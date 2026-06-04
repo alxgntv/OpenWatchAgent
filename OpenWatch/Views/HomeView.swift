@@ -40,6 +40,15 @@ struct HomeView: View {
                 }
             }
 
+            Section("Voice") {
+                Toggle(isOn: Binding(
+                    get: { model.ttsEnabled },
+                    set: { model.setTTSEnabled($0) }
+                )) {
+                    Label("Speak replies on Watch", systemImage: model.ttsEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                }
+            }
+
             Section("Session") {
                 Button {
                     model.startNewSession()
@@ -48,15 +57,28 @@ struct HomeView: View {
                 }
             }
 
-            Section("Conversation") {
-                if model.jobs.isEmpty {
-                    Text("Use your Apple Watch or tap Listen above.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    // One session = one chat thread. Oldest turn on top, newest at the bottom, just like the Watch.
-                    ForEach(orderedJobs) { job in
-                        ChatTurnView(job: job)
+            Section {
+                if model.gatewaySessions.isEmpty {
+                    if model.sessionsLoading {
+                        HStack { ProgressView(); Text("Loading sessions…") }
+                    } else {
+                        Text("No sessions yet. Pull down to refresh.")
+                            .foregroundStyle(.secondary)
                     }
+                } else {
+                    // Real gateway sessions; tap to open the full transcript loaded from the bot.
+                    ForEach(model.gatewaySessions) { session in
+                        NavigationLink {
+                            SessionDetailView(model: model, session: session)
+                        } label: {
+                            SessionCardView(session: session)
+                        }
+                    }
+                }
+            } header: {
+                HStack {
+                    Text("Sessions")
+                    if model.sessionsLoading { Spacer(); ProgressView() }
                 }
             }
 
@@ -67,6 +89,8 @@ struct HomeView: View {
             }
         }
         .navigationTitle("OpenWatch")
+        .refreshable { await model.refreshSessions() }
+        .task { await model.refreshSessions() }
         .onAppear { AppLog.info("HomeView appeared jobs=\(model.jobs.count)") }
     }
 
@@ -74,37 +98,69 @@ struct HomeView: View {
         guard let id = model.activeJobId else { return nil }
         return model.jobs.first { $0.id == id }
     }
+}
 
-    /// Oldest turn first so the conversation reads top-to-bottom. A concrete Array keeps SwiftUI's list diffing stable.
-    private var orderedJobs: [VoiceJob] {
-        model.jobs.sorted { $0.createdAt < $1.createdAt }
+/// A tappable card representing one real gateway session.
+struct SessionCardView: View {
+    let session: GatewaySessionRow
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(session.title)
+                .lineLimit(1)
+            if let preview = session.preview, !preview.isEmpty {
+                Text(preview)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            HStack(spacing: 4) {
+                if let count = session.messageCount {
+                    Text("\(count) message\(count == 1 ? "" : "s")")
+                    if session.updatedAt != nil { Text("·") }
+                }
+                if let updated = session.updatedAt {
+                    Text(updated, style: .relative)
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
     }
 }
 
-/// A single request/response turn inside the current session, rendered as chat bubbles.
-struct ChatTurnView: View {
-    let job: VoiceJob
+/// The full transcript for one session, loaded from the gateway via chat.history.
+struct SessionDetailView: View {
+    @ObservedObject var model: AppModel
+    let session: GatewaySessionRow
+
+    @State private var messages: [ChatHistoryMessage] = []
+    @State private var loading = true
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if let transcript = job.transcript, !transcript.isEmpty {
-                ChatBubble(text: transcript, isUser: true)
-            }
-
-            if let result = job.resultText, !result.isEmpty {
-                ChatBubble(text: result, isUser: false)
-            } else if job.status == .failed {
-                ChatBubble(text: job.errorMessage ?? "Failed", isUser: false, isError: true)
-            } else if job.status == .running || job.status == .sending || job.status == .listening {
-                HStack(spacing: 8) {
-                    ProgressView()
-                    Text(job.statusDetail ?? job.status.rawValue.capitalized)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+        List {
+            if loading {
+                HStack { ProgressView(); Text("Loading transcript…") }
+            } else if messages.isEmpty {
+                Text("No messages in this session.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(messages) { message in
+                    ChatBubble(text: message.text, isUser: message.isUser)
+                        .listRowSeparator(.hidden)
                 }
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .navigationTitle(session.title)
+        .navigationBarTitleDisplayMode(.inline)
+        .refreshable { await load() }
+        .task { await load() }
+    }
+
+    private func load() async {
+        loading = true
+        messages = await model.history(for: session.id)
+        loading = false
     }
 }
 

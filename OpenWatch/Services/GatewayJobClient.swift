@@ -29,6 +29,24 @@ enum GatewayJobError: LocalizedError {
     }
 }
 
+/// One real session as reported by the gateway's `sessions.list`.
+struct GatewaySessionRow: Identifiable, Sendable, Equatable {
+    let id: String              // sessionKey
+    let title: String
+    let preview: String?
+    let updatedAt: Date?
+    let messageCount: Int?
+}
+
+/// One transcript message as reported by the gateway's `chat.history`.
+struct ChatHistoryMessage: Identifiable, Sendable, Equatable {
+    let id: String
+    let role: String            // "user" / "assistant" / …
+    let text: String
+
+    var isUser: Bool { role.lowercased() == "user" }
+}
+
 actor GatewayJobClient {
     private let appVersion: String
     /// We never cap how long an agent run may take. This is only the "connection is dead" window: if NO frame at all
@@ -53,38 +71,10 @@ actor GatewayJobClient {
     ) async throws -> String {
         AppLog.info("Submitting voice job via chat.send sessionKey=\(sessionKey) transcriptLength=\(transcript.count)")
 
-        guard KeychainStore.isPaired, let gatewayURL = KeychainStore.loadGatewayURL() else {
-            AppLog.error("runCommand blocked: not paired")
-            throw GatewayJobError.notPaired
-        }
-        guard let operatorToken = KeychainStore.loadOperatorToken() else {
-            AppLog.error("runCommand blocked: missing operator token")
-            throw GatewayJobError.missingOperatorToken
-        }
-
-        let operatorScopes = KeychainStore.loadOperatorScopes()
-        let identity = try DeviceIdentityStore.loadOrCreate()
-        let wsURL = try websocketURL(from: gatewayURL)
-
-        let task = URLSession.shared.webSocketTask(with: wsURL)
-        task.resume()
+        let task = try await openOperatorSocket()
         defer {
             task.cancel(with: .goingAway, reason: nil)
         }
-
-        let nonce = try await waitForChallenge(on: task)
-        AppLog.info("Job WS received connect.challenge")
-
-        let connectId = UUID().uuidString
-        try await sendConnect(
-            on: task,
-            connectId: connectId,
-            identity: identity,
-            operatorToken: operatorToken,
-            operatorScopes: operatorScopes,
-            nonce: nonce
-        )
-        try await waitForHelloOk(on: task, connectId: connectId)
         AppLog.info("Job WS operator handshake succeeded")
 
         // Subscribe to this session's live transcript/operation/tool events so we can stream the chain to the client.
@@ -116,6 +106,163 @@ actor GatewayJobClient {
             ],
         ]
         try await sendJSON(frame, on: task)
+    }
+
+    /// Opens a WebSocket and completes the operator handshake (challenge → connect → hello-ok).
+    /// The caller owns the returned task and must cancel it when done.
+    private func openOperatorSocket() async throws -> URLSessionWebSocketTask {
+        guard KeychainStore.isPaired, let gatewayURL = KeychainStore.loadGatewayURL() else {
+            AppLog.error("openOperatorSocket blocked: not paired")
+            throw GatewayJobError.notPaired
+        }
+        guard let operatorToken = KeychainStore.loadOperatorToken() else {
+            AppLog.error("openOperatorSocket blocked: missing operator token")
+            throw GatewayJobError.missingOperatorToken
+        }
+        let operatorScopes = KeychainStore.loadOperatorScopes()
+        let identity = try DeviceIdentityStore.loadOrCreate()
+        let wsURL = try websocketURL(from: gatewayURL)
+
+        let task = URLSession.shared.webSocketTask(with: wsURL)
+        task.resume()
+
+        let nonce = try await waitForChallenge(on: task)
+        AppLog.info("Job WS received connect.challenge")
+        let connectId = UUID().uuidString
+        try await sendConnect(
+            on: task,
+            connectId: connectId,
+            identity: identity,
+            operatorToken: operatorToken,
+            operatorScopes: operatorScopes,
+            nonce: nonce
+        )
+        try await waitForHelloOk(on: task, connectId: connectId)
+        return task
+    }
+
+    /// Fetches the real session index from the gateway (`sessions.list`). Field names are parsed defensively because
+    /// the protocol schema is not fully pinned here; the raw payload is logged so parsing can be tuned to your gateway.
+    func listSessions() async throws -> [GatewaySessionRow] {
+        let task = try await openOperatorSocket()
+        defer { task.cancel(with: .goingAway, reason: nil) }
+
+        let reqId = UUID().uuidString
+        try await sendJSON([
+            "type": "req",
+            "id": reqId,
+            "method": "sessions.list",
+            "params": [:] as [String: Any],
+        ], on: task)
+        AppLog.info("sessions.list dispatched id=\(reqId)")
+
+        let payload = try await awaitResult(on: task, id: reqId)
+        AppLog.info("sessions.list raw payload=\(truncatedJSON(payload))")
+        return parseSessions(payload)
+    }
+
+    /// Fetches the real transcript for one session (`chat.history`). Parsed defensively + raw payload logged.
+    func fetchHistory(sessionKey: String) async throws -> [ChatHistoryMessage] {
+        let task = try await openOperatorSocket()
+        defer { task.cancel(with: .goingAway, reason: nil) }
+
+        let reqId = UUID().uuidString
+        try await sendJSON([
+            "type": "req",
+            "id": reqId,
+            "method": "chat.history",
+            "params": ["sessionKey": sessionKey],
+        ], on: task)
+        AppLog.info("chat.history dispatched id=\(reqId) sessionKey=\(sessionKey)")
+
+        let payload = try await awaitResult(on: task, id: reqId)
+        AppLog.info("chat.history raw payload=\(truncatedJSON(payload))")
+        return parseHistory(payload)
+    }
+
+    /// Reads frames until the matching `res` arrives (skipping interleaved events), returns its payload or throws.
+    private func awaitResult(on task: URLSessionWebSocketTask, id: String) async throws -> [String: Any] {
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { break }
+            let json = try await receiveJSON(on: task, timeoutSeconds: min(remaining, 15))
+            guard (json["type"] as? String) == "res", (json["id"] as? String) == id else { continue }
+            if (json["ok"] as? Bool) == false {
+                let error = json["error"] as? [String: Any]
+                let message = (error?["message"] as? String) ?? (error?["code"] as? String) ?? "request failed"
+                AppLog.error("RPC \(id) failed: \(message)")
+                throw GatewayJobError.runFailed(message)
+            }
+            return (json["payload"] as? [String: Any]) ?? [:]
+        }
+        throw GatewayJobError.timedOut
+    }
+
+    private func truncatedJSON(_ object: [String: Any]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+              let raw = String(data: data, encoding: .utf8) else { return "<unserializable>" }
+        return raw.count > 1500 ? String(raw.prefix(1500)) + "…" : raw
+    }
+
+    private func parseSessions(_ payload: [String: Any]) -> [GatewaySessionRow] {
+        let rows = (payload["sessions"] as? [[String: Any]])
+            ?? (payload["rows"] as? [[String: Any]])
+            ?? (payload["items"] as? [[String: Any]])
+            ?? (payload["list"] as? [[String: Any]])
+            ?? []
+        let parsed = rows.compactMap { row -> GatewaySessionRow? in
+            guard let key = (row["key"] as? String) ?? (row["sessionKey"] as? String) ?? (row["id"] as? String) else {
+                return nil
+            }
+            let title = (row["title"] as? String) ?? (row["label"] as? String) ?? (row["name"] as? String) ?? key
+            let preview = (row["preview"] as? String) ?? (row["lastMessage"] as? String) ?? (row["summary"] as? String)
+            let updated = parseDate(row["updatedAt"]) ?? parseDate(row["lastActivityAt"]) ?? parseDate(row["lastMessageAt"]) ?? parseDate(row["mtimeMs"]) ?? parseDate(row["ts"])
+            let count = (row["messageCount"] as? Int) ?? (row["count"] as? Int) ?? (row["messages"] as? Int)
+            return GatewaySessionRow(id: key, title: title, preview: preview, updatedAt: updated, messageCount: count)
+        }
+        return parsed.sorted { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
+    }
+
+    private func parseHistory(_ payload: [String: Any]) -> [ChatHistoryMessage] {
+        let rows = (payload["messages"] as? [[String: Any]])
+            ?? (payload["items"] as? [[String: Any]])
+            ?? (payload["history"] as? [[String: Any]])
+            ?? (payload["entries"] as? [[String: Any]])
+            ?? []
+        return rows.compactMap { row -> ChatHistoryMessage? in
+            let id = (row["id"] as? String) ?? (row["messageId"] as? String) ?? UUID().uuidString
+            let role = (row["role"] as? String) ?? (row["author"] as? String) ?? "assistant"
+            guard let text = historyText(from: row), !text.isEmpty else { return nil }
+            return ChatHistoryMessage(id: id, role: role, text: text)
+        }
+    }
+
+    /// Extracts displayable text from a transcript row: plain `text`, plain `content` string, or a content-block array.
+    private func historyText(from row: [String: Any]) -> String? {
+        if let text = row["text"] as? String { return text }
+        if let content = row["content"] as? String { return content }
+        if let blocks = (row["content"] as? [[String: Any]]) ?? (row["parts"] as? [[String: Any]]) {
+            let parts = blocks.compactMap { block -> String? in
+                if let t = block["text"] as? String { return t }
+                if (block["type"] as? String) == "text" { return block["value"] as? String }
+                return nil
+            }
+            let joined = parts.joined()
+            return joined.isEmpty ? nil : joined
+        }
+        if let message = row["message"] as? [String: Any] { return historyText(from: message) }
+        return nil
+    }
+
+    private func parseDate(_ value: Any?) -> Date? {
+        if let ms = value as? Double { return Date(timeIntervalSince1970: ms > 1_000_000_000_000 ? ms / 1000 : ms) }
+        if let ms = value as? Int { return parseDate(Double(ms)) }
+        if let iso = value as? String {
+            let formatter = ISO8601DateFormatter()
+            return formatter.date(from: iso)
+        }
+        return nil
     }
 
     private func sendConnect(

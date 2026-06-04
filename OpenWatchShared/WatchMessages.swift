@@ -21,6 +21,8 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
     public let job: VoiceJob?
     public let jobs: [VoiceJob]?
     public let text: String?
+    /// Global "speak replies on Watch" switch, controlled from the iPhone app. nil means "unchanged / unknown".
+    public let ttsEnabled: Bool?
 
     public init(
         kind: WatchMessageKind,
@@ -28,7 +30,8 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         pairing: PairingSnapshot? = nil,
         job: VoiceJob? = nil,
         jobs: [VoiceJob]? = nil,
-        text: String? = nil
+        text: String? = nil,
+        ttsEnabled: Bool? = nil
     ) {
         self.kind = kind
         self.jobId = jobId
@@ -36,5 +39,6 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         self.job = job
         self.jobs = jobs
         self.text = text
+        self.ttsEnabled = ttsEnabled
     }
 }

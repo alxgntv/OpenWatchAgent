@@ -26,6 +26,14 @@ final class SpeechPlaybackService: NSObject {
         AppLog.info("Watch TTS speaking length=\(text.count)")
         synthesizer.speak(utterance)
     }
+
+    /// Immediately stops any current/queued speech and releases the audio session.
+    func stop() {
+        guard synthesizer.isSpeaking else { return }
+        synthesizer.stopSpeaking(at: .immediate)
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        AppLog.info("Watch TTS stopped")
+    }
 }
 
 extension SpeechPlaybackService: AVSpeechSynthesizerDelegate {

@@ -8,11 +8,14 @@ struct WatchSession: Identifiable, Equatable {
     let id: UUID
     let sessionKey: String
     var jobs: [VoiceJob]
+    /// When true, replies in this session are not spoken aloud.
+    var muted: Bool
 
     init(sessionKey: String) {
         self.id = UUID()
         self.sessionKey = sessionKey
         self.jobs = []
+        self.muted = false
     }
 
     var isEmpty: Bool { jobs.isEmpty }
@@ -26,8 +29,17 @@ final class WatchAppModel: ObservableObject {
 
     @Published var pairing = PairingSnapshot()
     @Published var sessions: [WatchSession]
-    @Published var currentIndex: Int = 0
+    /// Switching the visible session stops whatever the previous session was speaking.
+    @Published var currentIndex: Int = 0 {
+        didSet {
+            guard oldValue != currentIndex else { return }
+            AppLog.info("Watch session switched \(oldValue) -> \(currentIndex); stopping any active speech")
+            SpeechPlaybackService.shared.stop()
+        }
+    }
     @Published var statusHint: String?
+    /// Global "speak replies" switch, mirrored from the iPhone app. Defaults to on until the phone tells us otherwise.
+    @Published var globalTtsEnabled: Bool = true
 
     private let bridge = WatchConnectivityWatchService.shared
     let recorder = WatchAudioRecorder()
@@ -73,11 +85,33 @@ final class WatchAppModel: ObservableObject {
         case .jobsSnapshot:
             // Sessions/history are owned by the Watch now; only the pairing status is taken from the snapshot.
             if let pairing = envelope.pairing { self.pairing = pairing }
+            applyGlobalTts(envelope.ttsEnabled)
         case .jobUpdated:
+            applyGlobalTts(envelope.ttsEnabled)
             if let job = envelope.job { upsert(job) }
         default:
             break
         }
+    }
+
+    /// Applies the iPhone's global TTS switch. Turning it off also stops any reply currently being spoken.
+    private func applyGlobalTts(_ enabled: Bool?) {
+        guard let enabled else { return }
+        let wasEnabled = globalTtsEnabled
+        globalTtsEnabled = enabled
+        if wasEnabled && !enabled {
+            SpeechPlaybackService.shared.stop()
+            AppLog.info("Watch global TTS disabled by iPhone; stopped active speech")
+        }
+    }
+
+    /// Per-session mute toggle. Muting a session that is currently speaking stops it immediately.
+    func toggleMute(sessionId: UUID) {
+        guard let si = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        sessions[si].muted.toggle()
+        let muted = sessions[si].muted
+        if muted { SpeechPlaybackService.shared.stop() }
+        AppLog.info("Watch session mute toggled sessionId=\(sessionId) muted=\(muted)")
     }
 
     /// Push-to-talk: first tap starts recording on the Watch, second tap stops and ships the audio to the iPhone.
@@ -186,7 +220,7 @@ final class WatchAppModel: ObservableObject {
             if isCurrent { statusHint = job.statusDetail ?? "Working…" }
         case .done:
             if isCurrent { statusHint = nil }
-            speakOnce(job)
+            speakOnce(job, muted: sessions[si].muted)
         case .failed:
             if isCurrent { statusHint = job.errorMessage ?? "Failed" }
         case .cancelled:
@@ -197,9 +231,14 @@ final class WatchAppModel: ObservableObject {
     }
 
     /// Speaks the reply exactly once per job, letting it read to the end without restarting.
-    private func speakOnce(_ job: VoiceJob) {
+    /// Each reply is "handled" once; if voice is off globally or this session is muted, it is silently skipped.
+    private func speakOnce(_ job: VoiceJob, muted: Bool) {
         guard !spokenJobIds.contains(job.id), let text = job.resultText, !text.isEmpty else { return }
         spokenJobIds.insert(job.id)
+        guard globalTtsEnabled, !muted else {
+            AppLog.info("Watch TTS skipped jobId=\(job.id) globalEnabled=\(globalTtsEnabled) muted=\(muted)")
+            return
+        }
         SpeechPlaybackService.shared.speak(text)
     }
 }

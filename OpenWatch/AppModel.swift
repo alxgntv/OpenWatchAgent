@@ -9,7 +9,12 @@ final class AppModel: ObservableObject {
     @Published var pairing = PairingSnapshot()
     @Published var jobs: [VoiceJob] = []
     @Published var activeJobId: UUID?
+    /// Real sessions reported by the gateway (`sessions.list`). Source of truth for the iPhone sessions screen.
+    @Published private(set) var gatewaySessions: [GatewaySessionRow] = []
+    @Published private(set) var sessionsLoading = false
     @Published var errorBanner: String?
+    /// Global "speak replies on Watch" switch. Persisted on iPhone and mirrored to the Watch on every sync.
+    @Published var ttsEnabled: Bool = UserDefaults.standard.object(forKey: "ttsEnabled") as? Bool ?? true
     /// Every voice command goes to this gateway session until the user explicitly starts a new one.
     @Published private(set) var currentSessionKey = "agent:main:main"
 
@@ -27,11 +32,47 @@ final class AppModel: ObservableObject {
         if KeychainStore.isPaired, let url = KeychainStore.loadGatewayURL()?.absoluteString {
             pairing = PairingSnapshot(phase: .connected, gatewayURL: url, message: "Connected.")
         }
-        watchBridge.publish(pairing: pairing, jobs: jobs)
+        watchBridge.publish(pairing: pairing, jobs: jobs, ttsEnabled: ttsEnabled)
+    }
+
+    /// Toggles global voice playback and immediately mirrors the new state to the Watch (which does the speaking).
+    func setTTSEnabled(_ enabled: Bool) {
+        ttsEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "ttsEnabled")
+        AppLog.info("Global TTS set enabled=\(enabled)")
+        syncWatch()
     }
 
     var isPaired: Bool {
         pairing.phase == .connected || KeychainStore.isPaired
+    }
+
+    /// Loads the real session index from the gateway. Called on the sessions screen appear and on pull-to-refresh.
+    func refreshSessions() async {
+        guard isPaired else { return }
+        sessionsLoading = true
+        defer { sessionsLoading = false }
+        do {
+            let rows = try await jobClient.listSessions()
+            gatewaySessions = rows
+            AppLog.info("Loaded \(rows.count) gateway sessions")
+        } catch {
+            errorBanner = error.localizedDescription
+            AppLog.error("refreshSessions failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Loads the real transcript for one session from the gateway.
+    func history(for sessionKey: String) async -> [ChatHistoryMessage] {
+        do {
+            let messages = try await jobClient.fetchHistory(sessionKey: sessionKey)
+            AppLog.info("Loaded \(messages.count) history messages for sessionKey=\(sessionKey)")
+            return messages
+        } catch {
+            errorBanner = error.localizedDescription
+            AppLog.error("history load failed sessionKey=\(sessionKey): \(error.localizedDescription)")
+            return []
+        }
     }
 
     func submitSetupCode(_ raw: String) {
@@ -86,6 +127,7 @@ final class AppModel: ObservableObject {
         KeychainStore.clear()
         pairing = PairingSnapshot(phase: .needsSetupCode, message: "Enter a new setup code.")
         jobs = []
+        gatewaySessions = []
         activeJobId = nil
         syncWatch()
     }
@@ -150,7 +192,7 @@ final class AppModel: ObservableObject {
             index = 0
         }
         activeJobId = jobId
-        AppLog.info("handleWatchAudio transcribing jobId=\(jobId)")
+        AppLog.info("handleWatchAudio transcribing jobId=\(jobId) sessionKey=\(sessionKey)")
         syncWatch(job: jobs[index])
 
         do {
@@ -191,11 +233,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Starts a brand-new chat session: a fresh sessionKey and a clean conversation. Old session stays on the gateway.
+    /// Starts a brand-new chat session: a fresh sessionKey. Past sessions stay as their own cards (history is not wiped).
     func startNewSession() {
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         currentSessionKey = "agent:main:\(token)"
-        jobs = []
         activeJobId = nil
         AppLog.info("Started new session sessionKey=\(currentSessionKey)")
         syncWatch()
@@ -342,7 +383,7 @@ final class AppModel: ObservableObject {
     }
 
     private func syncWatch(job: VoiceJob? = nil) {
-        watchBridge.publish(pairing: pairing, jobs: jobs)
+        watchBridge.publish(pairing: pairing, jobs: jobs, ttsEnabled: ttsEnabled)
         if let job { watchBridge.publish(job: job) }
     }
 

@@ -10,13 +10,12 @@ struct WatchSessionPage: View {
         ScrollView {
             VStack(spacing: 8) {
                 speakButton
-                if index == model.currentIndex, let hint = model.statusHint {
+                muteButton
+                // Only surface non-process hints (permission/pairing errors) here; live process status lives in the button.
+                if index == model.currentIndex, session.activeJob == nil, !isRecordingHere, let hint = model.statusHint {
                     Text(hint)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                }
-                if session.activeJob != nil {
-                    ProgressView()
                 }
                 history
             }
@@ -24,6 +23,11 @@ struct WatchSessionPage: View {
             .frame(maxWidth: .infinity)
         }
         .navigationTitle(session.jobs.isEmpty ? "New" : "Session \(index)")
+    }
+
+    /// Recording is global (one recorder) and always belongs to the visible session, so it only shows on the current page.
+    private var isRecordingHere: Bool {
+        model.isRecording && index == model.currentIndex
     }
 
     @ViewBuilder
@@ -61,15 +65,41 @@ struct WatchSessionPage: View {
         Button {
             model.toggleRecord()
         } label: {
-            VStack {
-                Image(systemName: model.isRecording ? "stop.fill" : "mic.fill")
-                    .font(.title2)
-                Text(model.isRecording ? "Stop & Send" : "Speak")
-                    .font(.caption2)
+            VStack(spacing: 4) {
+                if isRecordingHere {
+                    Image(systemName: "stop.fill").font(.title2)
+                    Text("Stop & Send").font(.caption2)
+                } else if let job = session.activeJob {
+                    // Already sent to work in this session: spinner replaces the mic and the live status is the label.
+                    ProgressView()
+                    Text(job.statusDetail ?? "Working…")
+                        .font(.caption2)
+                        .multilineTextAlignment(.center)
+                } else {
+                    Image(systemName: "mic.fill").font(.title2)
+                    Text("Speak").font(.caption2)
+                }
             }
         }
         .buttonStyle(.borderedProminent)
-        .tint(model.isRecording ? .red : .blue)
+        .tint(isRecordingHere ? .red : .blue)
+        .disabled(session.activeJob != nil)
+    }
+
+    /// Per-session voice mute. Disabled (and shown off) when the iPhone has turned voice off globally.
+    private var muteButton: some View {
+        Button {
+            model.toggleMute(sessionId: session.id)
+        } label: {
+            Label(
+                session.muted ? "Voice Off" : "Voice On",
+                systemImage: session.muted ? "speaker.slash.fill" : "speaker.wave.2.fill"
+            )
+            .font(.caption2)
+        }
+        .buttonStyle(.bordered)
+        .tint(session.muted ? .gray : .blue)
+        .disabled(!model.globalTtsEnabled)
     }
 }
 

@@ -17,9 +17,9 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         }
     }
 
-    func publish(pairing: PairingSnapshot, jobs: [VoiceJob]) {
+    func publish(pairing: PairingSnapshot, jobs: [VoiceJob], ttsEnabled: Bool) {
         guard session.activationState == .activated else { return }
-        let envelope = WatchEnvelope(kind: .jobsSnapshot, pairing: pairing, jobs: jobs)
+        let envelope = WatchEnvelope(kind: .jobsSnapshot, pairing: pairing, jobs: jobs, ttsEnabled: ttsEnabled)
         pushToWatch(envelope, preferImmediate: true)
     }
 
