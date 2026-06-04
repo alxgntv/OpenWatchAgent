@@ -1,21 +1,16 @@
-//
-//  ContentView.swift
-//  OpenWatch Watch App
-//
-//  Created by Alex Ign on 03.06.2026.
-//
-
 import SwiftUI
 
 struct ContentView: View {
+    @StateObject private var model = WatchAppModel.shared
+
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
+        NavigationStack {
+            WatchHomeView(model: model)
         }
-        .padding()
+        .onAppear {
+            WatchConnectivityWatchService.shared.requestSync()
+            AppLog.info("OpenWatch Watch app launched")
+        }
     }
 }
 
