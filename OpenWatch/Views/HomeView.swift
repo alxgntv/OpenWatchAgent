@@ -152,6 +152,7 @@ struct SessionDetailView: View {
 
     @State private var messages: [ChatHistoryMessage] = []
     @State private var loading = true
+    @State private var browserURL: IdentifiableURL?
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -181,6 +182,21 @@ struct SessionDetailView: View {
             .navigationTitle(session.title)
             .navigationBarTitleDisplayMode(.inline)
             .safeAreaInset(edge: .bottom) { inputBar }
+            .environment(\.openURL, OpenURLAction { url in
+                // Open agent-provided links inside the app. SFSafariViewController only supports http/https;
+                // hand any other scheme back to the system instead of presenting an unsupported URL.
+                if let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
+                    AppLog.info("In-session link tapped, opening in-app browser url=\(url.absoluteString)")
+                    browserURL = IdentifiableURL(url: url)
+                    return .handled
+                }
+                AppLog.info("In-session link tapped with non-web scheme, deferring to system url=\(url.absoluteString)")
+                return .systemAction
+            })
+            .sheet(item: $browserURL) { item in
+                SafariView(url: item.url)
+                    .ignoresSafeArea()
+            }
             .refreshable { await load(proxy: proxy) }
             .task { await load(proxy: proxy) }
         }
@@ -244,8 +260,9 @@ struct ChatBubble: View {
     var body: some View {
         HStack(spacing: 0) {
             if isUser { Spacer(minLength: 56) }
-            Text(text)
+            Text(attributedText)
                 .font(.body)
+                .tint(isUser ? .white : .blue)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 9)
                 .foregroundStyle(textColor)
@@ -255,6 +272,27 @@ struct ChatBubble: View {
         }
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
         .padding(.vertical, 2)
+    }
+
+    /// Builds an attributed string where any detected URL becomes a tappable link (handled by the surrounding
+    /// OpenURLAction so it opens in the in-app browser). Links are underlined and tinted for visibility.
+    private var attributedText: AttributedString {
+        var attributed = AttributedString(text)
+        let nsLength = (text as NSString).length
+        guard nsLength > 0,
+              let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else {
+            return attributed
+        }
+        detector.enumerateMatches(in: text, range: NSRange(location: 0, length: nsLength)) { result, _, _ in
+            guard let result, let url = result.url,
+                  let stringRange = Range(result.range, in: text),
+                  let lower = AttributedString.Index(stringRange.lowerBound, within: attributed),
+                  let upper = AttributedString.Index(stringRange.upperBound, within: attributed) else { return }
+            attributed[lower..<upper].link = url
+            attributed[lower..<upper].underlineStyle = .single
+            attributed[lower..<upper].foregroundColor = isUser ? .white : .blue
+        }
+        return attributed
     }
 
     private var bubbleColor: Color {
