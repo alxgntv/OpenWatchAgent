@@ -39,7 +39,8 @@ struct WatchSessionPage: View {
                 .multilineTextAlignment(.center)
         } else {
             VStack(alignment: .leading, spacing: 10) {
-                ForEach(session.jobs.reversed()) { job in
+                // jobs[0] is the newest turn, so iterate as-is to keep the latest message on top.
+                ForEach(session.jobs) { job in
                     VStack(alignment: .leading, spacing: 2) {
                         if let transcript = job.transcript {
                             Text(transcript)

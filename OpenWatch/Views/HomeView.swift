@@ -22,14 +22,11 @@ struct HomeView: View {
                 }
             }
 
-            Section("Voice on iPhone") {
+            Section {
                 Button {
                     model.toggleListenOnPhone()
                 } label: {
-                    Label(
-                        activeJob?.status == .listening ? "Tap to send" : "Tap to listen",
-                        systemImage: activeJob?.status == .listening ? "paperplane.fill" : "mic.fill"
-                    )
+                    Label("Tap to listen", systemImage: "mic.fill")
                 }
 
                 if let job = activeJob, job.status == .listening || job.status == .sending || job.status == .running {
@@ -38,6 +35,10 @@ struct HomeView: View {
                         Text(job.statusDetail ?? job.status.rawValue.capitalized)
                     }
                 }
+            } header: {
+                Text("Listen")
+            } footer: {
+                Text("Starts a new recording on the Watch. The Watch app must be open on screen — watchOS does not allow the iPhone to launch the Watch app or its microphone in the background.")
             }
 
             Section("Voice") {
@@ -47,14 +48,18 @@ struct HomeView: View {
                 )) {
                     Label("Speak replies on Watch", systemImage: model.ttsEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
                 }
-            }
 
-            Section("Session") {
-                Button {
-                    model.startNewSession()
+                Picker(selection: Binding(
+                    get: { model.ttsLanguage },
+                    set: { model.setTTSLanguage($0) }
+                )) {
+                    ForEach(AppModel.availableVoiceLanguages, id: \.code) { lang in
+                        Text(lang.name).tag(lang.code)
+                    }
                 } label: {
-                    Label("New session", systemImage: "plus.bubble")
+                    Label("Language", systemImage: "globe")
                 }
+                .disabled(!model.ttsEnabled)
             }
 
             Section {
@@ -78,7 +83,17 @@ struct HomeView: View {
             } header: {
                 HStack {
                     Text("Sessions")
-                    if model.sessionsLoading { Spacer(); ProgressView() }
+                    Spacer()
+                    if model.sessionsLoading {
+                        ProgressView()
+                    } else {
+                        Button {
+                            Task { await model.refreshSessions() }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .buttonStyle(.borderless)
+                    }
                 }
             }
 
@@ -159,7 +174,8 @@ struct SessionDetailView: View {
 
     private func load() async {
         loading = true
-        messages = await model.history(for: session.id)
+        // chat.history returns oldest-first; reverse so the latest message is on top.
+        messages = Array(await model.history(for: session.id).reversed())
         loading = false
     }
 }

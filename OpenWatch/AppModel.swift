@@ -1,3 +1,4 @@
+import AVFoundation
 import Combine
 import Foundation
 import SwiftUI
@@ -15,6 +16,17 @@ final class AppModel: ObservableObject {
     @Published var errorBanner: String?
     /// Global "speak replies on Watch" switch. Persisted on iPhone and mirrored to the Watch on every sync.
     @Published var ttsEnabled: Bool = UserDefaults.standard.object(forKey: "ttsEnabled") as? Bool ?? true
+    /// BCP-47 language used by the Watch to speak replies. Persisted on iPhone and mirrored to the Watch.
+    @Published var ttsLanguage: String = UserDefaults.standard.string(forKey: "ttsLanguage") ?? "en-US"
+
+    /// Every speech language available for the picker, shown with English display names (code, name), sorted by name.
+    static let availableVoiceLanguages: [(code: String, name: String)] = {
+        let codes = Set(AVSpeechSynthesisVoice.speechVoices().map { $0.language })
+        let english = Locale(identifier: "en_US")
+        return codes
+            .map { code in (code: code, name: english.localizedString(forIdentifier: code) ?? code) }
+            .sorted { $0.name < $1.name }
+    }()
     /// Every voice command goes to this gateway session until the user explicitly starts a new one.
     @Published private(set) var currentSessionKey = "agent:main:main"
 
@@ -32,7 +44,9 @@ final class AppModel: ObservableObject {
         if KeychainStore.isPaired, let url = KeychainStore.loadGatewayURL()?.absoluteString {
             pairing = PairingSnapshot(phase: .connected, gatewayURL: url, message: "Connected.")
         }
-        watchBridge.publish(pairing: pairing, jobs: jobs, ttsEnabled: ttsEnabled)
+        watchBridge.publish(pairing: pairing, jobs: jobs, ttsEnabled: ttsEnabled, ttsLanguage: ttsLanguage)
+        // Warm the voice catalog off the main thread so the language Picker never computes speechVoices() during render.
+        Task.detached(priority: .utility) { _ = AppModel.availableVoiceLanguages }
     }
 
     /// Toggles global voice playback and immediately mirrors the new state to the Watch (which does the speaking).
@@ -40,6 +54,14 @@ final class AppModel: ObservableObject {
         ttsEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "ttsEnabled")
         AppLog.info("Global TTS set enabled=\(enabled)")
+        syncWatch()
+    }
+
+    /// Sets the speech language and mirrors it to the Watch.
+    func setTTSLanguage(_ language: String) {
+        ttsLanguage = language
+        UserDefaults.standard.set(language, forKey: "ttsLanguage")
+        AppLog.info("Global TTS language set=\(language)")
         syncWatch()
     }
 
@@ -129,6 +151,7 @@ final class AppModel: ObservableObject {
         jobs = []
         gatewaySessions = []
         activeJobId = nil
+        Task { await jobClient.closeReadSocket() }
         syncWatch()
     }
 
@@ -247,14 +270,17 @@ final class AppModel: ObservableObject {
         syncWatch()
     }
 
+    /// "Tap to listen" on the iPhone does NOT use the iPhone microphone. Voice is captured on the Watch, so this remote-starts
+    /// a fresh recording on the Watch. It only takes effect if the Watch app is currently active on screen — watchOS does not
+    /// allow the iPhone to launch the Watch app or its microphone in the background.
     func toggleListenOnPhone() {
-        Task {
-            if speech.isListening {
-                await stopAndSendFromWatch()
-            } else {
-                await startListeningFromWatch()
-            }
+        guard isPaired else {
+            errorBanner = "Pair on iPhone before using the watch."
+            AppLog.error("toggleListenOnPhone blocked: not paired")
+            return
         }
+        AppLog.info("iPhone Tap to listen -> sending startListening command to Watch")
+        watchBridge.sendCommandToWatch(WatchEnvelope(kind: .startListening))
     }
 
     private func startListeningFromWatch() async {
@@ -383,7 +409,7 @@ final class AppModel: ObservableObject {
     }
 
     private func syncWatch(job: VoiceJob? = nil) {
-        watchBridge.publish(pairing: pairing, jobs: jobs, ttsEnabled: ttsEnabled)
+        watchBridge.publish(pairing: pairing, jobs: jobs, ttsEnabled: ttsEnabled, ttsLanguage: ttsLanguage)
         if let job { watchBridge.publish(job: job) }
     }
 

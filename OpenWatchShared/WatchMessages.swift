@@ -23,6 +23,8 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
     public let text: String?
     /// Global "speak replies on Watch" switch, controlled from the iPhone app. nil means "unchanged / unknown".
     public let ttsEnabled: Bool?
+    /// BCP-47 language code the Watch should use to speak replies (e.g. "en-US"). nil means "unchanged / unknown".
+    public let ttsLanguage: String?
 
     public init(
         kind: WatchMessageKind,
@@ -31,7 +33,8 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         job: VoiceJob? = nil,
         jobs: [VoiceJob]? = nil,
         text: String? = nil,
-        ttsEnabled: Bool? = nil
+        ttsEnabled: Bool? = nil,
+        ttsLanguage: String? = nil
     ) {
         self.kind = kind
         self.jobId = jobId
@@ -40,5 +43,6 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         self.jobs = jobs
         self.text = text
         self.ttsEnabled = ttsEnabled
+        self.ttsLanguage = ttsLanguage
     }
 }

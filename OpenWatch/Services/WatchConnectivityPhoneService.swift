@@ -17,9 +17,9 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         }
     }
 
-    func publish(pairing: PairingSnapshot, jobs: [VoiceJob], ttsEnabled: Bool) {
+    func publish(pairing: PairingSnapshot, jobs: [VoiceJob], ttsEnabled: Bool, ttsLanguage: String) {
         guard session.activationState == .activated else { return }
-        let envelope = WatchEnvelope(kind: .jobsSnapshot, pairing: pairing, jobs: jobs, ttsEnabled: ttsEnabled)
+        let envelope = WatchEnvelope(kind: .jobsSnapshot, pairing: pairing, jobs: jobs, ttsEnabled: ttsEnabled, ttsLanguage: ttsLanguage)
         pushToWatch(envelope, preferImmediate: true)
     }
 
@@ -27,6 +27,31 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         guard session.activationState == .activated else { return }
         let envelope = WatchEnvelope(kind: .jobUpdated, job: job)
         pushToWatch(envelope, preferImmediate: true)
+    }
+
+    /// iPhone → Watch command (e.g. remote-start a recording). Delivered immediately when the Watch app is reachable,
+    /// otherwise queued via transferUserInfo (the Watch can only act on it once its app is active — watchOS limitation).
+    func sendCommandToWatch(_ envelope: WatchEnvelope) {
+        guard session.activationState == .activated else {
+            AppLog.error("WCSession not activated on iPhone; cannot send command kind=\(envelope.kind.rawValue)")
+            return
+        }
+        guard let userInfo = WatchConnectivityCodec.userInfo(from: envelope) else {
+            AppLog.error("Failed to encode iPhone->Watch command kind=\(envelope.kind.rawValue)")
+            return
+        }
+        if session.isReachable, let data = WatchConnectivityCodec.payloadData(from: userInfo) {
+            session.sendMessageData(data, replyHandler: nil) { error in
+                WCSession.default.transferUserInfo(userInfo)
+                Task { @MainActor in
+                    AppLog.error("iPhone sendMessageData to Watch failed kind=\(envelope.kind.rawValue): \(error.localizedDescription); fell back to transferUserInfo")
+                }
+            }
+            AppLog.info("Sent command to Watch kind=\(envelope.kind.rawValue) (immediate)")
+        } else {
+            session.transferUserInfo(userInfo)
+            AppLog.info("Queued command to Watch kind=\(envelope.kind.rawValue) (background-safe)")
+        }
     }
 
     private func pushToWatch(_ envelope: WatchEnvelope, preferImmediate: Bool) {

@@ -8,6 +8,8 @@ xcuserdata/
 
 # Build
 build/
+build-watch/
+build_*.log
 DerivedData/
 *.moved-aside
 *.hmap

@@ -40,6 +40,8 @@ final class WatchAppModel: ObservableObject {
     @Published var statusHint: String?
     /// Global "speak replies" switch, mirrored from the iPhone app. Defaults to on until the phone tells us otherwise.
     @Published var globalTtsEnabled: Bool = true
+    /// BCP-47 language used to speak replies, mirrored from the iPhone app.
+    @Published var globalTtsLanguage: String = "en-US"
 
     private let bridge = WatchConnectivityWatchService.shared
     let recorder = WatchAudioRecorder()
@@ -86,12 +88,36 @@ final class WatchAppModel: ObservableObject {
             // Sessions/history are owned by the Watch now; only the pairing status is taken from the snapshot.
             if let pairing = envelope.pairing { self.pairing = pairing }
             applyGlobalTts(envelope.ttsEnabled)
+            applyTtsLanguage(envelope.ttsLanguage)
         case .jobUpdated:
             applyGlobalTts(envelope.ttsEnabled)
+            applyTtsLanguage(envelope.ttsLanguage)
             if let job = envelope.job { upsert(job) }
+        case .startListening:
+            AppLog.info("Watch received remote startListening from iPhone")
+            handleRemoteStartListening()
         default:
             break
         }
+    }
+
+    /// Remote "Tap to listen" from the iPhone: open a fresh session page and begin recording on the Watch.
+    /// Effective only while the Watch app is active on screen — watchOS cannot start the microphone in the background.
+    private func handleRemoteStartListening() {
+        guard isPaired else {
+            statusHint = "Pair on iPhone first."
+            AppLog.error("Watch remote startListening blocked: not paired")
+            return
+        }
+        guard !recorder.isRecording else {
+            AppLog.info("Watch remote startListening ignored: already recording")
+            return
+        }
+        // Jump to the top empty "new session" page so the recording opens a fresh conversation.
+        if sessions.indices.contains(0), sessions[0].isEmpty {
+            currentIndex = 0
+        }
+        Task { await beginRecording() }
     }
 
     /// Applies the iPhone's global TTS switch. Turning it off also stops any reply currently being spoken.
@@ -103,6 +129,13 @@ final class WatchAppModel: ObservableObject {
             SpeechPlaybackService.shared.stop()
             AppLog.info("Watch global TTS disabled by iPhone; stopped active speech")
         }
+    }
+
+    /// Applies the iPhone's chosen speech language.
+    private func applyTtsLanguage(_ language: String?) {
+        guard let language, !language.isEmpty, language != globalTtsLanguage else { return }
+        globalTtsLanguage = language
+        AppLog.info("Watch TTS language set to \(language) by iPhone")
     }
 
     /// Per-session mute toggle. Muting a session that is currently speaking stops it immediately.
@@ -239,6 +272,6 @@ final class WatchAppModel: ObservableObject {
             AppLog.info("Watch TTS skipped jobId=\(job.id) globalEnabled=\(globalTtsEnabled) muted=\(muted)")
             return
         }
-        SpeechPlaybackService.shared.speak(text)
+        SpeechPlaybackService.shared.speak(text, language: globalTtsLanguage)
     }
 }

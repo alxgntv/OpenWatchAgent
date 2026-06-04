@@ -141,43 +141,59 @@ actor GatewayJobClient {
         return task
     }
 
+    /// A warm, authenticated socket reused for read-only RPCs (sessions.list / chat.history) so we don't pay a full
+    /// handshake on every call. It is dedicated to reads (never shared with the streaming runCommand socket).
+    private var readSocket: URLSessionWebSocketTask?
+
     /// Fetches the real session index from the gateway (`sessions.list`). Field names are parsed defensively because
     /// the protocol schema is not fully pinned here; the raw payload is logged so parsing can be tuned to your gateway.
     func listSessions() async throws -> [GatewaySessionRow] {
-        let task = try await openOperatorSocket()
-        defer { task.cancel(with: .goingAway, reason: nil) }
-
-        let reqId = UUID().uuidString
-        try await sendJSON([
-            "type": "req",
-            "id": reqId,
-            "method": "sessions.list",
-            "params": [:] as [String: Any],
-        ], on: task)
-        AppLog.info("sessions.list dispatched id=\(reqId)")
-
-        let payload = try await awaitResult(on: task, id: reqId)
+        let payload = try await readRPC(method: "sessions.list", params: [:])
         AppLog.info("sessions.list raw payload=\(truncatedJSON(payload))")
         return parseSessions(payload)
     }
 
     /// Fetches the real transcript for one session (`chat.history`). Parsed defensively + raw payload logged.
     func fetchHistory(sessionKey: String) async throws -> [ChatHistoryMessage] {
-        let task = try await openOperatorSocket()
-        defer { task.cancel(with: .goingAway, reason: nil) }
+        let payload = try await readRPC(method: "chat.history", params: ["sessionKey": sessionKey])
+        AppLog.info("chat.history raw payload=\(truncatedJSON(payload))")
+        return parseHistory(payload)
+    }
 
+    /// Closes the warm read socket (e.g. on disconnect).
+    func closeReadSocket() {
+        readSocket?.cancel(with: .goingAway, reason: nil)
+        readSocket = nil
+    }
+
+    /// Runs a read RPC on the warm socket; if the reused socket is stale/closed, reopens a fresh one and retries once.
+    private func readRPC(method: String, params: [String: Any]) async throws -> [String: Any] {
+        do {
+            return try await readRPCOnce(method: method, params: params, reuseExisting: true)
+        } catch {
+            AppLog.info("read RPC \(method) failed on warm socket (\(error.localizedDescription)); retrying fresh")
+            closeReadSocket()
+            return try await readRPCOnce(method: method, params: params, reuseExisting: false)
+        }
+    }
+
+    private func readRPCOnce(method: String, params: [String: Any], reuseExisting: Bool) async throws -> [String: Any] {
+        let task: URLSessionWebSocketTask
+        if reuseExisting, let existing = readSocket {
+            task = existing
+        } else {
+            task = try await openOperatorSocket()
+            readSocket = task
+        }
         let reqId = UUID().uuidString
         try await sendJSON([
             "type": "req",
             "id": reqId,
-            "method": "chat.history",
-            "params": ["sessionKey": sessionKey],
+            "method": method,
+            "params": params,
         ], on: task)
-        AppLog.info("chat.history dispatched id=\(reqId) sessionKey=\(sessionKey)")
-
-        let payload = try await awaitResult(on: task, id: reqId)
-        AppLog.info("chat.history raw payload=\(truncatedJSON(payload))")
-        return parseHistory(payload)
+        AppLog.info("\(method) dispatched id=\(reqId) reused=\(reuseExisting && readSocket != nil)")
+        return try await awaitResult(on: task, id: reqId)
     }
 
     /// Reads frames until the matching `res` arrives (skipping interleaved events), returns its payload or throws.

@@ -123,4 +123,13 @@ extension WatchConnectivityWatchService: WCSessionDelegate {
             WatchAppModel.shared.applyEnvelope(data)
         }
     }
+
+    /// Queued iPhone → Watch commands (e.g. remote-start recording) arrive here when the Watch app was not reachable.
+    nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        Task { @MainActor in
+            guard let data = WatchConnectivityCodec.payloadData(from: userInfo) else { return }
+            AppLog.info("Watch received queued command via transferUserInfo")
+            WatchAppModel.shared.applyEnvelope(data)
+        }
+    }
 }
