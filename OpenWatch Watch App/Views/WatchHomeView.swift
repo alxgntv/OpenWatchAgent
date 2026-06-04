@@ -39,14 +39,10 @@ struct WatchSessionPage: View {
                 .multilineTextAlignment(.center)
         } else {
             VStack(alignment: .leading, spacing: 10) {
-                // jobs[0] is the newest turn, so iterate as-is to keep the latest message on top.
+                // jobs[0] is the newest turn. Inside each turn the agent reply is shown above the recognized text, so the
+                // newest message (the latest reply) is the very top line — matching the iPhone's newest-first order.
                 ForEach(session.jobs) { job in
                     VStack(alignment: .leading, spacing: 2) {
-                        if let transcript = job.transcript {
-                            Text(transcript)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
                         if let result = job.resultText {
                             Text(result)
                                 .font(.footnote)
@@ -54,6 +50,11 @@ struct WatchSessionPage: View {
                             Text(error)
                                 .font(.caption2)
                                 .foregroundStyle(.red)
+                        }
+                        if let transcript = job.transcript {
+                            Text(transcript)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
