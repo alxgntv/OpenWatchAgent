@@ -39,6 +39,8 @@ final class AppModel: ObservableObject {
     private var approvalPollTask: Task<Void, Never>?
     /// Last gateway session list (with recent history) pushed to the Watch, so we can re-push it on a Watch sync request.
     private var watchGatewaySessions: [WatchGatewaySession] = []
+    /// Last usage summary pushed to the Watch, re-pushed on a Watch sync request.
+    private var watchUsage: WatchUsage?
     /// Tracks the in-flight Watch enrichment so a new refresh supersedes an older one.
     private var watchEnrichTask: Task<Void, Never>?
     /// How many recent messages per session we mirror onto the Watch.
@@ -81,16 +83,30 @@ final class AppModel: ObservableObject {
         sessionsLoading = true
         defer { sessionsLoading = false }
         do {
-            let rows = try await jobClient.listSessions()
+            let (rows, usage) = try await jobClient.listSessionsAndUsage()
             gatewaySessions = rows
-            AppLog.info("Loaded \(rows.count) gateway sessions")
+            AppLog.info("Loaded \(rows.count) gateway sessions; usage totalTokens=\(usage.totalTokens) sessions=\(usage.sessionCount)")
             // Push the list to the Watch immediately so its horizontal pages appear fast, then enrich with recent history.
             pushSessionListToWatch(rows: rows)
+            pushUsageToWatch(usage)
             startWatchEnrichment(rows: rows)
         } catch {
             errorBanner = error.localizedDescription
             AppLog.error("refreshSessions failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Maps gateway usage to the Watch transport type and pushes it to the Watch's Usage page.
+    private func pushUsageToWatch(_ usage: GatewayUsage) {
+        let watch = WatchUsage(
+            sessionCount: usage.sessionCount,
+            totalTokens: usage.totalTokens,
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            model: usage.model
+        )
+        watchUsage = watch
+        watchBridge.publishUsage(watch)
     }
 
     /// Pushes the bare session list (no messages yet) to the Watch so pages render immediately.
@@ -197,6 +213,7 @@ final class AppModel: ObservableObject {
         gatewaySessions = []
         watchEnrichTask?.cancel()
         watchGatewaySessions = []
+        watchUsage = nil
         activeJobId = nil
         watchBridge.publishGatewaySessions([])
         Task { await jobClient.closeReadSocket() }
@@ -236,9 +253,10 @@ final class AppModel: ObservableObject {
         case .requestSync:
             AppLog.info("Watch requested sync; republishing pairing + jobs")
             syncWatch()
-            // Mirror gateway sessions too: re-push the cached list if we have it, otherwise fetch it now.
+            // Mirror gateway sessions + usage too: re-push the cached values if we have them, otherwise fetch now.
             if !watchGatewaySessions.isEmpty {
                 watchBridge.publishGatewaySessions(watchGatewaySessions)
+                if let watchUsage { watchBridge.publishUsage(watchUsage) }
             } else if isPaired {
                 Task { await refreshSessions() }
             }

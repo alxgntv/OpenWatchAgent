@@ -52,6 +52,8 @@ final class WatchAppModel: ObservableObject {
     @Published var globalTtsLanguage: String = "en-US"
     /// Real gateway sessions (with recent history) mirrored from the iPhone — shown as horizontal pages.
     @Published var gatewaySessions: [WatchGatewaySession] = []
+    /// Aggregate usage mirrored from the iPhone — shown on the Usage page.
+    @Published var usage: WatchUsage?
 
     private let bridge = WatchConnectivityWatchService.shared
     let recorder = WatchAudioRecorder()
@@ -119,6 +121,11 @@ final class WatchAppModel: ObservableObject {
             if let sessions = envelope.gatewaySessions {
                 gatewaySessions = sessions
                 AppLog.info("Watch received \(sessions.count) gateway sessions from iPhone")
+            }
+        case .usage:
+            if let usage = envelope.usage {
+                self.usage = usage
+                AppLog.info("Watch received usage sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens)")
             }
         default:
             break

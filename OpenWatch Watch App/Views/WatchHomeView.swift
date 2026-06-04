@@ -231,6 +231,51 @@ struct GatewaySessionPage: View {
     }
 }
 
+/// Usage page (one screen right of the live stack): aggregate stats derived from the gateway's session index.
+struct UsagePage: View {
+    @ObservedObject var model: WatchAppModel
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Usage").font(.headline)
+                if let usage = model.usage {
+                    statRow("Sessions", "\(usage.sessionCount)")
+                    statRow("Total tokens", Self.formatted(usage.totalTokens))
+                    statRow("Input tokens", Self.formatted(usage.inputTokens))
+                    statRow("Output tokens", Self.formatted(usage.outputTokens))
+                    if let model = usage.model { statRow("Model", model) }
+                } else {
+                    Text("Open the iPhone app to load usage.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 4)
+        }
+        .navigationTitle("Usage")
+    }
+
+    private func statRow(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+            Text(value).font(.footnote)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private static let numberFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter
+    }()
+
+    private static func formatted(_ value: Int) -> String {
+        numberFormatter.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
+}
+
 struct WatchNotPairedView: View {
     var body: some View {
         VStack(spacing: 6) {

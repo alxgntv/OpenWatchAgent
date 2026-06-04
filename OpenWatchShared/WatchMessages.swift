@@ -14,6 +14,25 @@ nonisolated public enum WatchMessageKind: String, Codable, Sendable {
     case newSession
     /// iPhone → Watch: the real gateway session index (with recent history) for the Watch's horizontal session pages.
     case gatewaySessions
+    /// iPhone → Watch: aggregate usage (session count, tokens, model) for the Watch's Usage page.
+    case usage
+}
+
+/// Aggregate usage derived from the gateway's `sessions.list`, mirrored to the Watch's Usage page.
+nonisolated public struct WatchUsage: Codable, Sendable, Equatable {
+    public let sessionCount: Int
+    public let totalTokens: Int
+    public let inputTokens: Int
+    public let outputTokens: Int
+    public let model: String?
+
+    public init(sessionCount: Int, totalTokens: Int, inputTokens: Int, outputTokens: Int, model: String?) {
+        self.sessionCount = sessionCount
+        self.totalTokens = totalTokens
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.model = model
+    }
 }
 
 /// One recent transcript message of a gateway session, pushed from the iPhone to the Watch (oldest-first).
@@ -59,6 +78,8 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
     public let ttsLanguage: String?
     /// Real gateway session index (with recent history) for the Watch's horizontal pages. nil means "unchanged / unknown".
     public let gatewaySessions: [WatchGatewaySession]?
+    /// Aggregate usage for the Watch's Usage page. nil means "unchanged / unknown".
+    public let usage: WatchUsage?
 
     public init(
         kind: WatchMessageKind,
@@ -69,7 +90,8 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         text: String? = nil,
         ttsEnabled: Bool? = nil,
         ttsLanguage: String? = nil,
-        gatewaySessions: [WatchGatewaySession]? = nil
+        gatewaySessions: [WatchGatewaySession]? = nil,
+        usage: WatchUsage? = nil
     ) {
         self.kind = kind
         self.jobId = jobId
@@ -80,5 +102,6 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         self.ttsEnabled = ttsEnabled
         self.ttsLanguage = ttsLanguage
         self.gatewaySessions = gatewaySessions
+        self.usage = usage
     }
 }

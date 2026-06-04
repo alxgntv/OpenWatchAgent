@@ -11,9 +11,12 @@ struct ContentView: View {
                 TabView(selection: $model.horizontalIndex) {
                     liveStack
                         .tag(0)
+                    // One screen right of the live stack: aggregate usage.
+                    UsagePage(model: model)
+                        .tag(1)
                     ForEach(Array(model.gatewaySessions.enumerated()), id: \.element.id) { idx, gatewaySession in
                         GatewaySessionPage(model: model, session: gatewaySession)
-                            .tag(idx + 1)
+                            .tag(idx + 2)
                     }
                 }
             } else {

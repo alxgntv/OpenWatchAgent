@@ -37,6 +37,14 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         AppLog.info("Pushed \(sessions.count) gateway sessions to Watch")
     }
 
+    /// Pushes aggregate usage (session count, tokens, model) to the Watch's Usage page.
+    func publishUsage(_ usage: WatchUsage) {
+        guard session.activationState == .activated else { return }
+        let envelope = WatchEnvelope(kind: .usage, usage: usage)
+        pushToWatch(envelope, preferImmediate: true)
+        AppLog.info("Pushed usage to Watch sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens)")
+    }
+
     /// iPhone → Watch command (e.g. remote-start a recording). Delivered immediately when the Watch app is reachable,
     /// otherwise queued via transferUserInfo (the Watch can only act on it once its app is active — watchOS limitation).
     func sendCommandToWatch(_ envelope: WatchEnvelope) {

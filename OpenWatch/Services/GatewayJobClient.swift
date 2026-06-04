@@ -38,6 +38,15 @@ struct GatewaySessionRow: Identifiable, Sendable, Equatable {
     let messageCount: Int?
 }
 
+/// Aggregate usage computed from the gateway's `sessions.list` payload (per-session token fields summed).
+struct GatewayUsage: Sendable, Equatable {
+    let sessionCount: Int
+    let totalTokens: Int
+    let inputTokens: Int
+    let outputTokens: Int
+    let model: String?
+}
+
 /// One transcript message as reported by the gateway's `chat.history`.
 struct ChatHistoryMessage: Identifiable, Sendable, Equatable {
     let id: String
@@ -153,6 +162,13 @@ actor GatewayJobClient {
         return parseSessions(payload)
     }
 
+    /// Fetches the session index once and returns both the parsed rows and aggregate usage (avoids a second RPC).
+    func listSessionsAndUsage() async throws -> (rows: [GatewaySessionRow], usage: GatewayUsage) {
+        let payload = try await readRPC(method: "sessions.list", params: [:])
+        AppLog.info("sessions.list raw payload=\(truncatedJSON(payload))")
+        return (parseSessions(payload), parseUsage(payload))
+    }
+
     /// Fetches the real transcript for one session (`chat.history`). Parsed defensively + raw payload logged.
     func fetchHistory(sessionKey: String) async throws -> [ChatHistoryMessage] {
         let payload = try await readRPC(method: "chat.history", params: ["sessionKey": sessionKey])
@@ -238,6 +254,30 @@ actor GatewayJobClient {
             return GatewaySessionRow(id: key, title: title, preview: preview, updatedAt: updated, messageCount: count)
         }
         return parsed.sorted { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
+    }
+
+    /// Sums per-session token counters from the `sessions.list` payload and reads the session count + default model.
+    private func parseUsage(_ payload: [String: Any]) -> GatewayUsage {
+        let rows = (payload["sessions"] as? [[String: Any]])
+            ?? (payload["rows"] as? [[String: Any]])
+            ?? (payload["items"] as? [[String: Any]])
+            ?? []
+        var total = 0, input = 0, output = 0
+        for row in rows {
+            total += intValue(row["totalTokens"])
+            input += intValue(row["inputTokens"])
+            output += intValue(row["outputTokens"])
+        }
+        let count = (payload["count"] as? Int) ?? rows.count
+        let model = (payload["defaults"] as? [String: Any])?["model"] as? String
+        return GatewayUsage(sessionCount: count, totalTokens: total, inputTokens: input, outputTokens: output, model: model)
+    }
+
+    private func intValue(_ value: Any?) -> Int {
+        if let i = value as? Int { return i }
+        if let d = value as? Double { return Int(d) }
+        if let s = value as? String, let i = Int(s) { return i }
+        return 0
     }
 
     private func parseHistory(_ payload: [String: Any]) -> [ChatHistoryMessage] {
