@@ -118,7 +118,40 @@ final class WatchAppModel: ObservableObject {
         AppLog.info("Watch restored pairing from local cache gatewayURL=\(url ?? "nil"); awaiting iPhone sync")
     }
 
-    private func persistPairingFromPhone(_ snapshot: PairingSnapshot) {
+    /// True when local cache says we were gateway-connected; used to ignore stale WCSession applicationContext.
+    func shouldSkipStaleApplicationContext() -> Bool {
+        let skip = UserDefaults.standard.bool(forKey: PairingLocalCache.wasConnectedKey) && pairing.phase == .connected
+        if skip {
+            AppLog.info("Watch shouldSkipStaleApplicationContext=true (local connected cache)")
+        }
+        return skip
+    }
+
+    private func shouldAcceptRemotePairing(_ remote: PairingSnapshot, envelopeKind: WatchMessageKind) -> Bool {
+        switch remote.phase {
+        case .connected:
+            return true
+        case .connecting, .waitingForApproval:
+            if pairing.phase == .connected {
+                AppLog.info("Watch ignored pairing phase=\(remote.phase.rawValue) from kind=\(envelopeKind.rawValue) while connected")
+                return false
+            }
+            return true
+        case .needsSetupCode, .failed:
+            // Only jobsSnapshot is authoritative for disconnect; usage/agents/gatewaySessions used to carry
+            // stale needsSetupCode via enrich gaps and WCSession context replay.
+            if pairing.phase == .connected,
+               UserDefaults.standard.bool(forKey: PairingLocalCache.wasConnectedKey),
+               envelopeKind != .jobsSnapshot {
+                AppLog.info("Watch ignored pairing downgrade to \(remote.phase.rawValue) from kind=\(envelopeKind.rawValue); awaiting jobsSnapshot")
+                return false
+            }
+            return true
+        }
+    }
+
+    private func persistPairingFromPhone(_ snapshot: PairingSnapshot, envelopeKind: WatchMessageKind) {
+        guard shouldAcceptRemotePairing(snapshot, envelopeKind: envelopeKind) else { return }
         pairing = snapshot
         switch snapshot.phase {
         case .connected:
@@ -140,7 +173,7 @@ final class WatchAppModel: ObservableObject {
 
     private func applyRemotePairingAndTts(from envelope: WatchEnvelope) {
         if let remote = envelope.pairing {
-            persistPairingFromPhone(remote)
+            persistPairingFromPhone(remote, envelopeKind: envelope.kind)
         }
         applyGlobalTts(envelope.ttsEnabled)
         applyTtsLanguage(envelope.ttsLanguage)

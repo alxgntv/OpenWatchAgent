@@ -412,7 +412,12 @@ final class AppModel: ObservableObject {
             pushSessionListToWatch(rows: gatewaySessions)
             startWatchEnrichment(rows: gatewaySessions(forAgentId: agentId))
         case .requestSync:
-            AppLog.info("Watch requested sync; republishing pairing + jobs")
+            if KeychainStore.isPaired, pairing.phase != .connected,
+               let url = KeychainStore.loadGatewayURL()?.absoluteString {
+                pairing = PairingSnapshot(phase: .connected, gatewayURL: url, message: "Connected.")
+                AppLog.info("Watch requestSync: repaired iPhone pairing snapshot from keychain")
+            }
+            AppLog.info("Watch requested sync; republishing pairing + jobs phase=\(pairing.phase.rawValue) keychainPaired=\(KeychainStore.isPaired)")
             syncWatch()
             // Mirror gateway sessions + usage too: re-push the cached values if we have them, otherwise fetch now.
             if !watchGatewaySessions.isEmpty {

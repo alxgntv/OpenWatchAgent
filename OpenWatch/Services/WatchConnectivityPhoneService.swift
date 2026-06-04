@@ -35,11 +35,14 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
     }
 
     func publish(pairing: PairingSnapshot, jobs: [VoiceJob], ttsEnabled: Bool, ttsLanguage: String) {
-        guard session.activationState == .activated else { return }
         cachedPairingForWatch = pairing
         cachedTtsEnabledForWatch = ttsEnabled
         cachedTtsLanguageForWatch = ttsLanguage
         AppLog.info("Cached Watch pairing phase=\(pairing.phase.rawValue) for context enrichment")
+        guard session.activationState == .activated else {
+            AppLog.info("WCSession not activated on iPhone; pairing cached but push deferred")
+            return
+        }
         let envelope = WatchEnvelope(kind: .jobsSnapshot, pairing: pairing, jobs: jobs, ttsEnabled: ttsEnabled, ttsLanguage: ttsLanguage)
         pushToWatch(envelope, preferImmediate: true)
     }

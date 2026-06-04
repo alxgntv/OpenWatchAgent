@@ -69,7 +69,8 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
             return
         }
         pendingSyncAfterActivation = false
-        applyLatestApplicationContext()
+        // Do not re-apply receivedApplicationContext here — it is often stale (old jobsSnapshot with
+        // needsSetupCode) and overwrites a good connected state right after a fresh usage/agents push.
         let envelope = WatchEnvelope(kind: .requestSync)
         if session.isReachable, let data = WatchConnectivityCodec.payloadData(from: WatchConnectivityCodec.userInfo(from: envelope) ?? [:]) {
             session.sendMessageData(data, replyHandler: nil) { error in
@@ -82,8 +83,13 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
         }
     }
 
-    /// Apply the last application context the iPhone published, so the Watch shows known state immediately on launch.
-    private func applyLatestApplicationContext() {
+    /// Apply the last application context once at cold start (before requestSync). Skipped when the Watch already
+    /// restored a connected gateway from local cache — stale context must not downgrade pairing.
+    private func applyLatestApplicationContextIfNeeded() {
+        guard !WatchAppModel.shared.shouldSkipStaleApplicationContext() else {
+            AppLog.info("Watch skipping stale application context (local pairing cache is connected)")
+            return
+        }
         let context = session.receivedApplicationContext
         guard !context.isEmpty, let data = WatchConnectivityCodec.payloadData(from: context) else {
             AppLog.info("Watch application context empty on apply; relying on local pairing cache + requestSync")
@@ -94,7 +100,7 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
     }
 
     fileprivate func applyLatestApplicationContextOnActivation() {
-        applyLatestApplicationContext()
+        applyLatestApplicationContextIfNeeded()
     }
 }
 
