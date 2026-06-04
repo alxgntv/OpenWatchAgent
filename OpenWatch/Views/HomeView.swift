@@ -180,9 +180,46 @@ struct SessionDetailView: View {
             .background(Color(.systemGroupedBackground))
             .navigationTitle(session.title)
             .navigationBarTitleDisplayMode(.inline)
+            .safeAreaInset(edge: .bottom) { inputBar }
             .refreshable { await load(proxy: proxy) }
             .task { await load(proxy: proxy) }
         }
+    }
+
+    /// iMessage-style input bar pinned to the bottom. iPhone never records audio itself, so the mic button
+    /// (right side, no "+") remotely starts listening on the Watch via the existing toggleListenOnPhone() path.
+    private var inputBar: some View {
+        HStack(spacing: 10) {
+            Text(isListening ? "Listening on Watch…" : "Tap the mic to talk on your Watch")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Button {
+                AppLog.info("SessionDetailView mic tapped sessionKey=\(session.id); triggering remote listen on Watch")
+                model.toggleListenOnPhone()
+            } label: {
+                Image(systemName: isListening ? "mic.fill" : "mic")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(isListening ? Color.red : Color.accentColor)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .overlay(
+            Capsule(style: .continuous)
+                .stroke(Color(.systemGray3), lineWidth: 1)
+        )
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    /// True while the Watch is actively recording the current job (drives the mic icon state/colour).
+    private var isListening: Bool {
+        guard let id = model.activeJobId else { return false }
+        return model.jobs.first { $0.id == id }?.status == .listening
     }
 
     private func load(proxy: ScrollViewProxy?) async {
