@@ -37,6 +37,14 @@ final class WatchAppModel: ObservableObject {
             SpeechPlaybackService.shared.stop()
         }
     }
+    /// Selected HORIZONTAL page (0 = live stack, 1...N = gateway sessions). Switching pages stops any active speech.
+    @Published var horizontalIndex: Int = 0 {
+        didSet {
+            guard oldValue != horizontalIndex else { return }
+            AppLog.info("Watch horizontal page switched \(oldValue) -> \(horizontalIndex); stopping any active speech")
+            SpeechPlaybackService.shared.stop()
+        }
+    }
     @Published var statusHint: String?
     /// Global "speak replies" switch, mirrored from the iPhone app. Defaults to on until the phone tells us otherwise.
     @Published var globalTtsEnabled: Bool = true
@@ -62,6 +70,8 @@ final class WatchAppModel: ObservableObject {
     private var jobGatewayKey: [UUID: String] = [:]
     /// The gateway sessionKey the in-progress recording belongs to (set when recording starts on a gateway page).
     private var gatewayRecordingKey: String?
+    /// Gateway sessionKeys whose replies are muted on the Watch (local, per-session). Not persisted/synced.
+    @Published private var gatewayMutedKeys: Set<String> = []
 
     private init() {
         sessions = [WatchSession(sessionKey: "agent:main:main")]
@@ -264,6 +274,23 @@ final class WatchAppModel: ObservableObject {
         recorder.isRecording && gatewayRecordingKey == sessionKey
     }
 
+    /// Whether replies for this gateway session are muted on the Watch.
+    func isGatewayMuted(_ sessionKey: String) -> Bool {
+        gatewayMutedKeys.contains(sessionKey)
+    }
+
+    /// Per-session mute for a gateway page. Muting also stops any reply currently being spoken (so it's a "stop" too).
+    func toggleGatewayMute(sessionKey: String) {
+        if gatewayMutedKeys.contains(sessionKey) {
+            gatewayMutedKeys.remove(sessionKey)
+            AppLog.info("Watch gateway session unmuted sessionKey=\(sessionKey)")
+        } else {
+            gatewayMutedKeys.insert(sessionKey)
+            SpeechPlaybackService.shared.stop()
+            AppLog.info("Watch gateway session muted sessionKey=\(sessionKey); stopped active speech")
+        }
+    }
+
     /// Push-to-talk for a gateway session: first tap records, second tap stops and ships the audio tagged with this key.
     func toggleGatewayRecord(sessionKey: String) {
         guard isPaired else {
@@ -342,8 +369,8 @@ final class WatchAppModel: ObservableObject {
             statusHint = job.statusDetail ?? "Working…"
         case .done:
             statusHint = nil
-            // Gateway pages have no per-session mute; honor only the global TTS switch.
-            speakOnce(job, muted: false)
+            // Honor the global TTS switch and this gateway session's local mute.
+            speakOnce(job, muted: isGatewayMuted(key))
         case .failed:
             statusHint = job.errorMessage ?? "Failed"
         case .cancelled:

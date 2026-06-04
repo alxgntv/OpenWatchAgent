@@ -118,12 +118,30 @@ struct GatewaySessionPage: View {
         ScrollView {
             VStack(spacing: 8) {
                 speakButton
+                muteButton
                 history
             }
             .padding(.horizontal, 4)
             .frame(maxWidth: .infinity)
         }
         .navigationTitle(titleText)
+    }
+
+    /// Per-session voice mute for this gateway page. Tapping it while a reply is speaking also stops it immediately.
+    /// Disabled (and shown off) when the iPhone has turned voice off globally.
+    private var muteButton: some View {
+        Button {
+            model.toggleGatewayMute(sessionKey: session.id)
+        } label: {
+            Label(
+                model.isGatewayMuted(session.id) ? "Voice Off" : "Voice On",
+                systemImage: model.isGatewayMuted(session.id) ? "speaker.slash.fill" : "speaker.wave.2.fill"
+            )
+            .font(.caption2)
+        }
+        .buttonStyle(.bordered)
+        .tint(model.isGatewayMuted(session.id) ? .gray : .blue)
+        .disabled(!model.globalTtsEnabled)
     }
 
     private var titleText: String {
