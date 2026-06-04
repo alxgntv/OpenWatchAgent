@@ -45,7 +45,7 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
 
     /// Transfers a recorded voice file to the iPhone. The iPhone transcribes it and forwards the text to the gateway.
     /// Uses `transferFile`, which is delivered reliably (in the background too) and carries metadata natively.
-    func sendAudio(fileURL: URL, jobId: UUID) {
+    func sendAudio(fileURL: URL, jobId: UUID, sessionKey: String) {
         guard session.activationState == .activated else {
             AppLog.error("WCSession not activated on Watch; cannot send audio")
             return
@@ -53,9 +53,10 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
         let metadata: [String: Any] = [
             WatchConnectivityCodec.audioKindKey: true,
             WatchConnectivityCodec.audioJobIdKey: jobId.uuidString,
+            WatchConnectivityCodec.audioSessionKeyKey: sessionKey,
         ]
         session.transferFile(fileURL, metadata: metadata)
-        AppLog.info("Watch transferFile audio jobId=\(jobId) file=\(fileURL.lastPathComponent)")
+        AppLog.info("Watch transferFile audio jobId=\(jobId) sessionKey=\(sessionKey) file=\(fileURL.lastPathComponent)")
     }
 
     /// Ask the iPhone to push the current pairing + jobs snapshot back to the Watch.

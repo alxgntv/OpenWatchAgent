@@ -128,8 +128,9 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Receives a voice recording captured on the Watch, transcribes it on iPhone, and runs it through the current session.
-    func handleWatchAudio(jobId: UUID, fileURL: URL) async {
+    /// Receives a voice recording captured on the Watch, transcribes it on iPhone, and runs it through the session the
+    /// Watch chose (each Watch session has its own sessionKey).
+    func handleWatchAudio(jobId: UUID, fileURL: URL, sessionKey: String) async {
         defer { try? FileManager.default.removeItem(at: fileURL) }
 
         guard isPaired else {
@@ -164,7 +165,11 @@ final class AppModel: ObservableObject {
             AppLog.info("handleWatchAudio transcript ready jobId=\(jobId) length=\(transcript.count)")
             syncWatch(job: jobs[runningIndex])
 
-            let reply = try await jobClient.runCommand(transcript: transcript, sessionKey: currentSessionKey)
+            let reply = try await jobClient.runCommand(
+                transcript: transcript,
+                sessionKey: sessionKey,
+                onProgress: makeProgressHandler(jobId: jobId)
+            )
             guard let doneIndex = jobs.firstIndex(where: { $0.id == jobId }) else { return }
             jobs[doneIndex].resultText = reply
             jobs[doneIndex].status = .done
@@ -248,7 +253,11 @@ final class AppModel: ObservableObject {
             jobs[index].statusDetail = "Working…"
             syncWatch(job: jobs[index])
 
-            let reply = try await jobClient.runCommand(transcript: transcript, sessionKey: currentSessionKey)
+            let reply = try await jobClient.runCommand(
+                transcript: transcript,
+                sessionKey: currentSessionKey,
+                onProgress: makeProgressHandler(jobId: jobId)
+            )
             jobs[index].resultText = reply
             jobs[index].status = .done
             jobs[index].statusDetail = nil
@@ -297,7 +306,11 @@ final class AppModel: ObservableObject {
         syncWatch(job: jobs[index])
 
         do {
-            let reply = try await jobClient.runCommand(transcript: transcript, sessionKey: currentSessionKey)
+            let reply = try await jobClient.runCommand(
+                transcript: transcript,
+                sessionKey: currentSessionKey,
+                onProgress: makeProgressHandler(jobId: id)
+            )
             guard let liveIndex = jobs.firstIndex(where: { $0.id == id }) else { return }
             jobs[liveIndex].resultText = reply
             jobs[liveIndex].status = .done
@@ -331,6 +344,21 @@ final class AppModel: ObservableObject {
     private func syncWatch(job: VoiceJob? = nil) {
         watchBridge.publish(pairing: pairing, jobs: jobs)
         if let job { watchBridge.publish(job: job) }
+    }
+
+    /// Builds a progress sink for a run: every streamed step from the gateway becomes the job's live `statusDetail`
+    /// and is pushed to the Watch so both screens show what OpenClaw is currently doing.
+    private func makeProgressHandler(jobId: UUID) -> @Sendable (String) -> Void {
+        { [weak self] step in
+            Task { @MainActor in
+                guard let self else { return }
+                guard let idx = self.jobs.firstIndex(where: { $0.id == jobId }) else { return }
+                guard self.jobs[idx].status == .running || self.jobs[idx].status == .sending else { return }
+                self.jobs[idx].statusDetail = step
+                AppLog.info("Run progress jobId=\(jobId) step=\(step)")
+                self.syncWatch(job: self.jobs[idx])
+            }
+        }
     }
 
     private func loadBootstrapFromKeychain() -> String? {

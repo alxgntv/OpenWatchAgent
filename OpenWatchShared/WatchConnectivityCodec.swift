@@ -6,6 +6,7 @@ nonisolated public enum WatchConnectivityCodec {
     /// Metadata keys used when transferring a recorded voice file from the Watch to the iPhone.
     public static let audioKindKey = "owAudio"
     public static let audioJobIdKey = "owAudioJobId"
+    public static let audioSessionKeyKey = "owAudioSessionKey"
 
     public static func userInfo(from envelope: WatchEnvelope) -> [String: Any]? {
         guard let data = try? JSONEncoder().encode(envelope) else { return nil }

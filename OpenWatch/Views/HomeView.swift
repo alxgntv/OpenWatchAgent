@@ -48,17 +48,14 @@ struct HomeView: View {
                 }
             }
 
-            Section("Recent jobs") {
+            Section("Conversation") {
                 if model.jobs.isEmpty {
                     Text("Use your Apple Watch or tap Listen above.")
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(model.jobs) { job in
-                        NavigationLink {
-                            JobDetailView(job: job)
-                        } label: {
-                            JobRowView(job: job)
-                        }
+                    // One session = one chat thread. Oldest turn on top, newest at the bottom, just like the Watch.
+                    ForEach(orderedJobs) { job in
+                        ChatTurnView(job: job)
                     }
                 }
             }
@@ -77,50 +74,60 @@ struct HomeView: View {
         guard let id = model.activeJobId else { return nil }
         return model.jobs.first { $0.id == id }
     }
-}
 
-struct JobRowView: View {
-    let job: VoiceJob
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(job.transcript ?? job.statusDetail ?? job.status.rawValue.capitalized)
-                .lineLimit(2)
-            Text(job.createdAt, style: .relative)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+    /// Oldest turn first so the conversation reads top-to-bottom. A concrete Array keeps SwiftUI's list diffing stable.
+    private var orderedJobs: [VoiceJob] {
+        model.jobs.sorted { $0.createdAt < $1.createdAt }
     }
 }
 
-struct JobDetailView: View {
+/// A single request/response turn inside the current session, rendered as chat bubbles.
+struct ChatTurnView: View {
     let job: VoiceJob
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                if let transcript = job.transcript {
-                    Group {
-                        Text("You said")
-                            .font(.caption.bold())
-                        Text(transcript)
-                    }
-                }
-                if let result = job.resultText {
-                    Group {
-                        Text("Response")
-                            .font(.caption.bold())
-                        Text(result)
-                    }
-                }
-                if let error = job.errorMessage {
-                    Text(error)
-                        .foregroundStyle(.red)
+        VStack(alignment: .leading, spacing: 6) {
+            if let transcript = job.transcript, !transcript.isEmpty {
+                ChatBubble(text: transcript, isUser: true)
+            }
+
+            if let result = job.resultText, !result.isEmpty {
+                ChatBubble(text: result, isUser: false)
+            } else if job.status == .failed {
+                ChatBubble(text: job.errorMessage ?? "Failed", isUser: false, isError: true)
+            } else if job.status == .running || job.status == .sending || job.status == .listening {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text(job.statusDetail ?? job.status.rawValue.capitalized)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding()
         }
-        .navigationTitle("Job")
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct ChatBubble: View {
+    let text: String
+    let isUser: Bool
+    var isError: Bool = false
+
+    var body: some View {
+        HStack {
+            if isUser { Spacer(minLength: 32) }
+            Text(text)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(bubbleColor)
+                .foregroundStyle(isError ? Color.red : Color.primary)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            if !isUser { Spacer(minLength: 32) }
+        }
+    }
+
+    private var bubbleColor: Color {
+        if isError { return Color.red.opacity(0.12) }
+        return isUser ? Color.accentColor.opacity(0.18) : Color.gray.opacity(0.14)
     }
 }

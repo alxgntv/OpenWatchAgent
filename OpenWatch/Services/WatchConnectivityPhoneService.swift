@@ -99,6 +99,7 @@ extension WatchConnectivityPhoneService: WCSessionDelegate {
         let metadata = file.metadata ?? [:]
         let isAudio = (metadata[WatchConnectivityCodec.audioKindKey] as? Bool) ?? false
         let jobIdString = metadata[WatchConnectivityCodec.audioJobIdKey] as? String
+        let sessionKey = metadata[WatchConnectivityCodec.audioSessionKeyKey] as? String
 
         // The incoming file is deleted once this method returns, so copy it to our own temp location first (synchronously).
         let dest = FileManager.default.temporaryDirectory.appendingPathComponent("watch-\(UUID().uuidString).m4a")
@@ -117,9 +118,10 @@ extension WatchConnectivityPhoneService: WCSessionDelegate {
                 try? FileManager.default.removeItem(at: dest)
                 return
             }
-            AppLog.info("iPhone received watch audio jobId=\(jobId) bytes=\((try? Data(contentsOf: dest))?.count ?? 0)")
+            let resolvedSessionKey = sessionKey ?? "agent:main:main"
+            AppLog.info("iPhone received watch audio jobId=\(jobId) sessionKey=\(resolvedSessionKey) bytes=\((try? Data(contentsOf: dest))?.count ?? 0)")
             BackgroundTaskService.begin("watchVoiceAudio")
-            await AppModel.shared.handleWatchAudio(jobId: jobId, fileURL: dest)
+            await AppModel.shared.handleWatchAudio(jobId: jobId, fileURL: dest, sessionKey: resolvedSessionKey)
             BackgroundTaskService.end()
         }
     }

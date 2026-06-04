@@ -31,17 +31,26 @@ enum GatewayJobError: LocalizedError {
 
 actor GatewayJobClient {
     private let appVersion: String
-    private let replyTimeoutSeconds: TimeInterval
+    /// We never cap how long an agent run may take. This is only the "connection is dead" window: if NO frame at all
+    /// (not even a `tick` keepalive) arrives for this long, we treat the socket as lost. The gateway ticks every
+    /// ~15–30s, so a healthy-but-busy run keeps streaming and is never cut off.
+    private let stallTimeoutSeconds: TimeInterval
 
     init(
         appVersion: String = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
-        replyTimeoutSeconds: TimeInterval = 120
+        stallTimeoutSeconds: TimeInterval = 90
     ) {
         self.appVersion = appVersion
-        self.replyTimeoutSeconds = replyTimeoutSeconds
+        self.stallTimeoutSeconds = stallTimeoutSeconds
     }
 
-    func runCommand(transcript: String, sessionKey: String) async throws -> String {
+    /// Runs a chat turn. `onProgress` streams the live chain of what OpenClaw is doing (operations, tools, thinking)
+    /// so the iPhone/Watch can show it. The run only fails on a real connection stall, not on a long-but-active agent.
+    func runCommand(
+        transcript: String,
+        sessionKey: String,
+        onProgress: @escaping @Sendable (String) -> Void = { _ in }
+    ) async throws -> String {
         AppLog.info("Submitting voice job via chat.send sessionKey=\(sessionKey) transcriptLength=\(transcript.count)")
 
         guard KeychainStore.isPaired, let gatewayURL = KeychainStore.loadGatewayURL() else {
@@ -78,6 +87,10 @@ actor GatewayJobClient {
         try await waitForHelloOk(on: task, connectId: connectId)
         AppLog.info("Job WS operator handshake succeeded")
 
+        // Subscribe to this session's live transcript/operation/tool events so we can stream the chain to the client.
+        try await sendSessionMessagesSubscribe(on: task, sessionKey: sessionKey)
+        AppLog.info("Subscribed to session messages sessionKey=\(sessionKey)")
+
         let chatSendId = UUID().uuidString
         try await sendChatSend(
             on: task,
@@ -86,10 +99,23 @@ actor GatewayJobClient {
             message: transcript
         )
         AppLog.info("chat.send dispatched sessionKey=\(sessionKey) id=\(chatSendId)")
+        onProgress("Sent. Waiting for agent…")
 
-        let reply = try await waitForReply(on: task, sessionKey: sessionKey, chatSendId: chatSendId)
+        let reply = try await waitForReply(on: task, sessionKey: sessionKey, chatSendId: chatSendId, onProgress: onProgress)
         AppLog.info("chat.send reply received length=\(reply.count)")
         return reply
+    }
+
+    private func sendSessionMessagesSubscribe(on task: URLSessionWebSocketTask, sessionKey: String) async throws {
+        let frame: [String: Any] = [
+            "type": "req",
+            "id": UUID().uuidString,
+            "method": "sessions.messages.subscribe",
+            "params": [
+                "sessionKey": sessionKey,
+            ],
+        ]
+        try await sendJSON(frame, on: task)
     }
 
     private func sendConnect(
@@ -193,31 +219,56 @@ actor GatewayJobClient {
     private func waitForReply(
         on task: URLSessionWebSocketTask,
         sessionKey: String,
-        chatSendId: String
+        chatSendId: String,
+        onProgress: @escaping @Sendable (String) -> Void
     ) async throws -> String {
-        let deadline = Date().addingTimeInterval(replyTimeoutSeconds)
         var latestText = ""
+        var lastProgress = ""
+        var sawAssistantDelta = false
 
-        while Date() < deadline {
-            let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0 else { break }
-            let json = try await receiveJSON(on: task, timeoutSeconds: min(remaining, 30))
+        func emit(_ text: String) {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed != lastProgress else { return }
+            lastProgress = trimmed
+            onProgress(trimmed)
+        }
 
-            if (json["type"] as? String) == "res",
-               (json["id"] as? String) == chatSendId,
-               (json["ok"] as? Bool) == false {
+        // No run cap: we wait as long as the agent keeps working. The only exit besides final/error is a dead socket,
+        // detected when receiveJSON sees no frame at all within the stall window.
+        while true {
+            let json: [String: Any]
+            do {
+                json = try await receiveJSON(on: task, timeoutSeconds: stallTimeoutSeconds)
+            } catch {
+                AppLog.error("Job WS stalled with no frames for \(stallTimeoutSeconds)s; connection lost")
+                throw GatewayJobError.timedOut
+            }
+
+            let type = json["type"] as? String
+
+            // Diagnostic: log every frame so we can see exactly what OpenClaw streams (event names + payload shape).
+            AppLog.info("WSFRAME \(describeFrame(json))")
+
+            if type == "res", (json["id"] as? String) == chatSendId, (json["ok"] as? Bool) == false {
                 let error = json["error"] as? [String: Any]
                 let message = (error?["message"] as? String) ?? (error?["code"] as? String) ?? "chat.send rejected"
                 AppLog.error("chat.send rejected: \(message)")
                 throw GatewayJobError.runFailed(message)
             }
 
-            guard (json["type"] as? String) == "event",
-                  (json["event"] as? String) == "chat",
-                  let payload = json["payload"] as? [String: Any],
-                  (payload["sessionKey"] as? String) == sessionKey else {
+            guard type == "event", let event = json["event"] as? String else { continue }
+            let payload = json["payload"] as? [String: Any] ?? [:]
+
+            // Live chain of what OpenClaw is doing for this session (operations, tools, transcript steps).
+            if event == "session.operation" || event == "session.tool" || event == "session.message" || event == "agent" {
+                if eventSessionKey(payload) == nil || eventSessionKey(payload) == sessionKey,
+                   let step = progressString(event: event, payload: payload) {
+                    emit(step)
+                }
                 continue
             }
+
+            guard event == "chat", (payload["sessionKey"] as? String) == sessionKey else { continue }
 
             let state = (payload["state"] as? String) ?? ""
             if let text = extractAssistantText(from: payload) {
@@ -226,6 +277,10 @@ actor GatewayJobClient {
 
             switch state {
             case "delta":
+                if !sawAssistantDelta {
+                    sawAssistantDelta = true
+                    emit("Responding…")
+                }
                 continue
             case "final":
                 let finalText = extractAssistantText(from: payload) ?? latestText
@@ -241,7 +296,55 @@ actor GatewayJobClient {
                 continue
             }
         }
-        throw GatewayJobError.timedOut
+    }
+
+    /// Compact one-line description of a frame for diagnostics: type, event/id, and a truncated JSON of the payload.
+    private func describeFrame(_ json: [String: Any]) -> String {
+        let type = (json["type"] as? String) ?? "?"
+        let event = (json["event"] as? String) ?? ""
+        let id = (json["id"] as? String) ?? ""
+        var payloadString = ""
+        if let payload = json["payload"],
+           let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+           let raw = String(data: data, encoding: .utf8) {
+            payloadString = raw.count > 600 ? String(raw.prefix(600)) + "…" : raw
+        }
+        return "type=\(type) event=\(event) id=\(id) payload=\(payloadString)"
+    }
+
+    private func eventSessionKey(_ payload: [String: Any]) -> String? {
+        if let key = payload["sessionKey"] as? String { return key }
+        if let session = payload["session"] as? [String: Any], let key = session["key"] as? String { return key }
+        return nil
+    }
+
+    /// Builds a short, human-readable status line from a streamed session/agent event.
+    private func progressString(event: String, payload: [String: Any]) -> String? {
+        func firstString(_ keys: [String]) -> String? {
+            for key in keys {
+                if let value = payload[key] as? String, !value.isEmpty { return value }
+            }
+            return nil
+        }
+
+        switch event {
+        case "session.tool":
+            let name = firstString(["tool", "name", "toolName", "title", "label"]) ?? "tool"
+            let status = firstString(["status", "state", "phase"])
+            return status != nil ? "Tool: \(name) (\(status!))" : "Tool: \(name)"
+        case "session.operation":
+            let label = firstString(["label", "title", "kind", "operation", "name", "type"]) ?? "operation"
+            let status = firstString(["status", "state", "phase"])
+            return status != nil ? "\(label) (\(status!))" : label
+        case "agent":
+            if let status = firstString(["status", "state", "phase"]) { return "Agent: \(status)" }
+            return "Working…"
+        case "session.message":
+            if let role = firstString(["role"]), role != "assistant" { return nil }
+            return nil
+        default:
+            return nil
+        }
     }
 
     private func extractAssistantText(from payload: [String: Any]) -> String? {

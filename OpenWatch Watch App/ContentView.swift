@@ -5,7 +5,17 @@ struct ContentView: View {
 
     var body: some View {
         NavigationStack {
-            WatchHomeView(model: model)
+            if model.isPaired {
+                TabView(selection: $model.currentIndex) {
+                    ForEach(Array(model.sessions.enumerated()), id: \.element.id) { idx, session in
+                        WatchSessionPage(model: model, session: session, index: idx)
+                            .tag(idx)
+                    }
+                }
+                .tabViewStyle(.verticalPage)
+            } else {
+                WatchNotPairedView()
+            }
         }
         .onAppear {
             WatchConnectivityWatchService.shared.requestSync()
