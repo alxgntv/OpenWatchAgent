@@ -8,6 +8,12 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
 
     private let session = WCSession.default
 
+    /// True only when the Watch app is currently reachable (its app is active/foreground). The iPhone cannot launch
+    /// the Watch app itself — watchOS provides no such API — so commands only take effect while this is true.
+    var isWatchReachable: Bool {
+        session.activationState == .activated && session.isReachable
+    }
+
     override private init() {
         super.init()
         if WCSession.isSupported() {

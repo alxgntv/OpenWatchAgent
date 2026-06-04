@@ -77,6 +77,12 @@ final class AppModel: ObservableObject {
         pairing.phase == .connected || KeychainStore.isPaired
     }
 
+    /// Whether the Watch app is reachable right now (its app is active). The iPhone cannot launch the Watch app itself,
+    /// so a remote "start listening" only takes effect while this is true.
+    var isWatchReachable: Bool {
+        watchBridge.isWatchReachable
+    }
+
     /// Loads the real session index from the gateway. Called on the sessions screen appear and on pull-to-refresh.
     func refreshSessions() async {
         guard isPaired else { return }

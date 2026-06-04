@@ -156,6 +156,7 @@ struct SessionDetailView: View {
     @State private var browserURL: IdentifiableURL?
     @State private var draft: String = ""
     @State private var sending = false
+    @State private var showWatchHint = false
     @FocusState private var inputFocused: Bool
 
     var body: some View {
@@ -205,6 +206,11 @@ struct SessionDetailView: View {
                 guard let lastID else { return }
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(lastID, anchor: .bottom) }
             }
+            .alert("Open OpenWatch on your Watch", isPresented: $showWatchHint) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("watchOS does not let the iPhone launch the Watch app. Open OpenWatch on your Apple Watch, then tap the mic again to record.")
+            }
             .refreshable { await load() }
             .task { await load() }
         }
@@ -249,8 +255,14 @@ struct SessionDetailView: View {
             .buttonStyle(.plain)
         } else {
             Button {
-                AppLog.info("SessionDetailView mic tapped sessionKey=\(session.id); triggering remote listen on Watch")
-                model.toggleListenOnPhone()
+                AppLog.info("SessionDetailView mic tapped sessionKey=\(session.id) watchReachable=\(model.isWatchReachable)")
+                // The iPhone cannot launch the Watch app (watchOS limitation). If the Watch app is not active, tell the
+                // user to open it; otherwise remote-start the recording on the Watch.
+                if model.isWatchReachable {
+                    model.toggleListenOnPhone()
+                } else {
+                    showWatchHint = true
+                }
             } label: {
                 Image(systemName: isListening ? "mic.fill" : "mic")
                     .font(.system(size: 20, weight: .semibold))
