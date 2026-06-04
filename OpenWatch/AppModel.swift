@@ -37,6 +37,12 @@ final class AppModel: ObservableObject {
     private var lastWatchCommandKey: String?
     private var lastWatchCommandAt: Date?
     private var approvalPollTask: Task<Void, Never>?
+    /// Last gateway session list (with recent history) pushed to the Watch, so we can re-push it on a Watch sync request.
+    private var watchGatewaySessions: [WatchGatewaySession] = []
+    /// Tracks the in-flight Watch enrichment so a new refresh supersedes an older one.
+    private var watchEnrichTask: Task<Void, Never>?
+    /// How many recent messages per session we mirror onto the Watch.
+    private let watchHistoryLimit = 20
 
     private init() {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
@@ -78,9 +84,48 @@ final class AppModel: ObservableObject {
             let rows = try await jobClient.listSessions()
             gatewaySessions = rows
             AppLog.info("Loaded \(rows.count) gateway sessions")
+            // Push the list to the Watch immediately so its horizontal pages appear fast, then enrich with recent history.
+            pushSessionListToWatch(rows: rows)
+            startWatchEnrichment(rows: rows)
         } catch {
             errorBanner = error.localizedDescription
             AppLog.error("refreshSessions failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Pushes the bare session list (no messages yet) to the Watch so pages render immediately.
+    private func pushSessionListToWatch(rows: [GatewaySessionRow]) {
+        let list = rows.map { WatchGatewaySession(id: $0.id, title: $0.title, preview: $0.preview, messages: []) }
+        watchGatewaySessions = list
+        watchBridge.publishGatewaySessions(list)
+    }
+
+    /// Fetches recent history for each gateway session and re-pushes the enriched list to the Watch.
+    private func startWatchEnrichment(rows: [GatewaySessionRow]) {
+        watchEnrichTask?.cancel()
+        let limit = watchHistoryLimit
+        watchEnrichTask = Task { [weak self] in
+            guard let self else { return }
+            var built: [WatchGatewaySession] = []
+            for row in rows {
+                if Task.isCancelled { return }
+                var recent: [WatchHistoryMessage] = []
+                do {
+                    let messages = try await self.jobClient.fetchHistory(sessionKey: row.id)
+                    recent = messages.suffix(limit).map {
+                        WatchHistoryMessage(id: $0.id, isUser: $0.isUser, text: String($0.text.prefix(500)))
+                    }
+                } catch {
+                    AppLog.error("Watch enrich history failed sessionKey=\(row.id): \(error.localizedDescription)")
+                }
+                built.append(WatchGatewaySession(id: row.id, title: row.title, preview: row.preview, messages: recent))
+            }
+            if Task.isCancelled { return }
+            await MainActor.run {
+                self.watchGatewaySessions = built
+                self.watchBridge.publishGatewaySessions(built)
+                AppLog.info("Pushed \(built.count) gateway sessions with recent history to Watch")
+            }
         }
     }
 
@@ -150,7 +195,10 @@ final class AppModel: ObservableObject {
         pairing = PairingSnapshot(phase: .needsSetupCode, message: "Enter a new setup code.")
         jobs = []
         gatewaySessions = []
+        watchEnrichTask?.cancel()
+        watchGatewaySessions = []
         activeJobId = nil
+        watchBridge.publishGatewaySessions([])
         Task { await jobClient.closeReadSocket() }
         syncWatch()
     }
@@ -188,6 +236,12 @@ final class AppModel: ObservableObject {
         case .requestSync:
             AppLog.info("Watch requested sync; republishing pairing + jobs")
             syncWatch()
+            // Mirror gateway sessions too: re-push the cached list if we have it, otherwise fetch it now.
+            if !watchGatewaySessions.isEmpty {
+                watchBridge.publishGatewaySessions(watchGatewaySessions)
+            } else if isPaired {
+                Task { await refreshSessions() }
+            }
         default:
             break
         }

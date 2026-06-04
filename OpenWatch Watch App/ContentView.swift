@@ -6,13 +6,14 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             if model.isPaired {
-                TabView(selection: $model.currentIndex) {
-                    ForEach(Array(model.sessions.enumerated()), id: \.element.id) { idx, session in
-                        WatchSessionPage(model: model, session: session, index: idx)
-                            .tag(idx)
+                // Outer axis = HORIZONTAL (default watchOS paging): page 0 is the live stack (unchanged),
+                // swiping left/right reveals one page per real gateway session mirrored from the iPhone.
+                TabView {
+                    liveStack
+                    ForEach(model.gatewaySessions) { gatewaySession in
+                        GatewaySessionPage(model: model, session: gatewaySession)
                     }
                 }
-                .tabViewStyle(.verticalPage)
             } else {
                 WatchNotPairedView()
             }
@@ -21,6 +22,17 @@ struct ContentView: View {
             WatchConnectivityWatchService.shared.requestSync()
             AppLog.info("OpenWatch Watch app launched")
         }
+    }
+
+    /// The existing vertical session stack, untouched: swipe up to the empty top page starts a brand-new session.
+    private var liveStack: some View {
+        TabView(selection: $model.currentIndex) {
+            ForEach(Array(model.sessions.enumerated()), id: \.element.id) { idx, session in
+                WatchSessionPage(model: model, session: session, index: idx)
+                    .tag(idx)
+            }
+        }
+        .tabViewStyle(.verticalPage)
     }
 }
 

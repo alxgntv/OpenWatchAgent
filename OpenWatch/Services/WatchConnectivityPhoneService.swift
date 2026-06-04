@@ -29,6 +29,14 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         pushToWatch(envelope, preferImmediate: true)
     }
 
+    /// Pushes the real gateway session index (with recent history) so the Watch can show horizontal session pages.
+    func publishGatewaySessions(_ sessions: [WatchGatewaySession]) {
+        guard session.activationState == .activated else { return }
+        let envelope = WatchEnvelope(kind: .gatewaySessions, gatewaySessions: sessions)
+        pushToWatch(envelope, preferImmediate: true)
+        AppLog.info("Pushed \(sessions.count) gateway sessions to Watch")
+    }
+
     /// iPhone → Watch command (e.g. remote-start a recording). Delivered immediately when the Watch app is reachable,
     /// otherwise queued via transferUserInfo (the Watch can only act on it once its app is active — watchOS limitation).
     func sendCommandToWatch(_ envelope: WatchEnvelope) {

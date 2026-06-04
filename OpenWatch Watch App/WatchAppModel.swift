@@ -42,6 +42,8 @@ final class WatchAppModel: ObservableObject {
     @Published var globalTtsEnabled: Bool = true
     /// BCP-47 language used to speak replies, mirrored from the iPhone app.
     @Published var globalTtsLanguage: String = "en-US"
+    /// Real gateway sessions (with recent history) mirrored from the iPhone — shown as horizontal pages.
+    @Published var gatewaySessions: [WatchGatewaySession] = []
 
     private let bridge = WatchConnectivityWatchService.shared
     let recorder = WatchAudioRecorder()
@@ -53,6 +55,13 @@ final class WatchAppModel: ObservableObject {
     private var spokenJobIds: Set<UUID> = []
     /// The session that the in-progress recording will be attached to (captured at record start).
     private var recordingSessionId: UUID?
+    /// Live turns the Watch started inside a gateway-session page, keyed by gateway sessionKey (newest-first).
+    /// Kept separate from `gatewaySessions` (which the iPhone overwrites on every push) so local turns survive refreshes.
+    @Published private var gatewayJobs: [String: [VoiceJob]] = [:]
+    /// Maps a jobId to a gateway sessionKey when the recording was started on a gateway page.
+    private var jobGatewayKey: [UUID: String] = [:]
+    /// The gateway sessionKey the in-progress recording belongs to (set when recording starts on a gateway page).
+    private var gatewayRecordingKey: String?
 
     private init() {
         sessions = [WatchSession(sessionKey: "agent:main:main")]
@@ -96,6 +105,11 @@ final class WatchAppModel: ObservableObject {
         case .startListening:
             AppLog.info("Watch received remote startListening from iPhone")
             handleRemoteStartListening()
+        case .gatewaySessions:
+            if let sessions = envelope.gatewaySessions {
+                gatewaySessions = sessions
+                AppLog.info("Watch received \(sessions.count) gateway sessions from iPhone")
+            }
         default:
             break
         }
@@ -227,12 +241,124 @@ final class WatchAppModel: ObservableObject {
         guard recorder.isRecording else { return }
         recorder.cancel()
         recordingSessionId = nil
+        gatewayRecordingKey = nil
         statusHint = "Cancelled"
         objectWillChange.send()
         AppLog.info("Watch cancelled recording")
     }
 
+    // MARK: - Gateway session pages (horizontal)
+
+    /// Live turns the Watch started inside a gateway-session page (newest-first). Read by the gateway page UI.
+    func gatewayTurns(for sessionKey: String) -> [VoiceJob] {
+        gatewayJobs[sessionKey] ?? []
+    }
+
+    /// The in-flight turn for a gateway page, if any (drives the spinner + status inside the Speak button).
+    func gatewayActiveJob(for sessionKey: String) -> VoiceJob? {
+        gatewayJobs[sessionKey]?.first { !$0.status.isTerminal && $0.status != .idle }
+    }
+
+    /// True while the global recorder is capturing audio destined for this specific gateway session.
+    func isRecordingGateway(_ sessionKey: String) -> Bool {
+        recorder.isRecording && gatewayRecordingKey == sessionKey
+    }
+
+    /// Push-to-talk for a gateway session: first tap records, second tap stops and ships the audio tagged with this key.
+    func toggleGatewayRecord(sessionKey: String) {
+        guard isPaired else {
+            statusHint = "Pair on iPhone first."
+            AppLog.error("Watch gateway toggleRecord blocked: not paired")
+            return
+        }
+        if recorder.isRecording {
+            Task { await finishGatewayRecordingAndSend() }
+        } else {
+            Task { await beginGatewayRecording(sessionKey: sessionKey) }
+        }
+    }
+
+    private func beginGatewayRecording(sessionKey: String) async {
+        AppLog.info("Watch beginGatewayRecording sessionKey=\(sessionKey) — requesting mic permission")
+        let granted = await recorder.ensurePermission()
+        guard granted else {
+            statusHint = "Allow Microphone in Watch Settings."
+            AppLog.error("Watch gateway beginRecording blocked: mic denied")
+            return
+        }
+        do {
+            try recorder.startRecording()
+            gatewayRecordingKey = sessionKey
+            recordingSessionId = nil
+            statusHint = "Recording… tap to send."
+            objectWillChange.send()
+            AppLog.info("Watch gateway recording started sessionKey=\(sessionKey)")
+        } catch {
+            statusHint = "Mic error"
+            AppLog.error("Watch gateway startRecording failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func finishGatewayRecordingAndSend() async {
+        guard let url = recorder.stopRecording() else {
+            statusHint = "Recording failed"
+            gatewayRecordingKey = nil
+            objectWillChange.send()
+            AppLog.error("Watch gateway finishRecording: no file")
+            return
+        }
+        objectWillChange.send()
+
+        guard let key = gatewayRecordingKey else {
+            statusHint = "Recording failed"
+            AppLog.error("Watch gateway finishRecording: target sessionKey missing")
+            return
+        }
+        gatewayRecordingKey = nil
+
+        let job = VoiceJob(status: .sending, statusDetail: "Sending…")
+        pendingJobIds.insert(job.id)
+        jobGatewayKey[job.id] = key
+        gatewayJobs[key, default: []].insert(job, at: 0)
+
+        bridge.sendAudio(fileURL: url, jobId: job.id, sessionKey: key)
+        statusHint = "Sending…"
+        AppLog.info("Watch sent gateway audio jobId=\(job.id) sessionKey=\(key)")
+    }
+
+    /// Applies an iPhone job update to a gateway-session turn (mirrors the local upsert behavior, but on `gatewayJobs`).
+    private func upsertGateway(_ job: VoiceJob, key: String) {
+        var arr = gatewayJobs[key] ?? []
+        if let ji = arr.firstIndex(where: { $0.id == job.id }) {
+            arr[ji] = job
+        } else {
+            arr.insert(job, at: 0)
+        }
+        gatewayJobs[key] = arr
+        if job.status.isTerminal { pendingJobIds.remove(job.id) }
+
+        switch job.status {
+        case .sending, .running:
+            statusHint = job.statusDetail ?? "Working…"
+        case .done:
+            statusHint = nil
+            // Gateway pages have no per-session mute; honor only the global TTS switch.
+            speakOnce(job, muted: false)
+        case .failed:
+            statusHint = job.errorMessage ?? "Failed"
+        case .cancelled:
+            statusHint = "Cancelled"
+        case .idle, .listening:
+            break
+        }
+    }
+
     private func upsert(_ job: VoiceJob) {
+        // Turns started on a gateway-session page are tracked separately and never touch the local vertical sessions.
+        if let key = jobGatewayKey[job.id] {
+            upsertGateway(job, key: key)
+            return
+        }
         guard let sessionId = jobSession[job.id],
               let si = sessions.firstIndex(where: { $0.id == sessionId }) else {
             AppLog.info("Watch upsert: job has no known session jobId=\(job.id); ignoring")

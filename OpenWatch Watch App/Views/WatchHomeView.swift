@@ -105,6 +105,92 @@ struct WatchSessionPage: View {
     }
 }
 
+/// One horizontal page == one real gateway session (mirrored from the iPhone). Shows recent history and lets you keep
+/// talking into THIS session via Speak. Live turns started here are tracked locally so they appear immediately.
+struct GatewaySessionPage: View {
+    @ObservedObject var model: WatchAppModel
+    let session: WatchGatewaySession
+
+    private var activeJob: VoiceJob? { model.gatewayActiveJob(for: session.id) }
+    private var isRecordingHere: Bool { model.isRecordingGateway(session.id) }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 8) {
+                speakButton
+                history
+            }
+            .padding(.horizontal, 4)
+            .frame(maxWidth: .infinity)
+        }
+        .navigationTitle(titleText)
+    }
+
+    private var titleText: String {
+        if !session.title.isEmpty, session.title != session.id { return session.title }
+        return "Session"
+    }
+
+    private var speakButton: some View {
+        Button {
+            model.toggleGatewayRecord(sessionKey: session.id)
+        } label: {
+            VStack(spacing: 4) {
+                if isRecordingHere {
+                    Image(systemName: "stop.fill").font(.title2)
+                    Text("Stop & Send").font(.caption2)
+                } else if let job = activeJob {
+                    ProgressView()
+                    Text(job.statusDetail ?? "Working…")
+                        .font(.caption2)
+                        .multilineTextAlignment(.center)
+                } else {
+                    Image(systemName: "mic.fill").font(.title2)
+                    Text("Speak").font(.caption2)
+                }
+            }
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(isRecordingHere ? .red : .blue)
+        .disabled(activeJob != nil)
+    }
+
+    @ViewBuilder
+    private var history: some View {
+        let turns = model.gatewayTurns(for: session.id)
+        if turns.isEmpty, session.messages.isEmpty {
+            Text("Tap Speak to continue this session.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                // Live turns started on this page (newest-first): agent reply above the recognized text.
+                ForEach(turns) { job in
+                    VStack(alignment: .leading, spacing: 2) {
+                        if let result = job.resultText {
+                            Text(result).font(.footnote)
+                        } else if let error = job.errorMessage {
+                            Text(error).font(.caption2).foregroundStyle(.red)
+                        }
+                        if let transcript = job.transcript {
+                            Text(transcript).font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                // Recent server history (oldest-first slice) reversed so the newest message is on top.
+                ForEach(Array(session.messages.reversed())) { message in
+                    Text(message.text)
+                        .font(message.isUser ? .caption2 : .footnote)
+                        .foregroundStyle(message.isUser ? Color.secondary : Color.primary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+}
+
 struct WatchNotPairedView: View {
     var body: some View {
         VStack(spacing: 6) {
