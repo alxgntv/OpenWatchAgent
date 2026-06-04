@@ -34,17 +34,47 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         }
     }
 
-    func publish(pairing: PairingSnapshot, jobs: [VoiceJob], ttsEnabled: Bool, ttsLanguage: String) {
-        cachedPairingForWatch = pairing
+    func publish(
+        pairing: PairingSnapshot,
+        jobs: [VoiceJob],
+        ttsEnabled: Bool,
+        ttsLanguage: String,
+        revokeGatewayPairing: Bool = false
+    ) {
+        let outbound = revokeGatewayPairing ? pairing : Self.pairingForWatchOutbound(pairing)
+        cachedPairingForWatch = outbound
         cachedTtsEnabledForWatch = ttsEnabled
         cachedTtsLanguageForWatch = ttsLanguage
-        AppLog.info("Cached Watch pairing phase=\(pairing.phase.rawValue) for context enrichment")
+        AppLog.info("Cached Watch pairing phase=\(outbound.phase.rawValue) revoke=\(revokeGatewayPairing) for context enrichment")
         guard session.activationState == .activated else {
             AppLog.info("WCSession not activated on iPhone; pairing cached but push deferred")
             return
         }
-        let envelope = WatchEnvelope(kind: .jobsSnapshot, pairing: pairing, jobs: jobs, ttsEnabled: ttsEnabled, ttsLanguage: ttsLanguage)
+        let envelope = WatchEnvelope(
+            kind: .jobsSnapshot,
+            pairing: outbound,
+            jobs: jobs,
+            ttsEnabled: ttsEnabled,
+            ttsLanguage: ttsLanguage,
+            revokeGatewayPairing: revokeGatewayPairing ? true : nil
+        )
         pushToWatch(envelope, preferImmediate: true)
+    }
+
+    /// While Keychain still has gateway credentials, never push needsSetupCode/failed to the Watch (sticky pairing).
+    private static func pairingForWatchOutbound(_ pairing: PairingSnapshot) -> PairingSnapshot {
+        guard KeychainStore.isPaired,
+              pairing.phase != .connected,
+              let url = KeychainStore.loadGatewayURL()?.absoluteString else {
+            return pairing
+        }
+        AppLog.info("Normalized outbound Watch pairing \(pairing.phase.rawValue) -> connected (keychain still paired)")
+        return PairingSnapshot(
+            phase: .connected,
+            gatewayURL: url,
+            message: pairing.message ?? "Connected.",
+            deviceId: pairing.deviceId
+        )
     }
 
     func publish(job: VoiceJob) {
@@ -66,7 +96,7 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         guard session.activationState == .activated else { return }
         let envelope = WatchEnvelope(kind: .usage, usage: usage)
         pushToWatch(envelope, preferImmediate: true)
-        AppLog.info("Pushed usage to Watch sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens)")
+        AppLog.info("Pushed usage to Watch agents=\(usage.agentCount) sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens)")
     }
 
     /// Pushes configured gateway agents and the active selection to the Watch's Agents page.
@@ -104,10 +134,20 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
 
     /// Merges cached pairing/TTS into every outbound context so the Watch never loses connected state on partial updates.
     private func enrichWatchEnvelope(_ envelope: WatchEnvelope) -> WatchEnvelope {
+        let mergedPairing: PairingSnapshot?
+        if envelope.revokeGatewayPairing == true {
+            mergedPairing = envelope.pairing ?? cachedPairingForWatch
+        } else if let explicit = envelope.pairing {
+            mergedPairing = Self.pairingForWatchOutbound(explicit)
+        } else if let cached = cachedPairingForWatch {
+            mergedPairing = Self.pairingForWatchOutbound(cached)
+        } else {
+            mergedPairing = nil
+        }
         let enriched = WatchEnvelope(
             kind: envelope.kind,
             jobId: envelope.jobId,
-            pairing: envelope.pairing ?? cachedPairingForWatch,
+            pairing: mergedPairing,
             job: envelope.job,
             jobs: envelope.jobs,
             text: envelope.text,
@@ -116,7 +156,8 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
             gatewaySessions: envelope.gatewaySessions,
             usage: envelope.usage,
             gatewayAgents: envelope.gatewayAgents,
-            selectedAgentId: envelope.selectedAgentId
+            selectedAgentId: envelope.selectedAgentId,
+            revokeGatewayPairing: envelope.revokeGatewayPairing
         )
         if enriched.pairing == nil, cachedPairingForWatch == nil {
             AppLog.info("Watch context enrich kind=\(envelope.kind.rawValue) has no cached pairing yet")

@@ -244,18 +244,46 @@ final class AppModel: ObservableObject {
     }
 
     /// Maps gateway usage to the Watch transport type and pushes it to the Watch's Usage page.
+    private var configuredAgentCount: Int {
+        gatewayAgents.isEmpty ? watchAgentsPayload.count : gatewayAgents.count
+    }
+
     private func pushUsageToWatch(_ usage: GatewayUsage) {
-        let watch = WatchUsage(
+        let watch = usageSnapshotForWatch(from: usage, agentCount: configuredAgentCount)
+        watchUsage = watch
+        AppLog.info("Pushing usage to Watch sessions=\(watch.sessionCount) agents=\(watch.agentCount) totalTokens=\(watch.totalTokens)")
+        watchBridge.publishUsage(watch)
+    }
+
+    /// Rebuilds cached usage for Watch sync so agent count stays current after `agents.list`.
+    private func usageSnapshotForWatch(from usage: GatewayUsage, agentCount: Int) -> WatchUsage {
+        WatchUsage(
             sessionCount: usage.sessionCount,
             totalTokens: usage.totalTokens,
             inputTokens: usage.inputTokens,
             outputTokens: usage.outputTokens,
             totalMessages: usage.totalMessages,
             lastActivityAt: usage.lastActivityAt,
-            model: usage.model
+            model: usage.model,
+            agentCount: agentCount
         )
-        watchUsage = watch
-        watchBridge.publishUsage(watch)
+    }
+
+    private func republishCachedUsageToWatch() {
+        guard let cached = watchUsage else { return }
+        let updated = WatchUsage(
+            sessionCount: cached.sessionCount,
+            totalTokens: cached.totalTokens,
+            inputTokens: cached.inputTokens,
+            outputTokens: cached.outputTokens,
+            totalMessages: cached.totalMessages,
+            lastActivityAt: cached.lastActivityAt,
+            model: cached.model,
+            agentCount: configuredAgentCount
+        )
+        watchUsage = updated
+        watchBridge.publishUsage(updated)
+        AppLog.info("Republished usage to Watch agents=\(updated.agentCount) sessions=\(updated.sessionCount)")
     }
 
     /// Pushes the bare session list (no messages yet) to the Watch so pages render immediately.
@@ -307,17 +335,25 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func submitSetupCode(_ raw: String) {
+    /// Connects to any OpenClaw gateway: paste a full `openclaw qr` setup code, or enter gateway address + bootstrap token.
+    func submitPairing(gatewayURL: String, setupCode: String) {
         Task {
             pairing.phase = .connecting
             pairing.message = "Connecting…"
             errorBanner = nil
             syncWatch()
             do {
-                let payload = try SetupCodeDecoder.decode(raw)
+                let payload = try SetupCodeDecoder.resolvePairingInput(
+                    gatewayURLInput: gatewayURL,
+                    setupCodeInput: setupCode
+                )
+                AppLog.info(
+                    "submitPairing connecting host=\(payload.gatewayURL.host ?? "unknown") port=\(payload.gatewayURL.port ?? 0)"
+                )
                 let snapshot = try await pairingClient.connect(using: payload)
                 pairing = snapshot
-                AppLog.info("Pairing phase=\(snapshot.phase.rawValue)")
+                SetupCodeDecoder.saveLastGatewayURL(payload.gatewayURL)
+                AppLog.info("Pairing phase=\(snapshot.phase.rawValue) gatewayHost=\(payload.gatewayURL.host ?? "unknown")")
                 if snapshot.phase == .waitingForApproval {
                     startApprovalPolling()
                 } else {
@@ -368,7 +404,7 @@ final class AppModel: ObservableObject {
         activeJobId = nil
         watchBridge.publishGatewaySessions([])
         Task { await jobClient.closeReadSocket() }
-        syncWatch()
+        syncWatch(revokeGatewayPairing: true)
     }
 
     func handleWatchMessage(_ data: Data) async {
@@ -412,17 +448,12 @@ final class AppModel: ObservableObject {
             pushSessionListToWatch(rows: gatewaySessions)
             startWatchEnrichment(rows: gatewaySessions(forAgentId: agentId))
         case .requestSync:
-            if KeychainStore.isPaired, pairing.phase != .connected,
-               let url = KeychainStore.loadGatewayURL()?.absoluteString {
-                pairing = PairingSnapshot(phase: .connected, gatewayURL: url, message: "Connected.")
-                AppLog.info("Watch requestSync: repaired iPhone pairing snapshot from keychain")
-            }
             AppLog.info("Watch requested sync; republishing pairing + jobs phase=\(pairing.phase.rawValue) keychainPaired=\(KeychainStore.isPaired)")
             syncWatch()
             // Mirror gateway sessions + usage too: re-push the cached values if we have them, otherwise fetch now.
             if !watchGatewaySessions.isEmpty {
                 watchBridge.publishGatewaySessions(watchGatewaySessions)
-                if let watchUsage { watchBridge.publishUsage(watchUsage) }
+                republishCachedUsageToWatch()
                 if !watchAgentsPayload.isEmpty {
                     watchBridge.publishAgents(watchAgentsPayload, selectedAgentId: selectedAgentId)
                 }
@@ -562,7 +593,7 @@ final class AppModel: ObservableObject {
         guard isPaired else { return }
         if !watchGatewaySessions.isEmpty {
             watchBridge.publishGatewaySessions(watchGatewaySessions)
-            if let watchUsage { watchBridge.publishUsage(watchUsage) }
+            republishCachedUsageToWatch()
             if !watchAgentsPayload.isEmpty {
                 watchBridge.publishAgents(watchAgentsPayload, selectedAgentId: selectedAgentId)
             }
@@ -737,8 +768,14 @@ final class AppModel: ObservableObject {
         syncWatch(job: jobs[index])
     }
 
-    private func syncWatch(job: VoiceJob? = nil) {
-        watchBridge.publish(pairing: pairing, jobs: jobs, ttsEnabled: ttsEnabled, ttsLanguage: ttsLanguage)
+    private func syncWatch(job: VoiceJob? = nil, revokeGatewayPairing: Bool = false) {
+        watchBridge.publish(
+            pairing: pairing,
+            jobs: jobs,
+            ttsEnabled: ttsEnabled,
+            ttsLanguage: ttsLanguage,
+            revokeGatewayPairing: revokeGatewayPairing
+        )
         if let job { watchBridge.publish(job: job) }
     }
 

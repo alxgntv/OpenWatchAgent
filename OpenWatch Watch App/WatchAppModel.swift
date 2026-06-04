@@ -98,8 +98,9 @@ final class WatchAppModel: ObservableObject {
         restorePairingFromLocalCache()
     }
 
+    /// Sticky gateway pairing: once connected, stays paired until iPhone sends revokeGatewayPairing (Disconnect).
     var isPaired: Bool {
-        pairing.phase == .connected
+        UserDefaults.standard.bool(forKey: PairingLocalCache.wasConnectedKey) || pairing.phase == .connected
     }
 
     private func restorePairingFromLocalCache() {
@@ -120,38 +121,46 @@ final class WatchAppModel: ObservableObject {
 
     /// True when local cache says we were gateway-connected; used to ignore stale WCSession applicationContext.
     func shouldSkipStaleApplicationContext() -> Bool {
-        let skip = UserDefaults.standard.bool(forKey: PairingLocalCache.wasConnectedKey) && pairing.phase == .connected
+        let skip = UserDefaults.standard.bool(forKey: PairingLocalCache.wasConnectedKey)
         if skip {
-            AppLog.info("Watch shouldSkipStaleApplicationContext=true (local connected cache)")
+            AppLog.info("Watch shouldSkipStaleApplicationContext=true (sticky pairing cache)")
         }
         return skip
     }
 
-    private func shouldAcceptRemotePairing(_ remote: PairingSnapshot, envelopeKind: WatchMessageKind) -> Bool {
+    private func shouldAcceptRemotePairing(
+        _ remote: PairingSnapshot,
+        envelopeKind: WatchMessageKind,
+        revokeGatewayPairing: Bool
+    ) -> Bool {
+        let sticky = UserDefaults.standard.bool(forKey: PairingLocalCache.wasConnectedKey)
         switch remote.phase {
         case .connected:
             return true
         case .connecting, .waitingForApproval:
-            if pairing.phase == .connected {
-                AppLog.info("Watch ignored pairing phase=\(remote.phase.rawValue) from kind=\(envelopeKind.rawValue) while connected")
+            if sticky || pairing.phase == .connected {
+                AppLog.info("Watch ignored pairing phase=\(remote.phase.rawValue) from kind=\(envelopeKind.rawValue) (sticky paired)")
                 return false
             }
             return true
         case .needsSetupCode, .failed:
-            // Only jobsSnapshot is authoritative for disconnect; usage/agents/gatewaySessions used to carry
-            // stale needsSetupCode via enrich gaps and WCSession context replay.
-            if pairing.phase == .connected,
-               UserDefaults.standard.bool(forKey: PairingLocalCache.wasConnectedKey),
-               envelopeKind != .jobsSnapshot {
-                AppLog.info("Watch ignored pairing downgrade to \(remote.phase.rawValue) from kind=\(envelopeKind.rawValue); awaiting jobsSnapshot")
-                return false
+            guard revokeGatewayPairing else {
+                if sticky {
+                    AppLog.info("Watch ignored pairing downgrade to \(remote.phase.rawValue) from kind=\(envelopeKind.rawValue) without revokeGatewayPairing")
+                }
+                return !sticky
             }
+            AppLog.info("Watch accepting pairing revoke to \(remote.phase.rawValue) from kind=\(envelopeKind.rawValue)")
             return true
         }
     }
 
-    private func persistPairingFromPhone(_ snapshot: PairingSnapshot, envelopeKind: WatchMessageKind) {
-        guard shouldAcceptRemotePairing(snapshot, envelopeKind: envelopeKind) else { return }
+    private func persistPairingFromPhone(
+        _ snapshot: PairingSnapshot,
+        envelopeKind: WatchMessageKind,
+        revokeGatewayPairing: Bool
+    ) {
+        guard shouldAcceptRemotePairing(snapshot, envelopeKind: envelopeKind, revokeGatewayPairing: revokeGatewayPairing) else { return }
         pairing = snapshot
         switch snapshot.phase {
         case .connected:
@@ -162,18 +171,23 @@ final class WatchAppModel: ObservableObject {
             if let deviceId = snapshot.deviceId {
                 UserDefaults.standard.set(deviceId, forKey: PairingLocalCache.deviceIdKey)
             }
-            AppLog.info("Watch persisted connected pairing to local cache")
+            AppLog.info("Watch persisted sticky connected pairing to local cache")
         case .needsSetupCode, .failed:
+            guard revokeGatewayPairing else {
+                AppLog.info("Watch kept sticky cache despite phase=\(snapshot.phase.rawValue) (no revoke)")
+                return
+            }
             UserDefaults.standard.set(false, forKey: PairingLocalCache.wasConnectedKey)
-            AppLog.info("Watch cleared pairing local cache phase=\(snapshot.phase.rawValue)")
+            AppLog.info("Watch cleared sticky pairing cache after explicit revoke phase=\(snapshot.phase.rawValue)")
         case .connecting, .waitingForApproval:
-            AppLog.info("Watch pairing intermediate phase=\(snapshot.phase.rawValue); local cache unchanged")
+            AppLog.info("Watch pairing intermediate phase=\(snapshot.phase.rawValue); sticky cache unchanged")
         }
     }
 
     private func applyRemotePairingAndTts(from envelope: WatchEnvelope) {
+        let revoke = envelope.revokeGatewayPairing == true
         if let remote = envelope.pairing {
-            persistPairingFromPhone(remote, envelopeKind: envelope.kind)
+            persistPairingFromPhone(remote, envelopeKind: envelope.kind, revokeGatewayPairing: revoke)
         }
         applyGlobalTts(envelope.ttsEnabled)
         applyTtsLanguage(envelope.ttsLanguage)
@@ -237,6 +251,38 @@ final class WatchAppModel: ObservableObject {
         gatewaySessions.filter { sessionAgentId(from: $0.id) == agentId }.count
     }
 
+    /// Agent row for `selectedAgentId` (same name/emoji as on the Agents page).
+    var selectedAgentDisplay: WatchGatewayAgent? {
+        sortedAgentsForDisplay.first { $0.id == selectedAgentId }
+    }
+
+    /// Emoji for the active agent (same as Agents page card).
+    func selectedAgentEmojiSymbol() -> String {
+        if let agent = selectedAgentDisplay {
+            return agentEmoji(for: agent)
+        }
+        return selectedAgentId == "main" ? "🎯" : "🤖"
+    }
+
+    /// Display name for the active agent (Main Actor for `main`).
+    func selectedAgentTitleName() -> String {
+        if let agent = selectedAgentDisplay {
+            return agentDisplayName(for: agent)
+        }
+        return selectedAgentId == "main" ? "Main Actor" : selectedAgentId
+    }
+
+    private func agentDisplayName(for agent: WatchGatewayAgent) -> String {
+        agent.id == "main" ? "Main Actor" : agent.name
+    }
+
+    private func agentEmoji(for agent: WatchGatewayAgent) -> String {
+        if let emoji = agent.emoji?.trimmingCharacters(in: .whitespacesAndNewlines), !emoji.isEmpty {
+            return emoji
+        }
+        return agent.id == "main" ? "🎯" : "🤖"
+    }
+
     private func newSessionKey() -> String {
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         return "agent:\(selectedAgentId):\(token)"
@@ -254,7 +300,7 @@ final class WatchAppModel: ObservableObject {
             AppLog.error("Watch failed to decode envelope")
             return
         }
-        AppLog.info("Watch applyEnvelope kind=\(envelope.kind.rawValue) pairingPhase=\(envelope.pairing?.phase.rawValue ?? "unchanged")")
+        AppLog.info("Watch applyEnvelope kind=\(envelope.kind.rawValue) pairingPhase=\(envelope.pairing?.phase.rawValue ?? "unchanged") revoke=\(envelope.revokeGatewayPairing == true)")
         applyRemotePairingAndTts(from: envelope)
         switch envelope.kind {
         case .pairingSnapshot, .jobsSnapshot:
@@ -277,7 +323,7 @@ final class WatchAppModel: ObservableObject {
         case .usage:
             if let usage = envelope.usage {
                 self.usage = usage
-                AppLog.info("Watch received usage sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens)")
+                AppLog.info("Watch received usage agents=\(usage.agentCount) sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens)")
             }
         case .agents:
             if let agents = envelope.gatewayAgents {
@@ -317,6 +363,7 @@ final class WatchAppModel: ObservableObject {
         guard let enabled else { return }
         let wasEnabled = globalTtsEnabled
         globalTtsEnabled = enabled
+        AppLog.info("Watch globalTtsEnabled=\(enabled) (was \(wasEnabled)); Voice On button \(enabled ? "visible" : "hidden")")
         if wasEnabled && !enabled {
             SpeechPlaybackService.shared.stop()
             AppLog.info("Watch global TTS disabled by iPhone; stopped active speech")

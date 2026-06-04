@@ -30,6 +30,10 @@ struct WatchSessionPage: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 8) {
+                // watchOS truncates navigationTitle to "New" — show full agent label in-content on the main live page.
+                if session.isEmpty {
+                    newSessionAgentBadge
+                }
                 speakButton
                 muteButton
                 // Only pairing / permission / mic errors — send & record progress live inside the Speak button.
@@ -44,12 +48,27 @@ struct WatchSessionPage: View {
             .padding(.horizontal, 4)
             .frame(maxWidth: .infinity)
         }
-        .navigationTitle(titleText)
+        .navigationTitle(navigationBarTitle)
     }
 
-    /// Small-text title: "New" for the empty page, otherwise "Session N · <date>" of the latest turn.
-    private var titleText: String {
-        guard let latest = session.latestJob else { return "New" }
+    /// Top badge on the Watch main (live) screen for an empty session (compact — ~half prior size).
+    private var newSessionAgentBadge: some View {
+        HStack(spacing: 3) {
+            Text(model.selectedAgentEmojiSymbol())
+                .font(.system(size: 11))
+            Text("New Session · \(model.selectedAgentTitleName())")
+                .font(.system(size: 9, weight: .semibold))
+                .multilineTextAlignment(.leading)
+                .lineLimit(2)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 1)
+    }
+
+    /// System nav bar: empty on new session (custom badge above); dated stamp when history exists.
+    private var navigationBarTitle: String {
+        guard let latest = session.latestJob else { return "" }
         return "Session \(index) · \(watchCompactStamp(latest.createdAt))"
     }
 
@@ -116,20 +135,22 @@ struct WatchSessionPage: View {
         .disabled(session.activeJob != nil)
     }
 
-    /// Per-session voice mute. Disabled (and shown off) when the iPhone has turned voice off globally.
+    /// Per-session voice mute — hidden when iPhone has disabled "Speak replies on Watch".
+    @ViewBuilder
     private var muteButton: some View {
-        Button {
-            model.toggleMute(sessionId: session.id)
-        } label: {
-            Label(
-                session.muted ? "Voice Off" : "Voice On",
-                systemImage: session.muted ? "speaker.slash.fill" : "speaker.wave.2.fill"
-            )
-            .font(.caption2)
+        if model.globalTtsEnabled {
+            Button {
+                model.toggleMute(sessionId: session.id)
+            } label: {
+                Label(
+                    session.muted ? "Voice Off" : "Voice On",
+                    systemImage: session.muted ? "speaker.slash.fill" : "speaker.wave.2.fill"
+                )
+                .font(.caption2)
+            }
+            .buttonStyle(.bordered)
+            .tint(session.muted ? .gray : .blue)
         }
-        .buttonStyle(.bordered)
-        .tint(session.muted ? .gray : .blue)
-        .disabled(!model.globalTtsEnabled)
     }
 }
 
@@ -155,21 +176,22 @@ struct GatewaySessionPage: View {
         .navigationTitle(titleText)
     }
 
-    /// Per-session voice mute for this gateway page. Tapping it while a reply is speaking also stops it immediately.
-    /// Disabled (and shown off) when the iPhone has turned voice off globally.
+    /// Per-session voice mute for this gateway page — hidden when iPhone has disabled global TTS.
+    @ViewBuilder
     private var muteButton: some View {
-        Button {
-            model.toggleGatewayMute(sessionKey: session.id)
-        } label: {
-            Label(
-                model.isGatewayMuted(session.id) ? "Voice Off" : "Voice On",
-                systemImage: model.isGatewayMuted(session.id) ? "speaker.slash.fill" : "speaker.wave.2.fill"
-            )
-            .font(.caption2)
+        if model.globalTtsEnabled {
+            Button {
+                model.toggleGatewayMute(sessionKey: session.id)
+            } label: {
+                Label(
+                    model.isGatewayMuted(session.id) ? "Voice Off" : "Voice On",
+                    systemImage: model.isGatewayMuted(session.id) ? "speaker.slash.fill" : "speaker.wave.2.fill"
+                )
+                .font(.caption2)
+            }
+            .buttonStyle(.bordered)
+            .tint(model.isGatewayMuted(session.id) ? .gray : .blue)
         }
-        .buttonStyle(.bordered)
-        .tint(model.isGatewayMuted(session.id) ? .gray : .blue)
-        .disabled(!model.globalTtsEnabled)
     }
 
     /// Small-text title: "Session · <date>" of last activity, kept short. Falls back to a plain label without a date.
@@ -241,90 +263,73 @@ struct GatewaySessionPage: View {
     }
 }
 
-/// Agents page (one screen left of the live stack): Workout-style cards mirrored from the iPhone.
+/// Agents page (one screen left of the live stack): standard watchOS list rows.
 struct AgentsPage: View {
     @ObservedObject var model: WatchAppModel
 
-    private let accent = Color(red: 0.75, green: 0.95, blue: 0.2)
-
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("AGENTS")
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(accent)
-                ForEach(model.sortedAgentsForDisplay) { agent in
-                    Button {
-                        AppLog.info("Watch agent card tapped id=\(agent.id)")
-                        model.selectAgent(agent.id)
-                    } label: {
-                        WatchAgentCardView(
-                            agent: agent,
-                            isSelected: model.selectedAgentId == agent.id,
-                            sessionCount: model.sessionCount(forAgentId: agent.id),
-                            accent: accent
-                        )
-                    }
-                    .buttonStyle(.plain)
+        List {
+            ForEach(model.sortedAgentsForDisplay) { agent in
+                Button {
+                    AppLog.info("Watch agent row tapped id=\(agent.id)")
+                    model.selectAgent(agent.id)
+                } label: {
+                    WatchAgentListRow(
+                        agent: agent,
+                        isSelected: model.selectedAgentId == agent.id,
+                        sessionCount: model.sessionCount(forAgentId: agent.id)
+                    )
                 }
             }
-            .padding(.horizontal, 2)
         }
         .navigationTitle("Agents")
     }
 }
 
-/// Compact Workout-style agent tile for watchOS.
-struct WatchAgentCardView: View {
+/// Default-style agent row for the Watch Agents list.
+struct WatchAgentListRow: View {
     let agent: WatchGatewayAgent
     let isSelected: Bool
     let sessionCount: Int
-    let accent: Color
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                if let emoji = agent.emoji, !emoji.isEmpty {
-                    Text(emoji).font(.title3)
-                } else {
-                    Image(systemName: "person.crop.circle.fill")
-                        .foregroundStyle(accent)
-                }
-                Spacer(minLength: 4)
-                Image(systemName: "ellipsis")
-                    .font(.caption2)
-                    .foregroundStyle(accent.opacity(0.8))
-            }
-            Text(agent.name)
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(.white)
-                .lineLimit(1)
-            Text(subtitleText)
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(accent)
-                .lineLimit(2)
-            if sessionCount > 0 {
-                Text("\(sessionCount) session\(sessionCount == 1 ? "" : "s")")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color(white: 0.14)))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(isSelected ? accent : Color.clear, lineWidth: 2)
-        )
+    private var displayName: String {
+        agent.id == "main" ? "Main Actor" : agent.name
     }
 
-    private var subtitleText: String {
-        if let model = agent.modelLabel, !model.isEmpty {
-            return model.replacingOccurrences(of: "/", with: " · ").uppercased()
+    var body: some View {
+        HStack(spacing: 8) {
+            if let emoji = agent.emoji, !emoji.isEmpty {
+                Text(emoji)
+                    .font(.body)
+            } else {
+                Image(systemName: "person.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(displayName)
+                    .lineLimit(1)
+                if let subtitle = agent.subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else if let modelLabel = agent.modelLabel, !modelLabel.isEmpty {
+                    Text(modelLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else if sessionCount > 0 {
+                    Text("\(sessionCount) session\(sessionCount == 1 ? "" : "s")")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 0)
+            if isSelected {
+                Image(systemName: "checkmark")
+                    .font(.caption.weight(.semibold))
+            }
         }
-        if let subtitle = agent.subtitle, !subtitle.isEmpty {
-            return String(subtitle.prefix(32)).uppercased()
-        }
-        return agent.isDefault ? "DEFAULT" : "AGENT"
     }
 }
 
@@ -335,8 +340,8 @@ struct UsagePage: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Usage").font(.headline)
                 if let usage = model.usage {
+                    statRow("Agents", "\(usage.agentCount)")
                     statRow("Sessions", "\(usage.sessionCount)")
                     statRow("Total messages", "\(usage.totalMessages)")
                     statRow("Total tokens", Self.formatted(usage.totalTokens))

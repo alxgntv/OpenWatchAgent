@@ -31,6 +31,8 @@ nonisolated public struct WatchUsage: Codable, Sendable, Equatable {
     public let totalMessages: Int
     public let lastActivityAt: Date?
     public let model: String?
+    /// Configured agents from `agents.list` (not part of `sessions.list` usage payload).
+    public let agentCount: Int
 
     /// Average tokens per session, derived (0 when there are no sessions).
     public var avgTokensPerSession: Int {
@@ -44,7 +46,8 @@ nonisolated public struct WatchUsage: Codable, Sendable, Equatable {
         outputTokens: Int,
         totalMessages: Int,
         lastActivityAt: Date?,
-        model: String?
+        model: String?,
+        agentCount: Int = 0
     ) {
         self.sessionCount = sessionCount
         self.totalTokens = totalTokens
@@ -53,6 +56,7 @@ nonisolated public struct WatchUsage: Codable, Sendable, Equatable {
         self.totalMessages = totalMessages
         self.lastActivityAt = lastActivityAt
         self.model = model
+        self.agentCount = agentCount
     }
 }
 
@@ -131,6 +135,9 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
     public let gatewayAgents: [WatchGatewayAgent]?
     /// Active agent id on the iPhone (filters sessions). nil means "unchanged / unknown".
     public let selectedAgentId: String?
+    /// When true, the iPhone explicitly disconnected (Disconnect button). The Watch may clear its sticky pairing cache.
+    /// Any other envelope must not unpair the Watch even if pairing.phase is needsSetupCode.
+    public let revokeGatewayPairing: Bool?
 
     public init(
         kind: WatchMessageKind,
@@ -144,7 +151,8 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         gatewaySessions: [WatchGatewaySession]? = nil,
         usage: WatchUsage? = nil,
         gatewayAgents: [WatchGatewayAgent]? = nil,
-        selectedAgentId: String? = nil
+        selectedAgentId: String? = nil,
+        revokeGatewayPairing: Bool? = nil
     ) {
         self.kind = kind
         self.jobId = jobId
@@ -158,5 +166,6 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         self.usage = usage
         self.gatewayAgents = gatewayAgents
         self.selectedAgentId = selectedAgentId
+        self.revokeGatewayPairing = revokeGatewayPairing
     }
 }

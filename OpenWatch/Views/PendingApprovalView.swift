@@ -27,7 +27,14 @@ struct PendingApprovalView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Button("Use a different setup code", role: .destructive) {
+                if let url = model.pairing.gatewayURL {
+                    Text(url)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Button("Use a different gateway", role: .destructive) {
+                    AppLog.info("PendingApprovalView: user chose different gateway (disconnect)")
                     model.disconnect()
                 }
             }
