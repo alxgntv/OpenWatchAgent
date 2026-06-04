@@ -1,5 +1,17 @@
 import SwiftUI
 
+/// Shared compact "session + date" stamp for page titles, e.g. "04 Jun 14:30". Kept short so it fits the Watch title.
+private let watchTitleDateFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.dateFormat = "dd MMM HH:mm"
+    return formatter
+}()
+
+private func watchCompactStamp(_ date: Date) -> String {
+    watchTitleDateFormatter.string(from: date)
+}
+
 /// One vertical page == one chat session. Swiping (up/down + Digital Crown) to the trailing empty page starts a new session.
 struct WatchSessionPage: View {
     @ObservedObject var model: WatchAppModel
@@ -22,7 +34,13 @@ struct WatchSessionPage: View {
             .padding(.horizontal, 4)
             .frame(maxWidth: .infinity)
         }
-        .navigationTitle(session.jobs.isEmpty ? "New" : "Session \(index)")
+        .navigationTitle(titleText)
+    }
+
+    /// Small-text title: "New" for the empty page, otherwise "Session N · <date>" of the latest turn.
+    private var titleText: String {
+        guard let latest = session.latestJob else { return "New" }
+        return "Session \(index) · \(watchCompactStamp(latest.createdAt))"
     }
 
     /// Recording is global (one recorder) and always belongs to the visible session, so it only shows on the current page.
@@ -144,17 +162,10 @@ struct GatewaySessionPage: View {
         .disabled(!model.globalTtsEnabled)
     }
 
-    /// Compact "what session is this" label: date + time of last activity (e.g. "04 Jun 14:30"), kept short for the title.
-    private static let titleDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "dd MMM HH:mm"
-        return formatter
-    }()
-
+    /// Small-text title: "Session · <date>" of last activity, kept short. Falls back to a plain label without a date.
     private var titleText: String {
         if let updatedAt = session.updatedAt {
-            return Self.titleDateFormatter.string(from: updatedAt)
+            return "Session · \(watchCompactStamp(updatedAt))"
         }
         if !session.title.isEmpty, session.title != session.id { return session.title }
         return "Session"
