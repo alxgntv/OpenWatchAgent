@@ -24,13 +24,30 @@ nonisolated public struct WatchUsage: Codable, Sendable, Equatable {
     public let totalTokens: Int
     public let inputTokens: Int
     public let outputTokens: Int
+    public let totalMessages: Int
+    public let lastActivityAt: Date?
     public let model: String?
 
-    public init(sessionCount: Int, totalTokens: Int, inputTokens: Int, outputTokens: Int, model: String?) {
+    /// Average tokens per session, derived (0 when there are no sessions).
+    public var avgTokensPerSession: Int {
+        sessionCount > 0 ? totalTokens / sessionCount : 0
+    }
+
+    public init(
+        sessionCount: Int,
+        totalTokens: Int,
+        inputTokens: Int,
+        outputTokens: Int,
+        totalMessages: Int,
+        lastActivityAt: Date?,
+        model: String?
+    ) {
         self.sessionCount = sessionCount
         self.totalTokens = totalTokens
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
+        self.totalMessages = totalMessages
+        self.lastActivityAt = lastActivityAt
         self.model = model
     }
 }

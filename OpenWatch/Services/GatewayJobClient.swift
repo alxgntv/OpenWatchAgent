@@ -44,6 +44,8 @@ struct GatewayUsage: Sendable, Equatable {
     let totalTokens: Int
     let inputTokens: Int
     let outputTokens: Int
+    let totalMessages: Int
+    let lastActivityAt: Date?
     let model: String?
 }
 
@@ -262,15 +264,30 @@ actor GatewayJobClient {
             ?? (payload["rows"] as? [[String: Any]])
             ?? (payload["items"] as? [[String: Any]])
             ?? []
-        var total = 0, input = 0, output = 0
+        var total = 0, input = 0, output = 0, messages = 0
+        var lastActivity: Date? = nil
         for row in rows {
             total += intValue(row["totalTokens"])
             input += intValue(row["inputTokens"])
             output += intValue(row["outputTokens"])
+            // Per-session message count, same defensive keys as parseSessions.
+            messages += (row["messageCount"] as? Int) ?? (row["count"] as? Int) ?? (row["messages"] as? Int) ?? 0
+            // Most recent activity across all sessions, same defensive keys as parseSessions.
+            if let updated = parseDate(row["updatedAt"]) ?? parseDate(row["lastActivityAt"]) ?? parseDate(row["lastMessageAt"]) ?? parseDate(row["mtimeMs"]) ?? parseDate(row["ts"]) {
+                if lastActivity == nil || updated > lastActivity! { lastActivity = updated }
+            }
         }
         let count = (payload["count"] as? Int) ?? rows.count
         let model = (payload["defaults"] as? [String: Any])?["model"] as? String
-        return GatewayUsage(sessionCount: count, totalTokens: total, inputTokens: input, outputTokens: output, model: model)
+        return GatewayUsage(
+            sessionCount: count,
+            totalTokens: total,
+            inputTokens: input,
+            outputTokens: output,
+            totalMessages: messages,
+            lastActivityAt: lastActivity,
+            model: model
+        )
     }
 
     private func intValue(_ value: Any?) -> Int {

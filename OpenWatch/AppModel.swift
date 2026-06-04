@@ -103,6 +103,8 @@ final class AppModel: ObservableObject {
             totalTokens: usage.totalTokens,
             inputTokens: usage.inputTokens,
             outputTokens: usage.outputTokens,
+            totalMessages: usage.totalMessages,
+            lastActivityAt: usage.lastActivityAt,
             model: usage.model
         )
         watchUsage = watch

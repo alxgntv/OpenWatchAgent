@@ -241,9 +241,12 @@ struct UsagePage: View {
                 Text("Usage").font(.headline)
                 if let usage = model.usage {
                     statRow("Sessions", "\(usage.sessionCount)")
+                    statRow("Total messages", "\(usage.totalMessages)")
                     statRow("Total tokens", Self.formatted(usage.totalTokens))
                     statRow("Input tokens", Self.formatted(usage.inputTokens))
                     statRow("Output tokens", Self.formatted(usage.outputTokens))
+                    statRow("Avg tokens / session", Self.formatted(usage.avgTokensPerSession))
+                    statRow("Last activity", Self.relativeActivity(usage.lastActivityAt))
                     if let model = usage.model { statRow("Model", model) }
                 } else {
                     Text("Open the iPhone app to load usage.")
@@ -273,6 +276,17 @@ struct UsagePage: View {
 
     private static func formatted(_ value: Int) -> String {
         numberFormatter.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
+
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter
+    }()
+
+    private static func relativeActivity(_ date: Date?) -> String {
+        guard let date else { return "—" }
+        return relativeFormatter.localizedString(for: date, relativeTo: Date())
     }
 }
 
