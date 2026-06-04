@@ -13,6 +13,11 @@ final class AppModel: ObservableObject {
     /// Real sessions reported by the gateway (`sessions.list`). Source of truth for the iPhone sessions screen.
     @Published private(set) var gatewaySessions: [GatewaySessionRow] = []
     @Published private(set) var sessionsLoading = false
+    /// Configured agents from the gateway (`agents.list`). Empty until first successful fetch.
+    @Published private(set) var gatewayAgents: [GatewayAgentRow] = []
+    @Published private(set) var agentsLoading = false
+    /// Active agent id for filtering sessions and new voice/text runs (`agent:<id>:…` session keys).
+    @Published private(set) var selectedAgentId: String = UserDefaults.standard.string(forKey: "selectedAgentId") ?? "main"
     @Published var errorBanner: String?
     /// Global "speak replies on Watch" switch. Persisted on iPhone and mirrored to the Watch on every sync.
     @Published var ttsEnabled: Bool = UserDefaults.standard.object(forKey: "ttsEnabled") as? Bool ?? true
@@ -83,22 +88,86 @@ final class AppModel: ObservableObject {
         watchBridge.isWatchReachable
     }
 
-    /// Loads the real session index from the gateway. Called on the sessions screen appear and on pull-to-refresh.
+    /// Agents to show in the Workout-style picker. Falls back to a single Main Actor card when the gateway returns none.
+    var agentsForDisplay: [GatewayAgentRow] {
+        if gatewayAgents.isEmpty {
+            return [Self.fallbackMainActor]
+        }
+        return gatewayAgents
+    }
+
+    /// Sessions for the currently selected agent (`agent:<selectedAgentId>:…` keys).
+    var filteredGatewaySessions: [GatewaySessionRow] {
+        gatewaySessions.filter { agentId(fromSessionKey: $0.id) == selectedAgentId }
+    }
+
+    private static let fallbackMainActor = GatewayAgentRow(
+        id: "main",
+        name: "Main Actor",
+        emoji: "🎯",
+        subtitle: "Default agent",
+        modelLabel: nil,
+        isDefault: true
+    )
+
+    /// Selects an agent and points new runs at that agent's default session key (`agent:<id>:main`).
+    func selectAgent(_ agentId: String) {
+        selectedAgentId = agentId
+        UserDefaults.standard.set(agentId, forKey: "selectedAgentId")
+        currentSessionKey = defaultSessionKey(forAgentId: agentId)
+        AppLog.info("Selected agent id=\(agentId) currentSessionKey=\(currentSessionKey)")
+    }
+
+    /// Loads agents + session index from the gateway. Called on home appear and on pull-to-refresh.
     func refreshSessions() async {
         guard isPaired else { return }
         sessionsLoading = true
-        defer { sessionsLoading = false }
+        agentsLoading = true
+        defer {
+            sessionsLoading = false
+            agentsLoading = false
+        }
+        do {
+            let agentsResult = try await jobClient.listAgents()
+            gatewayAgents = agentsResult.agents
+            reconcileSelectedAgent(defaultId: agentsResult.defaultAgentId)
+            AppLog.info("Loaded \(agentsResult.agents.count) gateway agents defaultId=\(agentsResult.defaultAgentId)")
+        } catch {
+            AppLog.error("agents.list failed: \(error.localizedDescription)")
+            // Keep previous gatewayAgents; UI falls back to Main Actor when empty.
+        }
         do {
             let (rows, usage) = try await jobClient.listSessionsAndUsage()
             gatewaySessions = rows
             AppLog.info("Loaded \(rows.count) gateway sessions; usage totalTokens=\(usage.totalTokens) sessions=\(usage.sessionCount)")
-            // Push the list to the Watch immediately so its horizontal pages appear fast, then enrich with recent history.
-            pushSessionListToWatch(rows: rows)
+            let watchRows = filteredGatewaySessions
+            pushSessionListToWatch(rows: watchRows)
             pushUsageToWatch(usage)
-            startWatchEnrichment(rows: rows)
+            startWatchEnrichment(rows: watchRows)
         } catch {
             errorBanner = error.localizedDescription
             AppLog.error("refreshSessions failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Parses `agent:<agentId>:…` from a gateway session key.
+    func agentId(fromSessionKey sessionKey: String) -> String? {
+        let parts = sessionKey.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count >= 2, parts[0] == "agent" else { return nil }
+        let id = String(parts[1])
+        return id.isEmpty ? nil : id
+    }
+
+    private func defaultSessionKey(forAgentId agentId: String) -> String {
+        "agent:\(agentId):main"
+    }
+
+    private func reconcileSelectedAgent(defaultId: String) {
+        let ids = Set(gatewayAgents.map(\.id))
+        if !ids.contains(selectedAgentId) {
+            let next = ids.contains(defaultId) ? defaultId : (gatewayAgents.first?.id ?? "main")
+            AppLog.info("Reconciling selectedAgentId \(selectedAgentId) -> \(next)")
+            selectAgent(next)
         }
     }
 
@@ -219,6 +288,7 @@ final class AppModel: ObservableObject {
         pairing = PairingSnapshot(phase: .needsSetupCode, message: "Enter a new setup code.")
         jobs = []
         gatewaySessions = []
+        gatewayAgents = []
         watchEnrichTask?.cancel()
         watchGatewaySessions = []
         watchUsage = nil
@@ -389,9 +459,9 @@ final class AppModel: ObservableObject {
     /// Starts a brand-new chat session: a fresh sessionKey. Past sessions stay as their own cards (history is not wiped).
     func startNewSession() {
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        currentSessionKey = "agent:main:\(token)"
+        currentSessionKey = "agent:\(selectedAgentId):\(token)"
         activeJobId = nil
-        AppLog.info("Started new session sessionKey=\(currentSessionKey)")
+        AppLog.info("Started new session sessionKey=\(currentSessionKey) agentId=\(selectedAgentId)")
         syncWatch()
     }
 

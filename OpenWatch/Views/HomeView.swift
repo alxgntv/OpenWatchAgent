@@ -64,16 +64,42 @@ struct HomeView: View {
             }
 
             Section {
-                if model.gatewaySessions.isEmpty {
+                if model.agentsLoading && model.gatewayAgents.isEmpty {
+                    HStack { ProgressView(); Text("Loading agents…") }
+                } else {
+                    ForEach(model.agentsForDisplay) { agent in
+                        Button {
+                            AppLog.info("Agent card tapped id=\(agent.id) name=\(agent.name)")
+                            model.selectAgent(agent.id)
+                        } label: {
+                            AgentWorkoutCardView(
+                                agent: agent,
+                                isSelected: model.selectedAgentId == agent.id
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
+                    }
+                }
+            } header: {
+                Text("Agents")
+            } footer: {
+                Text("Each card is a configured agent on your gateway. Sessions below are filtered to the selected agent.")
+            }
+
+            Section {
+                if model.filteredGatewaySessions.isEmpty {
                     if model.sessionsLoading {
                         HStack { ProgressView(); Text("Loading sessions…") }
                     } else {
-                        Text("No sessions yet. Pull down to refresh.")
+                        Text("No sessions for this agent yet. Pull down to refresh.")
                             .foregroundStyle(.secondary)
                     }
                 } else {
                     // Real gateway sessions; tap to open the full transcript loaded from the bot.
-                    ForEach(model.gatewaySessions) { session in
+                    ForEach(model.filteredGatewaySessions) { session in
                         NavigationLink {
                             SessionDetailView(model: model, session: session)
                         } label: {
@@ -113,6 +139,68 @@ struct HomeView: View {
     private var activeJob: VoiceJob? {
         guard let id = model.activeJobId else { return nil }
         return model.jobs.first { $0.id == id }
+    }
+}
+
+/// Workout-style agent card (dark tile, accent subtitle) — one card per configured gateway agent.
+struct AgentWorkoutCardView: View {
+    let agent: GatewayAgentRow
+    let isSelected: Bool
+
+    private let accent = Color(red: 0.75, green: 0.95, blue: 0.2)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top) {
+                agentIcon
+                    .font(.title2)
+                    .frame(width: 36, height: 36)
+                Spacer(minLength: 8)
+                Image(systemName: "ellipsis")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(accent.opacity(0.85))
+                    .padding(8)
+                    .background(Circle().fill(Color.white.opacity(0.08)))
+            }
+            Text(agent.name)
+                .font(.body.weight(.semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+            Text(subtitleText)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(accent)
+                .textCase(.uppercase)
+                .lineLimit(2)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color(white: 0.14))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(isSelected ? accent : Color.clear, lineWidth: 2)
+        )
+    }
+
+    @ViewBuilder private var agentIcon: some View {
+        if let emoji = agent.emoji, !emoji.isEmpty {
+            Text(emoji)
+        } else {
+            Image(systemName: "person.crop.circle.fill")
+                .foregroundStyle(accent)
+        }
+    }
+
+    private var subtitleText: String {
+        if let model = agent.modelLabel, !model.isEmpty {
+            return model.replacingOccurrences(of: "/", with: " · ").uppercased()
+        }
+        if let subtitle = agent.subtitle, !subtitle.isEmpty {
+            return String(subtitle.prefix(48)).uppercased()
+        }
+        return agent.isDefault ? "DEFAULT AGENT" : "AGENT"
     }
 }
 

@@ -29,6 +29,22 @@ enum GatewayJobError: LocalizedError {
     }
 }
 
+/// One configured agent as reported by the gateway's `agents.list`.
+struct GatewayAgentRow: Identifiable, Sendable, Equatable {
+    let id: String
+    let name: String
+    let emoji: String?
+    let subtitle: String?
+    let modelLabel: String?
+    let isDefault: Bool
+}
+
+/// Parsed payload from `agents.list` (OpenClaw gateway RPC).
+struct GatewayAgentsListResult: Sendable, Equatable {
+    let defaultAgentId: String
+    let agents: [GatewayAgentRow]
+}
+
 /// One real session as reported by the gateway's `sessions.list`.
 struct GatewaySessionRow: Identifiable, Sendable, Equatable {
     let id: String              // sessionKey
@@ -164,6 +180,13 @@ actor GatewayJobClient {
         return parseSessions(payload)
     }
 
+    /// Fetches configured agents from the gateway (`agents.list`). Same WS transport as sessions.list.
+    func listAgents() async throws -> GatewayAgentsListResult {
+        let payload = try await readRPC(method: "agents.list", params: [:])
+        AppLog.info("agents.list raw payload=\(truncatedJSON(payload))")
+        return parseAgents(payload)
+    }
+
     /// Fetches the session index once and returns both the parsed rows and aggregate usage (avoids a second RPC).
     func listSessionsAndUsage() async throws -> (rows: [GatewaySessionRow], usage: GatewayUsage) {
         let payload = try await readRPC(method: "sessions.list", params: [:])
@@ -237,6 +260,37 @@ actor GatewayJobClient {
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
               let raw = String(data: data, encoding: .utf8) else { return "<unserializable>" }
         return raw.count > 1500 ? String(raw.prefix(1500)) + "…" : raw
+    }
+
+    private func parseAgents(_ payload: [String: Any]) -> GatewayAgentsListResult {
+        let defaultId = (payload["defaultId"] as? String) ?? "main"
+        let rows = (payload["agents"] as? [[String: Any]]) ?? []
+        let agents = rows.compactMap { row -> GatewayAgentRow? in
+            guard let id = row["id"] as? String, !id.isEmpty else { return nil }
+            let identity = row["identity"] as? [String: Any]
+            let name = (row["name"] as? String)
+                ?? (identity?["name"] as? String)
+                ?? id.capitalized
+            let emoji = identity?["emoji"] as? String
+            let theme = identity?["theme"] as? String
+            let description = row["description"] as? String
+            let subtitle = theme ?? description
+            var modelLabel: String?
+            if let model = row["model"] as? [String: Any], let primary = model["primary"] as? String {
+                modelLabel = primary
+            }
+            let isDefault = (row["default"] as? Bool) == true || id == defaultId
+            return GatewayAgentRow(
+                id: id,
+                name: name,
+                emoji: emoji,
+                subtitle: subtitle,
+                modelLabel: modelLabel,
+                isDefault: isDefault
+            )
+        }
+        AppLog.info("Parsed \(agents.count) agents from agents.list defaultId=\(defaultId)")
+        return GatewayAgentsListResult(defaultAgentId: defaultId, agents: agents)
     }
 
     private func parseSessions(_ payload: [String: Any]) -> [GatewaySessionRow] {
