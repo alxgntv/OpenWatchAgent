@@ -330,6 +330,56 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Sends a TYPED text message from the iPhone straight into a specific gateway session via chat.send.
+    /// This is text only (not voice) — voice still originates on the Watch. Returns when the agent reply arrives so the
+    /// caller can reload the transcript.
+    func sendText(_ text: String, to sessionKey: String) async {
+        guard isPaired else {
+            errorBanner = "Pair on iPhone before sending messages."
+            AppLog.error("sendText blocked: not paired sessionKey=\(sessionKey)")
+            return
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            AppLog.error("sendText ignored empty text sessionKey=\(sessionKey)")
+            return
+        }
+
+        let job = VoiceJob(status: .running, transcript: trimmed, statusDetail: "Working…")
+        jobs.insert(job, at: 0)
+        activeJobId = job.id
+        AppLog.info("sendText running jobId=\(job.id) sessionKey=\(sessionKey) length=\(trimmed.count)")
+        syncWatch(job: job)
+
+        do {
+            let reply = try await jobClient.runCommand(
+                transcript: trimmed,
+                sessionKey: sessionKey,
+                onProgress: makeProgressHandler(jobId: job.id)
+            )
+            if let idx = jobs.firstIndex(where: { $0.id == job.id }) {
+                jobs[idx].resultText = reply
+                jobs[idx].status = .done
+                jobs[idx].statusDetail = nil
+                jobs[idx].completedAt = Date()
+                if activeJobId == job.id { activeJobId = nil }
+                syncWatch(job: jobs[idx])
+            }
+            AppLog.info("sendText done jobId=\(job.id) replyLength=\(reply.count)")
+        } catch {
+            if let idx = jobs.firstIndex(where: { $0.id == job.id }) {
+                jobs[idx].status = .failed
+                jobs[idx].errorMessage = error.localizedDescription
+                jobs[idx].statusDetail = nil
+                jobs[idx].completedAt = Date()
+                if activeJobId == job.id { activeJobId = nil }
+                syncWatch(job: jobs[idx])
+            }
+            errorBanner = error.localizedDescription
+            AppLog.error("sendText failed jobId=\(job.id) sessionKey=\(sessionKey): \(error.localizedDescription)")
+        }
+    }
+
     /// Starts a brand-new chat session: a fresh sessionKey. Past sessions stay as their own cards (history is not wiped).
     func startNewSession() {
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()

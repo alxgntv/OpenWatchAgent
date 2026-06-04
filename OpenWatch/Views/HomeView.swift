@@ -154,6 +154,9 @@ struct SessionDetailView: View {
     @State private var messages: [ChatHistoryMessage] = []
     @State private var loading = true
     @State private var browserURL: IdentifiableURL?
+    @State private var draft: String = ""
+    @State private var sending = false
+    @FocusState private var inputFocused: Bool
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -198,34 +201,32 @@ struct SessionDetailView: View {
                 SafariView(url: item.url)
                     .ignoresSafeArea()
             }
-            .refreshable { await load(proxy: proxy) }
-            .task { await load(proxy: proxy) }
+            .onChange(of: messages.last?.id) { _, lastID in
+                guard let lastID else { return }
+                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(lastID, anchor: .bottom) }
+            }
+            .refreshable { await load() }
+            .task { await load() }
         }
     }
 
-    /// iMessage-style input bar pinned to the bottom. iPhone never records audio itself, so the mic button
-    /// (right side, no "+") remotely starts listening on the Watch via the existing toggleListenOnPhone() path.
+    /// iMessage-style input bar pinned to the bottom: a real text field plus a trailing control that switches between
+    /// a send button (when there is text) and a Watch mic button (when empty), and a spinner while a turn is in flight.
     private var inputBar: some View {
         HStack(spacing: 10) {
-            Text(isListening ? "Listening on Watch…" : "Tap the mic to talk on your Watch")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            Spacer(minLength: 8)
-            Button {
-                AppLog.info("SessionDetailView mic tapped sessionKey=\(session.id); triggering remote listen on Watch")
-                model.toggleListenOnPhone()
-            } label: {
-                Image(systemName: isListening ? "mic.fill" : "mic")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(isListening ? Color.red : Color.accentColor)
-            }
-            .buttonStyle(.plain)
+            TextField("Message", text: $draft, axis: .vertical)
+                .textInputAutocapitalization(.sentences)
+                .lineLimit(1 ... 5)
+                .focused($inputFocused)
+                .submitLabel(.send)
+                .onSubmit(send)
+                .disabled(isBusy)
+            trailingControl
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        .padding(.vertical, 8)
         .overlay(
-            Capsule(style: .continuous)
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(Color(.systemGray3), lineWidth: 1)
         )
         .padding(.horizontal, 12)
@@ -233,22 +234,71 @@ struct SessionDetailView: View {
         .background(.bar)
     }
 
-    /// True while the Watch is actively recording the current job (drives the mic icon state/colour).
-    private var isListening: Bool {
-        guard let id = model.activeJobId else { return false }
-        return model.jobs.first { $0.id == id }?.status == .listening
+    /// The trailing control mirrors the Watch's Speak button states: spinner while busy, send arrow when there's text,
+    /// otherwise the Watch mic (red + pulsing while the Watch is recording).
+    @ViewBuilder private var trailingControl: some View {
+        if isBusy {
+            ProgressView()
+                .frame(width: 26, height: 26)
+        } else if !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Button(action: send) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 26))
+                    .foregroundStyle(Color.accentColor)
+            }
+            .buttonStyle(.plain)
+        } else {
+            Button {
+                AppLog.info("SessionDetailView mic tapped sessionKey=\(session.id); triggering remote listen on Watch")
+                model.toggleListenOnPhone()
+            } label: {
+                Image(systemName: isListening ? "mic.fill" : "mic")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(isListening ? Color.red : Color.accentColor)
+                    .symbolEffect(.pulse, isActive: isListening)
+                    .frame(width: 26, height: 26)
+            }
+            .buttonStyle(.plain)
+        }
     }
 
-    private func load(proxy: ScrollViewProxy?) async {
+    /// The currently active job, if any (drives the input control state).
+    private var activeJob: VoiceJob? {
+        guard let id = model.activeJobId else { return nil }
+        return model.jobs.first { $0.id == id }
+    }
+
+    /// True while a turn is being sent/processed (local send or a job running), so the field locks and shows a spinner.
+    private var isBusy: Bool {
+        if sending { return true }
+        let status = activeJob?.status
+        return status == .sending || status == .running
+    }
+
+    /// True while the Watch is actively recording the current job (drives the mic icon state/colour).
+    private var isListening: Bool {
+        activeJob?.status == .listening
+    }
+
+    /// Sends the typed text into this gateway session, then reloads the transcript so the new turn appears.
+    private func send() {
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !isBusy else { return }
+        draft = ""
+        inputFocused = false
+        AppLog.info("SessionDetailView send tapped sessionKey=\(session.id) length=\(text.count)")
+        Task {
+            await model.sendText(text, to: session.id)
+            messages = await model.history(for: session.id)
+        }
+    }
+
+    private func load() async {
         loading = true
         // chat.history returns oldest-first; keep that order so the newest message is at the bottom (iMessage style).
         messages = await model.history(for: session.id)
         loading = false
         AppLog.info("SessionDetailView loaded sessionKey=\(session.id) messages=\(messages.count)")
-        // Jump to the latest message, like opening an iMessage thread.
-        if let proxy, let last = messages.last {
-            proxy.scrollTo(last.id, anchor: .bottom)
-        }
     }
 }
 
