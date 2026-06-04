@@ -144,7 +144,18 @@ struct GatewaySessionPage: View {
         .disabled(!model.globalTtsEnabled)
     }
 
+    /// Compact "what session is this" label: date + time of last activity (e.g. "04 Jun 14:30"), kept short for the title.
+    private static let titleDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "dd MMM HH:mm"
+        return formatter
+    }()
+
     private var titleText: String {
+        if let updatedAt = session.updatedAt {
+            return Self.titleDateFormatter.string(from: updatedAt)
+        }
         if !session.title.isEmpty, session.title != session.id { return session.title }
         return "Session"
     }

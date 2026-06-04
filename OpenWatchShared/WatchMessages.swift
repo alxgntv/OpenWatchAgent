@@ -34,12 +34,14 @@ nonisolated public struct WatchGatewaySession: Codable, Sendable, Identifiable, 
     public let id: String              // sessionKey (e.g. "agent:main:...")
     public let title: String
     public let preview: String?
+    public let updatedAt: Date?        // last activity time, shown compactly as the page title
     public let messages: [WatchHistoryMessage]   // recent slice, oldest-first
 
-    public init(id: String, title: String, preview: String?, messages: [WatchHistoryMessage]) {
+    public init(id: String, title: String, preview: String?, updatedAt: Date?, messages: [WatchHistoryMessage]) {
         self.id = id
         self.title = title
         self.preview = preview
+        self.updatedAt = updatedAt
         self.messages = messages
     }
 }

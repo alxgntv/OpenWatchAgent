@@ -95,7 +95,7 @@ final class AppModel: ObservableObject {
 
     /// Pushes the bare session list (no messages yet) to the Watch so pages render immediately.
     private func pushSessionListToWatch(rows: [GatewaySessionRow]) {
-        let list = rows.map { WatchGatewaySession(id: $0.id, title: $0.title, preview: $0.preview, messages: []) }
+        let list = rows.map { WatchGatewaySession(id: $0.id, title: $0.title, preview: $0.preview, updatedAt: $0.updatedAt, messages: []) }
         watchGatewaySessions = list
         watchBridge.publishGatewaySessions(list)
     }
@@ -118,7 +118,7 @@ final class AppModel: ObservableObject {
                 } catch {
                     AppLog.error("Watch enrich history failed sessionKey=\(row.id): \(error.localizedDescription)")
                 }
-                built.append(WatchGatewaySession(id: row.id, title: row.title, preview: row.preview, messages: recent))
+                built.append(WatchGatewaySession(id: row.id, title: row.title, preview: row.preview, updatedAt: row.updatedAt, messages: recent))
             }
             if Task.isCancelled { return }
             await MainActor.run {
