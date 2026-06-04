@@ -145,6 +145,7 @@ struct SessionCardView: View {
 }
 
 /// The full transcript for one session, loaded from the gateway via chat.history.
+/// Rendered as an iMessage-style thread: oldest messages on top, newest at the bottom, scrolled to the latest.
 struct SessionDetailView: View {
     @ObservedObject var model: AppModel
     let session: GatewaySessionRow
@@ -153,53 +154,79 @@ struct SessionDetailView: View {
     @State private var loading = true
 
     var body: some View {
-        List {
-            if loading {
-                HStack { ProgressView(); Text("Loading transcript…") }
-            } else if messages.isEmpty {
-                Text("No messages in this session.")
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(messages) { message in
-                    ChatBubble(text: message.text, isUser: message.isUser)
-                        .listRowSeparator(.hidden)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    if loading {
+                        HStack(spacing: 8) { ProgressView(); Text("Loading transcript…") }
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 32)
+                    } else if messages.isEmpty {
+                        Text("No messages in this session.")
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 32)
+                    } else {
+                        ForEach(messages) { message in
+                            ChatBubble(text: message.text, isUser: message.isUser)
+                                .id(message.id)
+                        }
+                    }
                 }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
             }
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle(session.title)
+            .navigationBarTitleDisplayMode(.inline)
+            .refreshable { await load(proxy: proxy) }
+            .task { await load(proxy: proxy) }
         }
-        .navigationTitle(session.title)
-        .navigationBarTitleDisplayMode(.inline)
-        .refreshable { await load() }
-        .task { await load() }
     }
 
-    private func load() async {
+    private func load(proxy: ScrollViewProxy?) async {
         loading = true
-        // chat.history returns oldest-first; reverse so the latest message is on top.
-        messages = Array(await model.history(for: session.id).reversed())
+        // chat.history returns oldest-first; keep that order so the newest message is at the bottom (iMessage style).
+        messages = await model.history(for: session.id)
         loading = false
+        AppLog.info("SessionDetailView loaded sessionKey=\(session.id) messages=\(messages.count)")
+        // Jump to the latest message, like opening an iMessage thread.
+        if let proxy, let last = messages.last {
+            proxy.scrollTo(last.id, anchor: .bottom)
+        }
     }
 }
 
+/// An iMessage-style chat bubble. User messages are blue and right-aligned; everything else is grey and left-aligned.
 struct ChatBubble: View {
     let text: String
     let isUser: Bool
     var isError: Bool = false
 
     var body: some View {
-        HStack {
-            if isUser { Spacer(minLength: 32) }
+        HStack(spacing: 0) {
+            if isUser { Spacer(minLength: 56) }
             Text(text)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+                .font(.body)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .foregroundStyle(textColor)
                 .background(bubbleColor)
-                .foregroundStyle(isError ? Color.red : Color.primary)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            if !isUser { Spacer(minLength: 32) }
+                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            if !isUser { Spacer(minLength: 56) }
         }
+        .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+        .padding(.vertical, 2)
     }
 
     private var bubbleColor: Color {
-        if isError { return Color.red.opacity(0.12) }
-        return isUser ? Color.accentColor.opacity(0.18) : Color.gray.opacity(0.14)
+        if isError { return Color.red.opacity(0.15) }
+        return isUser ? Color.blue : Color(.systemGray5)
+    }
+
+    private var textColor: Color {
+        if isError { return .red }
+        return isUser ? .white : .primary
     }
 }
