@@ -9,6 +9,7 @@ xcuserdata/
 # Build
 build/
 build-watch/
+build-phone/
 build_*.log
 DerivedData/
 *.moved-aside
