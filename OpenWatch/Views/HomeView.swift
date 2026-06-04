@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct HomeView: View {
     @ObservedObject var model: AppModel
@@ -252,6 +253,7 @@ struct SessionDetailView: View {
 }
 
 /// An iMessage-style chat bubble. User messages are blue and right-aligned; everything else is grey and left-aligned.
+/// The body renders message segments so fenced code blocks get proper monospaced layout.
 struct ChatBubble: View {
     let text: String
     let isUser: Bool
@@ -260,12 +262,9 @@ struct ChatBubble: View {
     var body: some View {
         HStack(spacing: 0) {
             if isUser { Spacer(minLength: 56) }
-            Text(attributedText)
-                .font(.body)
-                .tint(isUser ? .white : .blue)
+            ChatMessageContent(text: text, isUser: isUser, isError: isError)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 9)
-                .foregroundStyle(textColor)
                 .background(bubbleColor)
                 .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
             if !isUser { Spacer(minLength: 56) }
@@ -274,34 +273,157 @@ struct ChatBubble: View {
         .padding(.vertical, 2)
     }
 
-    /// Builds an attributed string where any detected URL becomes a tappable link (handled by the surrounding
-    /// OpenURLAction so it opens in the in-app browser). Links are underlined and tinted for visibility.
-    private var attributedText: AttributedString {
-        var attributed = AttributedString(text)
-        let nsLength = (text as NSString).length
-        guard nsLength > 0,
-              let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else {
-            return attributed
-        }
-        detector.enumerateMatches(in: text, range: NSRange(location: 0, length: nsLength)) { result, _, _ in
-            guard let result, let url = result.url,
-                  let stringRange = Range(result.range, in: text),
-                  let lower = AttributedString.Index(stringRange.lowerBound, within: attributed),
-                  let upper = AttributedString.Index(stringRange.upperBound, within: attributed) else { return }
-            attributed[lower..<upper].link = url
-            attributed[lower..<upper].underlineStyle = .single
-            attributed[lower..<upper].foregroundColor = isUser ? .white : .blue
-        }
-        return attributed
-    }
-
     private var bubbleColor: Color {
         if isError { return Color.red.opacity(0.15) }
         return isUser ? Color.blue : Color(.systemGray5)
+    }
+}
+
+/// One parsed piece of a message: either plain (inline-markdown) text or a fenced code block.
+enum MessageSegment: Identifiable {
+    case text(String)
+    case code(language: String?, code: String)
+
+    var id: String {
+        switch self {
+        case .text(let s): return "t:\(s.hashValue)"
+        case .code(let lang, let code): return "c:\(lang ?? "")\(code.hashValue)"
+        }
+    }
+
+    /// Splits a message into text/code segments based on triple-backtick fenced blocks.
+    static func parse(_ input: String) -> [MessageSegment] {
+        let pattern = "```([\\w+#.-]*)[\\t ]*\\r?\\n?([\\s\\S]*?)```"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return [.text(input)]
+        }
+        let ns = input as NSString
+        var segments: [MessageSegment] = []
+        var lastEnd = 0
+        for match in regex.matches(in: input, range: NSRange(location: 0, length: ns.length)) {
+            if match.range.location > lastEnd {
+                let chunk = ns.substring(with: NSRange(location: lastEnd, length: match.range.location - lastEnd))
+                let trimmed = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { segments.append(.text(trimmed)) }
+            }
+            let langRange = match.range(at: 1)
+            let codeRange = match.range(at: 2)
+            let lang = langRange.location != NSNotFound ? ns.substring(with: langRange) : ""
+            let code = codeRange.location != NSNotFound ? ns.substring(with: codeRange) : ""
+            segments.append(.code(
+                language: lang.isEmpty ? nil : lang,
+                code: code.trimmingCharacters(in: CharacterSet(charactersIn: "\n\r"))
+            ))
+            lastEnd = match.range.location + match.range.length
+        }
+        if lastEnd < ns.length {
+            let chunk = ns.substring(with: NSRange(location: lastEnd, length: ns.length - lastEnd))
+            let trimmed = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { segments.append(.text(trimmed)) }
+        }
+        return segments.isEmpty ? [.text(input)] : segments
+    }
+}
+
+/// Renders a message as a vertical stack of text and code-block segments inside a bubble.
+struct ChatMessageContent: View {
+    let text: String
+    let isUser: Bool
+    var isError: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(MessageSegment.parse(text)) { segment in
+                switch segment {
+                case .text(let value):
+                    Text(ChatMessageContent.attributed(value, isUser: isUser))
+                        .font(.body)
+                        .tint(isUser ? .white : .blue)
+                        .foregroundStyle(textColor)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                case .code(let language, let code):
+                    CodeBlockView(language: language, code: code)
+                }
+            }
+        }
     }
 
     private var textColor: Color {
         if isError { return .red }
         return isUser ? .white : .primary
+    }
+
+    /// Parses inline markdown (bold/italic/inline code/markdown links), then tags any remaining bare URLs as links.
+    static func attributed(_ value: String, isUser: Bool) -> AttributedString {
+        var attributed: AttributedString
+        if let parsed = try? AttributedString(
+            markdown: value,
+            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) {
+            attributed = parsed
+        } else {
+            attributed = AttributedString(value)
+        }
+
+        // Make inline `code` runs visibly monospaced.
+        for run in attributed.runs where run.inlinePresentationIntent?.contains(.code) == true {
+            attributed[run.range].font = .system(.body, design: .monospaced)
+        }
+
+        // Detect bare URLs (e.g. "myads.id/x") that markdown did not turn into links, and link them.
+        let plain = String(attributed.characters)
+        let nsLength = (plain as NSString).length
+        if nsLength > 0, let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) {
+            detector.enumerateMatches(in: plain, range: NSRange(location: 0, length: nsLength)) { result, _, _ in
+                guard let result, let url = result.url, let r = Range(result.range, in: plain) else { return }
+                let startOffset = plain.distance(from: plain.startIndex, to: r.lowerBound)
+                let length = plain.distance(from: r.lowerBound, to: r.upperBound)
+                let lower = attributed.characters.index(attributed.startIndex, offsetBy: startOffset)
+                let upper = attributed.characters.index(lower, offsetBy: length)
+                if attributed[lower..<upper].link == nil {
+                    attributed[lower..<upper].link = url
+                    attributed[lower..<upper].underlineStyle = .single
+                    attributed[lower..<upper].foregroundColor = isUser ? .white : .blue
+                }
+            }
+        }
+        return attributed
+    }
+}
+
+/// A monospaced code-block card with an optional language label and a copy button. Long lines scroll horizontally.
+struct CodeBlockView: View {
+    let language: String?
+    let code: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text((language?.isEmpty == false ? language! : "code").uppercased())
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.55))
+                Spacer(minLength: 8)
+                Button {
+                    UIPasteboard.general.string = code
+                    AppLog.info("Code snippet copied to clipboard length=\(code.count)")
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(code)
+                    .font(.system(.footnote, design: .monospaced))
+                    .foregroundStyle(.white)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(white: 0.13))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
