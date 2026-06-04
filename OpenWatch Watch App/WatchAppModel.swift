@@ -37,8 +37,9 @@ final class WatchAppModel: ObservableObject {
             SpeechPlaybackService.shared.stop()
         }
     }
-    /// Selected HORIZONTAL page (0 = live stack, 1...N = gateway sessions). Switching pages stops any active speech.
-    @Published var horizontalIndex: Int = 0 {
+    /// Selected HORIZONTAL page: 0 = Usage, 1 = live stack (main), 2...N = gateway sessions.
+    /// Defaults to 1 so the app always opens on the main screen. Switching pages stops any active speech.
+    @Published var horizontalIndex: Int = 1 {
         didSet {
             guard oldValue != horizontalIndex else { return }
             AppLog.info("Watch horizontal page switched \(oldValue) -> \(horizontalIndex); stopping any active speech")
