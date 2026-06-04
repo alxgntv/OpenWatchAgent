@@ -8,24 +8,26 @@ struct ContentView: View {
             if model.isPaired {
                 // Outer axis = HORIZONTAL (default watchOS paging): page 0 is the live stack (unchanged),
                 // swiping left/right reveals one page per real gateway session mirrored from the iPhone.
-                // Horizontal order: Usage (left) · live stack (main) · one page per gateway session (right).
+                // Horizontal order: Usage · Agents · live stack (main) · gateway sessions.
                 TabView(selection: $model.horizontalIndex) {
                     UsagePage(model: model)
                         .tag(0)
-                    liveStack
+                    AgentsPage(model: model)
                         .tag(1)
-                    ForEach(Array(model.gatewaySessions.enumerated()), id: \.element.id) { idx, gatewaySession in
+                    liveStack
+                        .tag(2)
+                    ForEach(Array(model.filteredGatewaySessions.enumerated()), id: \.element.id) { idx, gatewaySession in
                         GatewaySessionPage(model: model, session: gatewaySession)
-                            .tag(idx + 2)
+                            .tag(idx + 3)
                     }
                 }
             } else {
-                WatchNotPairedView()
+                WatchNotPairedView(model: model)
             }
         }
         .onAppear {
             // Always open on the main (live) screen.
-            model.horizontalIndex = 1
+            model.horizontalIndex = 2
             WatchConnectivityWatchService.shared.requestSync()
             AppLog.info("OpenWatch Watch app launched")
         }

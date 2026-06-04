@@ -16,6 +16,10 @@ nonisolated public enum WatchMessageKind: String, Codable, Sendable {
     case gatewaySessions
     /// iPhone → Watch: aggregate usage (session count, tokens, model) for the Watch's Usage page.
     case usage
+    /// iPhone → Watch: configured gateway agents for the Watch's Agents page.
+    case agents
+    /// Watch → iPhone: user picked an agent on the Watch (`text` carries the agent id).
+    case selectAgent
 }
 
 /// Aggregate usage derived from the gateway's `sessions.list`, mirrored to the Watch's Usage page.
@@ -49,6 +53,32 @@ nonisolated public struct WatchUsage: Codable, Sendable, Equatable {
         self.totalMessages = totalMessages
         self.lastActivityAt = lastActivityAt
         self.model = model
+    }
+}
+
+/// One configured gateway agent mirrored to the Watch Agents page.
+nonisolated public struct WatchGatewayAgent: Codable, Sendable, Identifiable, Equatable {
+    public let id: String
+    public let name: String
+    public let emoji: String?
+    public let subtitle: String?
+    public let modelLabel: String?
+    public let isDefault: Bool
+
+    public init(
+        id: String,
+        name: String,
+        emoji: String?,
+        subtitle: String?,
+        modelLabel: String?,
+        isDefault: Bool
+    ) {
+        self.id = id
+        self.name = name
+        self.emoji = emoji
+        self.subtitle = subtitle
+        self.modelLabel = modelLabel
+        self.isDefault = isDefault
     }
 }
 
@@ -97,6 +127,10 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
     public let gatewaySessions: [WatchGatewaySession]?
     /// Aggregate usage for the Watch's Usage page. nil means "unchanged / unknown".
     public let usage: WatchUsage?
+    /// Configured agents for the Watch's Agents page. nil means "unchanged / unknown".
+    public let gatewayAgents: [WatchGatewayAgent]?
+    /// Active agent id on the iPhone (filters sessions). nil means "unchanged / unknown".
+    public let selectedAgentId: String?
 
     public init(
         kind: WatchMessageKind,
@@ -108,7 +142,9 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         ttsEnabled: Bool? = nil,
         ttsLanguage: String? = nil,
         gatewaySessions: [WatchGatewaySession]? = nil,
-        usage: WatchUsage? = nil
+        usage: WatchUsage? = nil,
+        gatewayAgents: [WatchGatewayAgent]? = nil,
+        selectedAgentId: String? = nil
     ) {
         self.kind = kind
         self.jobId = jobId
@@ -120,5 +156,7 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         self.ttsLanguage = ttsLanguage
         self.gatewaySessions = gatewaySessions
         self.usage = usage
+        self.gatewayAgents = gatewayAgents
+        self.selectedAgentId = selectedAgentId
     }
 }

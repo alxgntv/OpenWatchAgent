@@ -8,6 +8,17 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
 
     private let session = WCSession.default
 
+    // ─── Ariadne's Thread [AT-0001] ─────────────────────
+    // What: Cache last pairing/TTS snapshot for every Watch applicationContext push.
+    // Why:  updateApplicationContext replaces the whole payload; gatewaySessions-only pushes
+    //       dropped pairing so the Watch cold-started into "Pair on iPhone" after battery drain.
+    // Date: 2026-06-04
+    // Related: WatchAppModel pairing cache, WatchConnectivityWatchService requestSync
+    // ─────────────────────────────────────────────────────
+    private var cachedPairingForWatch: PairingSnapshot?
+    private var cachedTtsEnabledForWatch: Bool?
+    private var cachedTtsLanguageForWatch: String?
+
     /// True only when the Watch app is currently reachable (its app is active/foreground). The iPhone cannot launch
     /// the Watch app itself — watchOS provides no such API — so commands only take effect while this is true.
     var isWatchReachable: Bool {
@@ -25,6 +36,10 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
 
     func publish(pairing: PairingSnapshot, jobs: [VoiceJob], ttsEnabled: Bool, ttsLanguage: String) {
         guard session.activationState == .activated else { return }
+        cachedPairingForWatch = pairing
+        cachedTtsEnabledForWatch = ttsEnabled
+        cachedTtsLanguageForWatch = ttsLanguage
+        AppLog.info("Cached Watch pairing phase=\(pairing.phase.rawValue) for context enrichment")
         let envelope = WatchEnvelope(kind: .jobsSnapshot, pairing: pairing, jobs: jobs, ttsEnabled: ttsEnabled, ttsLanguage: ttsLanguage)
         pushToWatch(envelope, preferImmediate: true)
     }
@@ -49,6 +64,14 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         let envelope = WatchEnvelope(kind: .usage, usage: usage)
         pushToWatch(envelope, preferImmediate: true)
         AppLog.info("Pushed usage to Watch sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens)")
+    }
+
+    /// Pushes configured gateway agents and the active selection to the Watch's Agents page.
+    func publishAgents(_ agents: [WatchGatewayAgent], selectedAgentId: String) {
+        guard session.activationState == .activated else { return }
+        let envelope = WatchEnvelope(kind: .agents, gatewayAgents: agents, selectedAgentId: selectedAgentId)
+        pushToWatch(envelope, preferImmediate: true)
+        AppLog.info("Pushed \(agents.count) agents to Watch selectedAgentId=\(selectedAgentId)")
     }
 
     /// iPhone → Watch command (e.g. remote-start a recording). Delivered immediately when the Watch app is reachable,
@@ -76,11 +99,36 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         }
     }
 
+    /// Merges cached pairing/TTS into every outbound context so the Watch never loses connected state on partial updates.
+    private func enrichWatchEnvelope(_ envelope: WatchEnvelope) -> WatchEnvelope {
+        let enriched = WatchEnvelope(
+            kind: envelope.kind,
+            jobId: envelope.jobId,
+            pairing: envelope.pairing ?? cachedPairingForWatch,
+            job: envelope.job,
+            jobs: envelope.jobs,
+            text: envelope.text,
+            ttsEnabled: envelope.ttsEnabled ?? cachedTtsEnabledForWatch,
+            ttsLanguage: envelope.ttsLanguage ?? cachedTtsLanguageForWatch,
+            gatewaySessions: envelope.gatewaySessions,
+            usage: envelope.usage,
+            gatewayAgents: envelope.gatewayAgents,
+            selectedAgentId: envelope.selectedAgentId
+        )
+        if enriched.pairing == nil, cachedPairingForWatch == nil {
+            AppLog.info("Watch context enrich kind=\(envelope.kind.rawValue) has no cached pairing yet")
+        } else if envelope.pairing == nil, let cached = cachedPairingForWatch {
+            AppLog.info("Watch context enrich kind=\(envelope.kind.rawValue) attached cached pairing phase=\(cached.phase.rawValue)")
+        }
+        return enriched
+    }
+
     private func pushToWatch(_ envelope: WatchEnvelope, preferImmediate: Bool) {
-        guard let context = WatchConnectivityCodec.applicationContext(from: envelope) else { return }
+        let enriched = enrichWatchEnvelope(envelope)
+        guard let context = WatchConnectivityCodec.applicationContext(from: enriched) else { return }
         do {
             try session.updateApplicationContext(context)
-            AppLog.info("Pushed application context to Watch kind=\(envelope.kind.rawValue)")
+            AppLog.info("Pushed application context to Watch kind=\(enriched.kind.rawValue) pairingPhase=\(enriched.pairing?.phase.rawValue ?? "nil")")
         } catch {
             AppLog.error("applicationContext update failed: \(error.localizedDescription)")
         }

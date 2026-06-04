@@ -16,6 +16,7 @@ final class AppModel: ObservableObject {
     /// Configured agents from the gateway (`agents.list`). Empty until first successful fetch.
     @Published private(set) var gatewayAgents: [GatewayAgentRow] = []
     @Published private(set) var agentsLoading = false
+    @Published private(set) var isCreatingAgent = false
     /// Active agent id for filtering sessions and new voice/text runs (`agent:<id>:…` session keys).
     @Published private(set) var selectedAgentId: String = UserDefaults.standard.string(forKey: "selectedAgentId") ?? "main"
     @Published var errorBanner: String?
@@ -46,6 +47,8 @@ final class AppModel: ObservableObject {
     private var watchGatewaySessions: [WatchGatewaySession] = []
     /// Last usage summary pushed to the Watch, re-pushed on a Watch sync request.
     private var watchUsage: WatchUsage?
+    /// Last agent list pushed to the Watch, re-pushed on a Watch sync request.
+    private var watchAgentsPayload: [WatchGatewayAgent] = []
     /// Tracks the in-flight Watch enrichment so a new refresh supersedes an older one.
     private var watchEnrichTask: Task<Void, Never>?
     /// How many recent messages per session we mirror onto the Watch.
@@ -88,7 +91,7 @@ final class AppModel: ObservableObject {
         watchBridge.isWatchReachable
     }
 
-    /// Agents to show in the Workout-style picker. Falls back to a single Main Actor card when the gateway returns none.
+    /// Agents to show in the home list. Falls back to a single Main Actor row when the gateway returns none.
     var agentsForDisplay: [GatewayAgentRow] {
         if gatewayAgents.isEmpty {
             return [Self.fallbackMainActor]
@@ -96,9 +99,29 @@ final class AppModel: ObservableObject {
         return gatewayAgents
     }
 
-    /// Sessions for the currently selected agent (`agent:<selectedAgentId>:…` keys).
+    /// Agents for UI: **Main Actor** (`main`) is always first, then others alphabetically by display name.
+    var sortedAgentsForDisplay: [GatewayAgentRow] {
+        let list = agentsForDisplay
+        let mains = list.filter { $0.id == "main" }
+        let rest = list.filter { $0.id != "main" }.sorted {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+        return mains + rest
+    }
+
+    /// Gateway sessions belonging to one agent (`agent:<id>:…`). Unknown keys are grouped under `main`.
+    func gatewaySessions(forAgentId targetAgentId: String) -> [GatewaySessionRow] {
+        gatewaySessions.filter { (agentId(fromSessionKey: $0.id) ?? "main") == targetAgentId }
+    }
+
+    /// Sessions for the currently selected agent (voice/text runs and Watch mirror).
     var filteredGatewaySessions: [GatewaySessionRow] {
-        gatewaySessions.filter { agentId(fromSessionKey: $0.id) == selectedAgentId }
+        gatewaySessions(forAgentId: selectedAgentId)
+    }
+
+    /// True when the paired operator token includes `operator.admin` (required for `agents.create`).
+    var canManageAgents: Bool {
+        KeychainStore.loadOperatorScopes().contains("operator.admin")
     }
 
     private static let fallbackMainActor = GatewayAgentRow(
@@ -115,7 +138,56 @@ final class AppModel: ObservableObject {
         selectedAgentId = agentId
         UserDefaults.standard.set(agentId, forKey: "selectedAgentId")
         currentSessionKey = defaultSessionKey(forAgentId: agentId)
-        AppLog.info("Selected agent id=\(agentId) currentSessionKey=\(currentSessionKey)")
+        pushAgentsToWatch()
+        let rows = gatewaySessions(forAgentId: agentId)
+        pushSessionListToWatch(rows: gatewaySessions)
+        startWatchEnrichment(rows: rows)
+        AppLog.info("Selected agent id=\(agentId) currentSessionKey=\(currentSessionKey) sessions=\(rows.count)")
+    }
+
+    /// Creates a new agent on the gateway via `agents.create`, then refreshes agents + sessions.
+    func createAgent(name: String, emoji: String?) async {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            errorBanner = "Agent name is required."
+            AppLog.error("createAgent blocked: empty name")
+            return
+        }
+        guard canManageAgents else {
+            AppLog.error("createAgent blocked: operator.admin not in scopes=\(KeychainStore.loadOperatorScopes().joined(separator: ","))")
+            return
+        }
+        isCreatingAgent = true
+        defer { isCreatingAgent = false }
+        do {
+            let agentId = try await jobClient.createAgent(
+                name: trimmed,
+                emoji: emoji,
+                model: nil
+            )
+            AppLog.info("createAgent succeeded id=\(agentId) name=\(trimmed)")
+            await refreshSessions()
+            selectAgent(agentId)
+        } catch {
+            errorBanner = error.localizedDescription
+            AppLog.error("createAgent failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Maps gateway agents to the Watch transport type and pushes them to the Watch Agents page.
+    private func pushAgentsToWatch() {
+        let agents = sortedAgentsForDisplay.map {
+            WatchGatewayAgent(
+                id: $0.id,
+                name: $0.name,
+                emoji: $0.emoji,
+                subtitle: $0.subtitle,
+                modelLabel: $0.modelLabel,
+                isDefault: $0.isDefault
+            )
+        }
+        watchAgentsPayload = agents
+        watchBridge.publishAgents(agents, selectedAgentId: selectedAgentId)
     }
 
     /// Loads agents + session index from the gateway. Called on home appear and on pull-to-refresh.
@@ -131,6 +203,7 @@ final class AppModel: ObservableObject {
             let agentsResult = try await jobClient.listAgents()
             gatewayAgents = agentsResult.agents
             reconcileSelectedAgent(defaultId: agentsResult.defaultAgentId)
+            pushAgentsToWatch()
             AppLog.info("Loaded \(agentsResult.agents.count) gateway agents defaultId=\(agentsResult.defaultAgentId)")
         } catch {
             AppLog.error("agents.list failed: \(error.localizedDescription)")
@@ -140,10 +213,9 @@ final class AppModel: ObservableObject {
             let (rows, usage) = try await jobClient.listSessionsAndUsage()
             gatewaySessions = rows
             AppLog.info("Loaded \(rows.count) gateway sessions; usage totalTokens=\(usage.totalTokens) sessions=\(usage.sessionCount)")
-            let watchRows = filteredGatewaySessions
-            pushSessionListToWatch(rows: watchRows)
+            pushSessionListToWatch(rows: gatewaySessions)
             pushUsageToWatch(usage)
-            startWatchEnrichment(rows: watchRows)
+            startWatchEnrichment(rows: gatewaySessions(forAgentId: selectedAgentId))
         } catch {
             errorBanner = error.localizedDescription
             AppLog.error("refreshSessions failed: \(error.localizedDescription)")
@@ -292,6 +364,7 @@ final class AppModel: ObservableObject {
         watchEnrichTask?.cancel()
         watchGatewaySessions = []
         watchUsage = nil
+        watchAgentsPayload = []
         activeJobId = nil
         watchBridge.publishGatewaySessions([])
         Task { await jobClient.closeReadSocket() }
@@ -328,6 +401,16 @@ final class AppModel: ObservableObject {
             if let id = envelope.jobId {
                 cancelJob(id: id)
             }
+        case .selectAgent:
+            let agentId = (envelope.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !agentId.isEmpty else {
+                AppLog.error("selectAgent from Watch ignored: empty agent id")
+                return
+            }
+            AppLog.info("Watch selected agent id=\(agentId)")
+            selectAgent(agentId)
+            pushSessionListToWatch(rows: gatewaySessions)
+            startWatchEnrichment(rows: gatewaySessions(forAgentId: agentId))
         case .requestSync:
             AppLog.info("Watch requested sync; republishing pairing + jobs")
             syncWatch()
@@ -335,6 +418,9 @@ final class AppModel: ObservableObject {
             if !watchGatewaySessions.isEmpty {
                 watchBridge.publishGatewaySessions(watchGatewaySessions)
                 if let watchUsage { watchBridge.publishUsage(watchUsage) }
+                if !watchAgentsPayload.isEmpty {
+                    watchBridge.publishAgents(watchAgentsPayload, selectedAgentId: selectedAgentId)
+                }
             } else if isPaired {
                 Task { await refreshSessions() }
             }
@@ -468,19 +554,57 @@ final class AppModel: ObservableObject {
     func republishToWatch(reason: String) {
         AppLog.info("Republishing state to Watch reason=\(reason) phase=\(pairing.phase.rawValue)")
         syncWatch()
+        guard isPaired else { return }
+        if !watchGatewaySessions.isEmpty {
+            watchBridge.publishGatewaySessions(watchGatewaySessions)
+            if let watchUsage { watchBridge.publishUsage(watchUsage) }
+            if !watchAgentsPayload.isEmpty {
+                watchBridge.publishAgents(watchAgentsPayload, selectedAgentId: selectedAgentId)
+            }
+            AppLog.info("Republish included gateway sessions=\(watchGatewaySessions.count) agents=\(watchAgentsPayload.count)")
+        } else {
+            AppLog.info("Republish: no cached gateway sessions; refreshing from gateway")
+            Task { await refreshSessions() }
+        }
     }
 
-    /// "Tap to listen" on the iPhone does NOT use the iPhone microphone. Voice is captured on the Watch, so this remote-starts
-    /// a fresh recording on the Watch. It only takes effect if the Watch app is currently active on screen — watchOS does not
-    /// allow the iPhone to launch the Watch app or its microphone in the background.
-    func toggleListenOnPhone() {
+    /// Active voice job on the iPhone (mirrored from Watch commands), if any.
+    var activeVoiceJob: VoiceJob? {
+        guard let id = activeJobId else { return nil }
+        return jobs.first { $0.id == id }
+    }
+
+    /// True when a voice job is in progress for the given agent (after `startListen(forAgentId:)`).
+    func isVoiceJobActive(forAgentId agentId: String) -> Bool {
+        guard selectedAgentId == agentId, let job = activeVoiceJob else { return false }
+        switch job.status {
+        case .listening, .sending, .running:
+            return true
+        case .idle, .done, .failed, .cancelled:
+            return false
+        }
+    }
+
+    /// "Tap to listen" under an agent: selects that agent, then remote-starts recording on the Watch (Watch app must be on screen).
+    func startListen(forAgentId agentId: String) {
         guard isPaired else {
             errorBanner = "Pair on iPhone before using the watch."
-            AppLog.error("toggleListenOnPhone blocked: not paired")
+            AppLog.error("startListen blocked: not paired agentId=\(agentId)")
             return
         }
-        AppLog.info("iPhone Tap to listen -> sending startListening command to Watch")
-        watchBridge.sendCommandToWatch(WatchEnvelope(kind: .startListening))
+        selectAgent(agentId)
+        guard isWatchReachable else {
+            errorBanner = "Open OpenWatch on your Watch to record."
+            AppLog.error("startListen blocked: Watch not reachable agentId=\(agentId)")
+            return
+        }
+        AppLog.info("iPhone Tap to listen agentId=\(agentId) -> startListening on Watch")
+        watchBridge.sendCommandToWatch(WatchEnvelope(kind: .startListening, text: agentId))
+    }
+
+    /// Legacy entry point: starts listen for the currently selected agent.
+    func toggleListenOnPhone() {
+        startListen(forAgentId: selectedAgentId)
     }
 
     private func startListeningFromWatch() async {

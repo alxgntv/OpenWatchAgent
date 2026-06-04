@@ -3,6 +3,8 @@ import UIKit
 
 struct HomeView: View {
     @ObservedObject var model: AppModel
+    @State private var showAddAgent = false
+    @State private var showServerAgentGuide = false
 
     var body: some View {
         List {
@@ -24,25 +26,6 @@ struct HomeView: View {
             }
 
             Section {
-                Button {
-                    model.toggleListenOnPhone()
-                } label: {
-                    Label("Tap to listen", systemImage: "mic.fill")
-                }
-
-                if let job = activeJob, job.status == .listening || job.status == .sending || job.status == .running {
-                    HStack {
-                        ProgressView()
-                        Text(job.statusDetail ?? job.status.rawValue.capitalized)
-                    }
-                }
-            } header: {
-                Text("Listen")
-            } footer: {
-                Text("Starts a new recording on the Watch. The Watch app must be open on screen — watchOS does not allow the iPhone to launch the Watch app or its microphone in the background.")
-            }
-
-            Section("Voice") {
                 Toggle(isOn: Binding(
                     get: { model.ttsEnabled },
                     set: { model.setTTSEnabled($0) }
@@ -61,66 +44,43 @@ struct HomeView: View {
                     Label("Language", systemImage: "globe")
                 }
                 .disabled(!model.ttsEnabled)
-            }
-
-            Section {
-                if model.agentsLoading && model.gatewayAgents.isEmpty {
-                    HStack { ProgressView(); Text("Loading agents…") }
-                } else {
-                    ForEach(model.agentsForDisplay) { agent in
-                        Button {
-                            AppLog.info("Agent card tapped id=\(agent.id) name=\(agent.name)")
-                            model.selectAgent(agent.id)
-                        } label: {
-                            AgentWorkoutCardView(
-                                agent: agent,
-                                isSelected: model.selectedAgentId == agent.id
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
-                        .listRowSeparator(.hidden)
-                        .listRowBackground(Color.clear)
-                    }
-                }
             } header: {
-                Text("Agents")
+                Text("Voice")
             } footer: {
-                Text("Each card is a configured agent on your gateway. Sessions below are filtered to the selected agent.")
+                Text("Tap to listen is under each agent. Recording runs on Apple Watch while OpenWatch is open on the Watch screen.")
+            }
+
+            if model.agentsLoading && model.gatewayAgents.isEmpty {
+                Section {
+                    HStack { ProgressView(); Text("Loading agents…") }
+                }
+            }
+
+            ForEach(model.sortedAgentsForDisplay) { agent in
+                AgentSessionsSection(model: model, agent: agent)
             }
 
             Section {
-                if model.filteredGatewaySessions.isEmpty {
-                    if model.sessionsLoading {
-                        HStack { ProgressView(); Text("Loading sessions…") }
+                Button {
+                    if model.canManageAgents {
+                        AppLog.info("Add agent sheet opened (in-app create)")
+                        showAddAgent = true
                     } else {
-                        Text("No sessions for this agent yet. Pull down to refresh.")
-                            .foregroundStyle(.secondary)
+                        AppLog.info("Add agent server guide opened (no operator.admin)")
+                        showServerAgentGuide = true
                     }
-                } else {
-                    // Real gateway sessions; tap to open the full transcript loaded from the bot.
-                    ForEach(model.filteredGatewaySessions) { session in
-                        NavigationLink {
-                            SessionDetailView(model: model, session: session)
-                        } label: {
-                            SessionCardView(session: session)
-                        }
-                    }
+                } label: {
+                    Label(
+                        model.canManageAgents ? "Add agent" : "Add agent on server",
+                        systemImage: "plus.circle.fill"
+                    )
                 }
-            } header: {
-                HStack {
-                    Text("Sessions")
-                    Spacer()
-                    if model.sessionsLoading {
-                        ProgressView()
-                    } else {
-                        Button {
-                            Task { await model.refreshSessions() }
-                        } label: {
-                            Image(systemName: "arrow.clockwise")
-                        }
-                        .buttonStyle(.borderless)
-                    }
+                .disabled(model.isCreatingAgent)
+            } footer: {
+                if model.canManageAgents {
+                    Text("Creates the agent on your gateway from this iPhone. Main Actor stays first.")
+                } else {
+                    Text("In-app create needs operator.admin on this phone. Tap above for server steps you can copy.")
                 }
             }
 
@@ -131,76 +91,202 @@ struct HomeView: View {
             }
         }
         .navigationTitle("OpenWatch")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    AppLog.info("Home refresh sessions tapped")
+                    Task { await model.refreshSessions() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .disabled(model.sessionsLoading)
+            }
+        }
         .refreshable { await model.refreshSessions() }
         .task { await model.refreshSessions() }
         .onAppear { AppLog.info("HomeView appeared jobs=\(model.jobs.count)") }
-    }
-
-    private var activeJob: VoiceJob? {
-        guard let id = model.activeJobId else { return nil }
-        return model.jobs.first { $0.id == id }
+        .sheet(isPresented: $showAddAgent) {
+            AddAgentSheet(model: model, isPresented: $showAddAgent)
+        }
+        .sheet(isPresented: $showServerAgentGuide) {
+            AddAgentServerGuideSheet(isPresented: $showServerAgentGuide)
+        }
+        .alert("Gateway", isPresented: Binding(
+            get: { model.errorBanner != nil },
+            set: { if !$0 { model.errorBanner = nil } }
+        )) {
+            Button("OK", role: .cancel) { model.errorBanner = nil }
+        } message: {
+            Text(model.errorBanner ?? "")
+        }
     }
 }
 
-/// Workout-style agent card (dark tile, accent subtitle) — one card per configured gateway agent.
-struct AgentWorkoutCardView: View {
+/// One agent block: standard section header + selectable row + that agent's sessions.
+private struct AgentSessionsSection: View {
+    @ObservedObject var model: AppModel
+    let agent: GatewayAgentRow
+
+    private var agentSessions: [GatewaySessionRow] {
+        model.gatewaySessions(forAgentId: agent.id)
+    }
+
+    var body: some View {
+        Section {
+            AgentListRowView(
+                agent: agent,
+                isSelected: model.selectedAgentId == agent.id
+            )
+            .contentShape(Rectangle())
+            .onTapGesture {
+                AppLog.info("Agent row tapped id=\(agent.id) name=\(agent.displayName)")
+                model.selectAgent(agent.id)
+            }
+
+            Button {
+                AppLog.info("Tap to listen tapped agentId=\(agent.id)")
+                model.startListen(forAgentId: agent.id)
+            } label: {
+                Label("Tap to listen", systemImage: "mic.fill")
+            }
+
+            if model.isVoiceJobActive(forAgentId: agent.id), let job = model.activeVoiceJob {
+                HStack {
+                    ProgressView()
+                    Text(job.statusDetail ?? job.status.rawValue.capitalized)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if agentSessions.isEmpty {
+                if model.sessionsLoading {
+                    HStack { ProgressView(); Text("Loading sessions…") }
+                } else {
+                    Text("No sessions for this agent yet.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                ForEach(agentSessions) { session in
+                    NavigationLink {
+                        SessionDetailView(model: model, session: session)
+                    } label: {
+                        SessionCardView(session: session)
+                    }
+                }
+            }
+        } header: {
+            Text(agent.displayName)
+                .foregroundStyle(.secondary)
+        } footer: {
+            if model.selectedAgentId == agent.id {
+                Text("Active for voice and new sessions.")
+            }
+        }
+    }
+}
+
+/// Standard list row for one gateway agent (system fonts, checkmark selection).
+struct AgentListRowView: View {
     let agent: GatewayAgentRow
     let isSelected: Bool
 
-    private let accent = Color(red: 0.75, green: 0.95, blue: 0.2)
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .top) {
-                agentIcon
-                    .font(.title2)
-                    .frame(width: 36, height: 36)
-                Spacer(minLength: 8)
-                Image(systemName: "ellipsis")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(accent.opacity(0.85))
-                    .padding(8)
-                    .background(Circle().fill(Color.white.opacity(0.08)))
+        HStack(spacing: 12) {
+            agentLeading
+            VStack(alignment: .leading, spacing: 2) {
+                Text(agent.displayName)
+                    .foregroundStyle(.primary)
+                if let subtitle = agentSubtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
             }
-            Text(agent.name)
-                .font(.body.weight(.semibold))
-                .foregroundStyle(.white)
-                .lineLimit(1)
-            Text(subtitleText)
-                .font(.caption.weight(.bold))
-                .foregroundStyle(accent)
-                .textCase(.uppercase)
-                .lineLimit(2)
+            Spacer(minLength: 0)
+            if isSelected {
+                Image(systemName: "checkmark")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.primary)
+            }
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color(white: 0.14))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(isSelected ? accent : Color.clear, lineWidth: 2)
-        )
     }
 
-    @ViewBuilder private var agentIcon: some View {
+    @ViewBuilder private var agentLeading: some View {
         if let emoji = agent.emoji, !emoji.isEmpty {
             Text(emoji)
+                .font(.title2)
+                .accessibilityHidden(true)
         } else {
             Image(systemName: "person.crop.circle.fill")
-                .foregroundStyle(accent)
+                .font(.title2)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.secondary)
         }
     }
 
-    private var subtitleText: String {
+    private var agentSubtitle: String? {
         if let model = agent.modelLabel, !model.isEmpty {
-            return model.replacingOccurrences(of: "/", with: " · ").uppercased()
+            return model.replacingOccurrences(of: "/", with: " · ")
         }
         if let subtitle = agent.subtitle, !subtitle.isEmpty {
-            return String(subtitle.prefix(48)).uppercased()
+            return subtitle
         }
-        return agent.isDefault ? "DEFAULT AGENT" : "AGENT"
+        return agent.isDefault ? "Default agent" : nil
+    }
+}
+
+/// Sheet to create a new gateway agent (`agents.create`).
+struct AddAgentSheet: View {
+    @ObservedObject var model: AppModel
+    @Binding var isPresented: Bool
+    @State private var name = ""
+    @State private var emoji = "🥗"
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Name", text: $name)
+                        .textInputAutocapitalization(.words)
+                    TextField("Emoji", text: $emoji)
+                } header: {
+                    Text("Agent")
+                } footer: {
+                    Text("Example: Nutritionist · 🥗. The gateway derives the agent id from the name (e.g. nutritionist).")
+                }
+            }
+            .navigationTitle("Add Agent")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        AppLog.info("Add agent sheet cancelled")
+                        isPresented = false
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Create") {
+                        AppLog.info("Add agent create tapped name=\(name)")
+                        Task {
+                            await model.createAgent(name: name, emoji: emoji)
+                            if model.errorBanner == nil {
+                                isPresented = false
+                            }
+                        }
+                    }
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || model.isCreatingAgent)
+                }
+            }
+            .overlay {
+                if model.isCreatingAgent {
+                    ProgressView("Creating…")
+                        .padding()
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+            }
+        }
     }
 }
 
@@ -211,6 +297,7 @@ struct SessionCardView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(session.title)
+                .foregroundStyle(.primary)
                 .lineLimit(1)
             if let preview = session.preview, !preview.isEmpty {
                 Text(preview)
@@ -347,7 +434,8 @@ struct SessionDetailView: View {
                 // The iPhone cannot launch the Watch app (watchOS limitation). If the Watch app is not active, tell the
                 // user to open it; otherwise remote-start the recording on the Watch.
                 if model.isWatchReachable {
-                    model.toggleListenOnPhone()
+                    let agentId = model.agentId(fromSessionKey: session.id) ?? model.selectedAgentId
+                    model.startListen(forAgentId: agentId)
                 } else {
                     showWatchHint = true
                 }

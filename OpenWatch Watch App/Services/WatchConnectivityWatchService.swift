@@ -7,6 +7,7 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
     static let shared = WatchConnectivityWatchService()
 
     private let session = WCSession.default
+    private var pendingSyncAfterActivation = false
 
     override private init() {
         super.init()
@@ -63,9 +64,11 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
     /// Uses an immediate message when the phone is reachable, otherwise queues it.
     func requestSync() {
         guard session.activationState == .activated else {
-            AppLog.error("WCSession not activated on Watch; cannot request sync")
+            pendingSyncAfterActivation = true
+            AppLog.info("Watch requestSync deferred until WCSession activates (state=\(session.activationState.rawValue))")
             return
         }
+        pendingSyncAfterActivation = false
         applyLatestApplicationContext()
         let envelope = WatchEnvelope(kind: .requestSync)
         if session.isReachable, let data = WatchConnectivityCodec.payloadData(from: WatchConnectivityCodec.userInfo(from: envelope) ?? [:]) {
@@ -82,9 +85,16 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
     /// Apply the last application context the iPhone published, so the Watch shows known state immediately on launch.
     private func applyLatestApplicationContext() {
         let context = session.receivedApplicationContext
-        guard !context.isEmpty, let data = WatchConnectivityCodec.payloadData(from: context) else { return }
-        AppLog.info("Applying cached application context on Watch")
+        guard !context.isEmpty, let data = WatchConnectivityCodec.payloadData(from: context) else {
+            AppLog.info("Watch application context empty on apply; relying on local pairing cache + requestSync")
+            return
+        }
+        AppLog.info("Applying cached application context on Watch bytes=\(data.count)")
         WatchAppModel.shared.applyEnvelope(data)
+    }
+
+    fileprivate func applyLatestApplicationContextOnActivation() {
+        applyLatestApplicationContext()
     }
 }
 
@@ -96,7 +106,12 @@ extension WatchConnectivityWatchService: WCSessionDelegate {
             Task { @MainActor in
                 AppLog.info("Watch WCSession activated state=\(activationState.rawValue)")
                 if activationState == .activated {
-                    WatchConnectivityWatchService.shared.requestSync()
+                    let service = WatchConnectivityWatchService.shared
+                    service.applyLatestApplicationContextOnActivation()
+                    if service.pendingSyncAfterActivation {
+                        AppLog.info("Watch running deferred requestSync after activation")
+                    }
+                    service.requestSync()
                 }
             }
         }

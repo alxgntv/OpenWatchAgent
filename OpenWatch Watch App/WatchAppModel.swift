@@ -37,9 +37,9 @@ final class WatchAppModel: ObservableObject {
             SpeechPlaybackService.shared.stop()
         }
     }
-    /// Selected HORIZONTAL page: 0 = Usage, 1 = live stack (main), 2...N = gateway sessions.
-    /// Defaults to 1 so the app always opens on the main screen. Switching pages stops any active speech.
-    @Published var horizontalIndex: Int = 1 {
+    /// Selected HORIZONTAL page: 0 = Usage, 1 = Agents, 2 = live stack (main), 3...N = gateway sessions.
+    /// Defaults to 2 so the app always opens on the main screen. Switching pages stops any active speech.
+    @Published var horizontalIndex: Int = 2 {
         didSet {
             guard oldValue != horizontalIndex else { return }
             AppLog.info("Watch horizontal page switched \(oldValue) -> \(horizontalIndex); stopping any active speech")
@@ -55,6 +55,10 @@ final class WatchAppModel: ObservableObject {
     @Published var gatewaySessions: [WatchGatewaySession] = []
     /// Aggregate usage mirrored from the iPhone — shown on the Usage page.
     @Published var usage: WatchUsage?
+    /// Configured agents mirrored from the iPhone — shown on the Agents page.
+    @Published var gatewayAgents: [WatchGatewayAgent] = []
+    /// Active agent id mirrored from the iPhone (filters gateway session pages).
+    @Published var selectedAgentId: String = "main"
 
     private let bridge = WatchConnectivityWatchService.shared
     let recorder = WatchAudioRecorder()
@@ -76,12 +80,70 @@ final class WatchAppModel: ObservableObject {
     /// Gateway sessionKeys whose replies are muted on the Watch (local, per-session). Not persisted/synced.
     @Published private var gatewayMutedKeys: Set<String> = []
 
+    // ─── Ariadne's Thread [AT-0002] ─────────────────────
+    // What: UserDefaults cache of last connected gateway pairing on the Watch.
+    // Why:  After battery drain the app cold-starts before iPhone sync; cached .connected
+    //       keeps the main UI while requestSync restores full state.
+    // Date: 2026-06-04
+    // Related: [AT-0001] WatchConnectivityPhoneService enrichWatchEnvelope
+    // ─────────────────────────────────────────────────────
+    private enum PairingLocalCache {
+        static let wasConnectedKey = "watch.pairing.wasConnected"
+        static let gatewayURLKey = "watch.pairing.gatewayURL"
+        static let deviceIdKey = "watch.pairing.deviceId"
+    }
+
     private init() {
         sessions = [WatchSession(sessionKey: "agent:main:main")]
+        restorePairingFromLocalCache()
     }
 
     var isPaired: Bool {
         pairing.phase == .connected
+    }
+
+    private func restorePairingFromLocalCache() {
+        guard UserDefaults.standard.bool(forKey: PairingLocalCache.wasConnectedKey) else {
+            AppLog.info("Watch pairing local cache miss; phase=\(pairing.phase.rawValue)")
+            return
+        }
+        let url = UserDefaults.standard.string(forKey: PairingLocalCache.gatewayURLKey)
+        let deviceId = UserDefaults.standard.string(forKey: PairingLocalCache.deviceIdKey)
+        pairing = PairingSnapshot(
+            phase: .connected,
+            gatewayURL: url,
+            message: "Syncing with iPhone…",
+            deviceId: deviceId
+        )
+        AppLog.info("Watch restored pairing from local cache gatewayURL=\(url ?? "nil"); awaiting iPhone sync")
+    }
+
+    private func persistPairingFromPhone(_ snapshot: PairingSnapshot) {
+        pairing = snapshot
+        switch snapshot.phase {
+        case .connected:
+            UserDefaults.standard.set(true, forKey: PairingLocalCache.wasConnectedKey)
+            if let url = snapshot.gatewayURL {
+                UserDefaults.standard.set(url, forKey: PairingLocalCache.gatewayURLKey)
+            }
+            if let deviceId = snapshot.deviceId {
+                UserDefaults.standard.set(deviceId, forKey: PairingLocalCache.deviceIdKey)
+            }
+            AppLog.info("Watch persisted connected pairing to local cache")
+        case .needsSetupCode, .failed:
+            UserDefaults.standard.set(false, forKey: PairingLocalCache.wasConnectedKey)
+            AppLog.info("Watch cleared pairing local cache phase=\(snapshot.phase.rawValue)")
+        case .connecting, .waitingForApproval:
+            AppLog.info("Watch pairing intermediate phase=\(snapshot.phase.rawValue); local cache unchanged")
+        }
+    }
+
+    private func applyRemotePairingAndTts(from envelope: WatchEnvelope) {
+        if let remote = envelope.pairing {
+            persistPairingFromPhone(remote)
+        }
+        applyGlobalTts(envelope.ttsEnabled)
+        applyTtsLanguage(envelope.ttsLanguage)
     }
 
     var isRecording: Bool { recorder.isRecording }
@@ -90,9 +152,68 @@ final class WatchAppModel: ObservableObject {
         sessions.indices.contains(currentIndex) ? sessions[currentIndex] : nil
     }
 
+    /// Agents to show on the Agents page. Falls back to Main Actor when the iPhone has not pushed any yet.
+    var agentsForDisplay: [WatchGatewayAgent] {
+        if gatewayAgents.isEmpty {
+            return [WatchGatewayAgent(
+                id: "main",
+                name: "Main Actor",
+                emoji: "🎯",
+                subtitle: "Default agent",
+                modelLabel: nil,
+                isDefault: true
+            )]
+        }
+        return gatewayAgents
+    }
+
+    /// Main Actor first, then other agents by name (mirrors iPhone).
+    var sortedAgentsForDisplay: [WatchGatewayAgent] {
+        let list = agentsForDisplay.map { agent -> WatchGatewayAgent in
+            if agent.id == "main" {
+                return WatchGatewayAgent(
+                    id: agent.id,
+                    name: "Main Actor",
+                    emoji: agent.emoji ?? "🎯",
+                    subtitle: agent.subtitle,
+                    modelLabel: agent.modelLabel,
+                    isDefault: agent.isDefault
+                )
+            }
+            return agent
+        }
+        let mains = list.filter { $0.id == "main" }
+        let rest = list.filter { $0.id != "main" }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        return mains + rest
+    }
+
+    /// Gateway session pages for the active agent only (`agent:<selectedAgentId>:…`).
+    var filteredGatewaySessions: [WatchGatewaySession] {
+        gatewaySessions.filter { sessionAgentId(from: $0.id) == selectedAgentId }
+    }
+
+    private func sessionAgentId(from sessionKey: String) -> String {
+        let parts = sessionKey.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count >= 2, parts[0] == "agent" else { return "main" }
+        let id = String(parts[1])
+        return id.isEmpty ? "main" : id
+    }
+
+    /// Session count for an agent (shown on the Agents page).
+    func sessionCount(forAgentId agentId: String) -> Int {
+        gatewaySessions.filter { sessionAgentId(from: $0.id) == agentId }.count
+    }
+
     private func newSessionKey() -> String {
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        return "agent:main:\(token)"
+        return "agent:\(selectedAgentId):\(token)"
+    }
+
+    /// User picked an agent on the Watch — sync selection to the iPhone (which filters sessions and re-pushes).
+    func selectAgent(_ agentId: String) {
+        selectedAgentId = agentId
+        AppLog.info("Watch selectAgent id=\(agentId); sending to iPhone")
+        bridge.sendCommand(WatchEnvelope(kind: .selectAgent, text: agentId))
     }
 
     func applyEnvelope(_ data: Data) {
@@ -100,23 +221,20 @@ final class WatchAppModel: ObservableObject {
             AppLog.error("Watch failed to decode envelope")
             return
         }
+        AppLog.info("Watch applyEnvelope kind=\(envelope.kind.rawValue) pairingPhase=\(envelope.pairing?.phase.rawValue ?? "unchanged")")
+        applyRemotePairingAndTts(from: envelope)
         switch envelope.kind {
-        case .pairingSnapshot:
-            if let pairing = envelope.pairing {
-                self.pairing = pairing
-                AppLog.info("Watch pairing phase=\(pairing.phase.rawValue)")
-            }
-        case .jobsSnapshot:
-            // Sessions/history are owned by the Watch now; only the pairing status is taken from the snapshot.
-            if let pairing = envelope.pairing { self.pairing = pairing }
-            applyGlobalTts(envelope.ttsEnabled)
-            applyTtsLanguage(envelope.ttsLanguage)
+        case .pairingSnapshot, .jobsSnapshot:
+            break
         case .jobUpdated:
-            applyGlobalTts(envelope.ttsEnabled)
-            applyTtsLanguage(envelope.ttsLanguage)
             if let job = envelope.job { upsert(job) }
         case .startListening:
-            AppLog.info("Watch received remote startListening from iPhone")
+            if let agentId = envelope.text?.trimmingCharacters(in: .whitespacesAndNewlines), !agentId.isEmpty {
+                selectedAgentId = agentId
+                AppLog.info("Watch received remote startListening for agentId=\(agentId)")
+            } else {
+                AppLog.info("Watch received remote startListening (no agent id in envelope)")
+            }
             handleRemoteStartListening()
         case .gatewaySessions:
             if let sessions = envelope.gatewaySessions {
@@ -127,6 +245,15 @@ final class WatchAppModel: ObservableObject {
             if let usage = envelope.usage {
                 self.usage = usage
                 AppLog.info("Watch received usage sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens)")
+            }
+        case .agents:
+            if let agents = envelope.gatewayAgents {
+                gatewayAgents = agents
+                AppLog.info("Watch received \(agents.count) gateway agents from iPhone")
+            }
+            if let selected = envelope.selectedAgentId, !selected.isEmpty {
+                selectedAgentId = selected
+                AppLog.info("Watch selectedAgentId=\(selected) from iPhone")
             }
         default:
             break
@@ -206,7 +333,7 @@ final class WatchAppModel: ObservableObject {
             try recorder.startRecording()
             promoteCurrentEmptyIfNeeded()
             recordingSessionId = sessions.indices.contains(currentIndex) ? sessions[currentIndex].id : nil
-            statusHint = "Recording… tap to send."
+            statusHint = nil
             objectWillChange.send()
             AppLog.info("Watch recording started sessionIndex=\(currentIndex)")
         } catch {
@@ -251,7 +378,7 @@ final class WatchAppModel: ObservableObject {
         sessions[si].jobs.insert(job, at: 0)
 
         bridge.sendAudio(fileURL: url, jobId: job.id, sessionKey: session.sessionKey)
-        statusHint = "Sending…"
+        statusHint = nil
         AppLog.info("Watch sent audio jobId=\(job.id) sessionKey=\(session.sessionKey)")
     }
 
@@ -260,7 +387,7 @@ final class WatchAppModel: ObservableObject {
         recorder.cancel()
         recordingSessionId = nil
         gatewayRecordingKey = nil
-        statusHint = "Cancelled"
+        statusHint = nil
         objectWillChange.send()
         AppLog.info("Watch cancelled recording")
     }
@@ -325,7 +452,7 @@ final class WatchAppModel: ObservableObject {
             try recorder.startRecording()
             gatewayRecordingKey = sessionKey
             recordingSessionId = nil
-            statusHint = "Recording… tap to send."
+            statusHint = nil
             objectWillChange.send()
             AppLog.info("Watch gateway recording started sessionKey=\(sessionKey)")
         } catch {
@@ -357,7 +484,7 @@ final class WatchAppModel: ObservableObject {
         gatewayJobs[key, default: []].insert(job, at: 0)
 
         bridge.sendAudio(fileURL: url, jobId: job.id, sessionKey: key)
-        statusHint = "Sending…"
+        statusHint = nil
         AppLog.info("Watch sent gateway audio jobId=\(job.id) sessionKey=\(key)")
     }
 
@@ -373,17 +500,10 @@ final class WatchAppModel: ObservableObject {
         if job.status.isTerminal { pendingJobIds.remove(job.id) }
 
         switch job.status {
-        case .sending, .running:
-            statusHint = job.statusDetail ?? "Working…"
         case .done:
             statusHint = nil
-            // Honor the global TTS switch and this gateway session's local mute.
             speakOnce(job, muted: isGatewayMuted(key))
-        case .failed:
-            statusHint = job.errorMessage ?? "Failed"
-        case .cancelled:
-            statusHint = "Cancelled"
-        case .idle, .listening:
+        case .failed, .cancelled, .sending, .running, .idle, .listening:
             break
         }
     }
@@ -408,18 +528,11 @@ final class WatchAppModel: ObservableObject {
             pendingJobIds.remove(job.id)
         }
 
-        let isCurrent = si == currentIndex
         switch job.status {
-        case .sending, .running:
-            if isCurrent { statusHint = job.statusDetail ?? "Working…" }
         case .done:
-            if isCurrent { statusHint = nil }
+            statusHint = nil
             speakOnce(job, muted: sessions[si].muted)
-        case .failed:
-            if isCurrent { statusHint = job.errorMessage ?? "Failed" }
-        case .cancelled:
-            if isCurrent { statusHint = "Cancelled" }
-        case .idle, .listening:
+        case .failed, .cancelled, .sending, .running, .idle, .listening:
             break
         }
     }

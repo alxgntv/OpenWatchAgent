@@ -18,13 +18,23 @@ struct WatchSessionPage: View {
     let session: WatchSession
     let index: Int
 
+    /// Hints that are not in-flight job state (those belong in the Speak button only).
+    private static func isActionableStatusHint(_ hint: String) -> Bool {
+        let blocked = [
+            "Sending…", "Sending...", "Working…", "Recording… tap to send.",
+            "Cancelled", "Failed"
+        ]
+        return !blocked.contains(hint)
+    }
+
     var body: some View {
         ScrollView {
             VStack(spacing: 8) {
                 speakButton
                 muteButton
-                // Only surface non-process hints (permission/pairing errors) here; live process status lives in the button.
-                if index == model.currentIndex, session.activeJob == nil, !isRecordingHere, let hint = model.statusHint {
+                // Only pairing / permission / mic errors — send & record progress live inside the Speak button.
+                if index == model.currentIndex, session.activeJob == nil, !isRecordingHere,
+                   let hint = model.statusHint, Self.isActionableStatusHint(hint) {
                     Text(hint)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -231,7 +241,94 @@ struct GatewaySessionPage: View {
     }
 }
 
-/// Usage page (one screen right of the live stack): aggregate stats derived from the gateway's session index.
+/// Agents page (one screen left of the live stack): Workout-style cards mirrored from the iPhone.
+struct AgentsPage: View {
+    @ObservedObject var model: WatchAppModel
+
+    private let accent = Color(red: 0.75, green: 0.95, blue: 0.2)
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("AGENTS")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(accent)
+                ForEach(model.sortedAgentsForDisplay) { agent in
+                    Button {
+                        AppLog.info("Watch agent card tapped id=\(agent.id)")
+                        model.selectAgent(agent.id)
+                    } label: {
+                        WatchAgentCardView(
+                            agent: agent,
+                            isSelected: model.selectedAgentId == agent.id,
+                            sessionCount: model.sessionCount(forAgentId: agent.id),
+                            accent: accent
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 2)
+        }
+        .navigationTitle("Agents")
+    }
+}
+
+/// Compact Workout-style agent tile for watchOS.
+struct WatchAgentCardView: View {
+    let agent: WatchGatewayAgent
+    let isSelected: Bool
+    let sessionCount: Int
+    let accent: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                if let emoji = agent.emoji, !emoji.isEmpty {
+                    Text(emoji).font(.title3)
+                } else {
+                    Image(systemName: "person.crop.circle.fill")
+                        .foregroundStyle(accent)
+                }
+                Spacer(minLength: 4)
+                Image(systemName: "ellipsis")
+                    .font(.caption2)
+                    .foregroundStyle(accent.opacity(0.8))
+            }
+            Text(agent.name)
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+            Text(subtitleText)
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(accent)
+                .lineLimit(2)
+            if sessionCount > 0 {
+                Text("\(sessionCount) session\(sessionCount == 1 ? "" : "s")")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color(white: 0.14)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(isSelected ? accent : Color.clear, lineWidth: 2)
+        )
+    }
+
+    private var subtitleText: String {
+        if let model = agent.modelLabel, !model.isEmpty {
+            return model.replacingOccurrences(of: "/", with: " · ").uppercased()
+        }
+        if let subtitle = agent.subtitle, !subtitle.isEmpty {
+            return String(subtitle.prefix(32)).uppercased()
+        }
+        return agent.isDefault ? "DEFAULT" : "AGENT"
+    }
+}
+
+/// Usage page (left of Agents): aggregate stats derived from the gateway's session index.
 struct UsagePage: View {
     @ObservedObject var model: WatchAppModel
 
@@ -291,12 +388,45 @@ struct UsagePage: View {
 }
 
 struct WatchNotPairedView: View {
+    @ObservedObject var model: WatchAppModel
+    @State private var syncAttempts = 0
+
     var body: some View {
-        VStack(spacing: 6) {
-            Image(systemName: "iphone")
-            Text("Pair on iPhone")
+        VStack(spacing: 8) {
+            ProgressView()
+            Text(statusText)
                 .font(.caption2)
                 .multilineTextAlignment(.center)
         }
+        .onAppear {
+            AppLog.info("WatchNotPairedView appear phase=\(model.pairing.phase.rawValue); starting sync")
+            triggerSync()
+        }
+        .task {
+            while !Task.isCancelled, !model.isPaired {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard !Task.isCancelled, !model.isPaired else { break }
+                syncAttempts += 1
+                AppLog.info("WatchNotPairedView periodic sync attempt=\(syncAttempts)")
+                triggerSync()
+            }
+        }
+    }
+
+    private var statusText: String {
+        switch model.pairing.phase {
+        case .needsSetupCode:
+            return "Pair on iPhone"
+        case .failed:
+            return model.pairing.message ?? "Pair on iPhone"
+        case .connecting, .waitingForApproval:
+            return model.pairing.message ?? "Syncing with iPhone…"
+        case .connected:
+            return model.pairing.message ?? "Syncing with iPhone…"
+        }
+    }
+
+    private func triggerSync() {
+        WatchConnectivityWatchService.shared.requestSync()
     }
 }

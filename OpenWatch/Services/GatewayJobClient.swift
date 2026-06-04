@@ -37,6 +37,11 @@ struct GatewayAgentRow: Identifiable, Sendable, Equatable {
     let subtitle: String?
     let modelLabel: String?
     let isDefault: Bool
+
+    /// UI label for the primary coordinator (`main` is always shown as Main Actor).
+    var displayName: String {
+        id == "main" ? "Main Actor" : name
+    }
 }
 
 /// Parsed payload from `agents.list` (OpenClaw gateway RPC).
@@ -185,6 +190,36 @@ actor GatewayJobClient {
         let payload = try await readRPC(method: "agents.list", params: [:])
         AppLog.info("agents.list raw payload=\(truncatedJSON(payload))")
         return parseAgents(payload)
+    }
+
+    /// Default workspace path used by agents on the user's gateway (matches OpenClaw docker layout).
+    static let defaultAgentWorkspace = "/home/node/.openclaw/workspace"
+
+    /// Creates a new agent on the gateway (`agents.create`, requires `operator.admin` on the operator token).
+    func createAgent(
+        name: String,
+        workspace: String = defaultAgentWorkspace,
+        emoji: String? = nil,
+        model: String? = nil
+    ) async throws -> String {
+        var params: [String: Any] = [
+            "name": name.trimmingCharacters(in: .whitespacesAndNewlines),
+            "workspace": workspace.trimmingCharacters(in: .whitespacesAndNewlines),
+        ]
+        if let emoji, !emoji.trimmingCharacters(in: .whitespaces).isEmpty {
+            params["emoji"] = emoji.trimmingCharacters(in: .whitespaces)
+        }
+        if let model, !model.trimmingCharacters(in: .whitespaces).isEmpty {
+            params["model"] = model.trimmingCharacters(in: .whitespaces)
+        }
+        AppLog.info("agents.create name=\(params["name"] ?? "") workspace=\(params["workspace"] ?? "")")
+        let payload = try await readRPC(method: "agents.create", params: params)
+        if let agentId = payload["agentId"] as? String, !agentId.isEmpty {
+            AppLog.info("agents.create succeeded agentId=\(agentId)")
+            return agentId
+        }
+        AppLog.error("agents.create response missing agentId payload=\(truncatedJSON(payload))")
+        throw GatewayJobError.runFailed("Gateway did not return an agent id.")
     }
 
     /// Fetches the session index once and returns both the parsed rows and aggregate usage (avoids a second RPC).

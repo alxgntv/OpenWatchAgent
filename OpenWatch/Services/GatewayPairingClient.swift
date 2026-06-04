@@ -24,6 +24,7 @@ actor GatewayPairingClient {
     private let appVersion: String
     private let bootstrapScopes = [
         "operator.approvals",
+        "operator.admin",
         "operator.read",
         "operator.talk.secrets",
         "operator.write",
