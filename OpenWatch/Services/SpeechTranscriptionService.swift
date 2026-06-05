@@ -44,8 +44,19 @@ final class SpeechTranscriptionService: NSObject, ObservableObject {
         recognitionTask = nil
 
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothHFP, .duckOthers])
+        // Route-aware input: when headphones (Bluetooth or wired) are connected, the system captures from them
+        // automatically; on disconnect it falls back to the built-in mic. We intentionally DO NOT pass
+        // `.defaultToSpeaker` here, because forcing the loud speaker overrides any connected headset route.
+        // `.allowBluetoothHFP` is the new name (Xcode 26+); `.allowBluetooth` is the same raw value on older Xcode.
+        var options: AVAudioSession.CategoryOptions = [.allowBluetoothA2DP, .allowAirPlay, .duckOthers]
+        #if compiler(>=6.2)
+        options.insert(.allowBluetoothHFP)
+        #else
+        options.insert(.allowBluetooth)
+        #endif
+        try session.setCategory(.playAndRecord, mode: .default, options: options)
         try session.setActive(true, options: .notifyOthersOnDeactivation)
+        logCurrentAudioRoute(session: session, context: "iPhone startListening")
 
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
         recognitionRequest?.shouldReportPartialResults = true
@@ -93,6 +104,25 @@ final class SpeechTranscriptionService: NSObject, ObservableObject {
             }
         }
     }
+
+    /// Logs the resolved input/output ports so we can confirm whether headphones or built-in devices are in use.
+    private func logCurrentAudioRoute(session: AVAudioSession, context: String) {
+        let route = session.currentRoute
+        let inputs = route.inputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+        let outputs = route.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+        let available = (session.availableInputs ?? []).map { $0.portType.rawValue }.joined(separator: ",")
+        let usingHeadphoneMic = route.inputs.contains { Self.headphoneInputPortTypes.contains($0.portType) }
+        AppLog.info("[\(context)] audio route inputs=[\(inputs)] outputs=[\(outputs)] available=[\(available)] usingHeadphoneMic=\(usingHeadphoneMic)")
+    }
+
+    /// Port types that represent an external headset/headphone microphone (anything that is NOT the built-in mic).
+    private static let headphoneInputPortTypes: Set<AVAudioSession.Port> = [
+        .bluetoothHFP,
+        .headsetMic,
+        .usbAudio,
+        .carAudio,
+        .lineIn,
+    ]
 
     func cancel() {
         recognitionTask?.cancel()

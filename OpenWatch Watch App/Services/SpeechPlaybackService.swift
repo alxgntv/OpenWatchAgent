@@ -16,8 +16,13 @@ final class SpeechPlaybackService: NSObject {
         guard !text.isEmpty else { return }
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+            // Route-aware playback: with A2DP allowed the spoken reply plays through connected Bluetooth headphones
+            // (e.g. AirPods) when present, and automatically falls back to the built-in Watch speaker when no
+            // headphones are connected. The `.playback` category never forces the speaker, so fallback is automatic.
+            // Note: `.allowAirPlay` is unavailable on watchOS, so only the Bluetooth A2DP option is used here.
+            try session.setCategory(.playback, mode: .spokenAudio, options: [.allowBluetoothA2DP, .duckOthers])
             try session.setActive(true, options: [])
+            logCurrentAudioRoute(session: session, context: "Watch TTS speak")
         } catch {
             AppLog.error("Watch TTS audio session setup failed: \(error.localizedDescription)")
         }
@@ -26,6 +31,16 @@ final class SpeechPlaybackService: NSObject {
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         AppLog.info("Watch TTS speaking length=\(text.count) language=\(language)")
         synthesizer.speak(utterance)
+    }
+
+    /// Logs the resolved output ports so we can confirm whether the reply plays through headphones or the Watch speaker.
+    private func logCurrentAudioRoute(session: AVAudioSession, context: String) {
+        let route = session.currentRoute
+        let outputs = route.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+        let usingHeadphoneOutput = route.outputs.contains {
+            $0.portType == .bluetoothA2DP || $0.portType == .bluetoothHFP || $0.portType == .headphones
+        }
+        AppLog.info("[\(context)] audio output route outputs=[\(outputs)] usingHeadphoneOutput=\(usingHeadphoneOutput)")
     }
 
     /// Immediately stops any current/queued speech and releases the audio session.

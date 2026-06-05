@@ -29,8 +29,22 @@ final class WatchAudioRecorder: NSObject, ObservableObject {
         guard !isRecording else { return }
 
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .default, options: [.duckOthers])
+        // Route-aware capture on the Watch: when Bluetooth HFP is allowed the system records from connected Bluetooth
+        // headphones (e.g. AirPods) when present, and automatically falls back to the built-in Watch microphone
+        // when no headset is connected. We never force the built-in mic, so the fallback is fully automatic.
+        // The Bluetooth-input option only exists on watchOS 11.0+, so it is added behind a runtime availability check;
+        // on watchOS 10 the recorder simply uses the built-in mic (unchanged previous behavior).
+        var options: AVAudioSession.CategoryOptions = [.duckOthers]
+        if #available(watchOS 11.0, *) {
+            #if compiler(>=6.2)
+            options.insert(.allowBluetoothHFP)
+            #else
+            options.insert(.allowBluetooth)
+            #endif
+        }
+        try session.setCategory(.playAndRecord, mode: .default, options: options)
         try session.setActive(true, options: .notifyOthersOnDeactivation)
+        logCurrentAudioRoute(session: session, context: "Watch startRecording")
 
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("voice-\(UUID().uuidString)")
@@ -64,6 +78,16 @@ final class WatchAudioRecorder: NSObject, ObservableObject {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         AppLog.info("Watch stopped audio recording url=\(url?.lastPathComponent ?? "nil")")
         return url
+    }
+
+    /// Logs the resolved input/output ports so we can confirm whether headphones or the built-in Watch mic is in use.
+    private func logCurrentAudioRoute(session: AVAudioSession, context: String) {
+        let route = session.currentRoute
+        let inputs = route.inputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+        let outputs = route.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+        let available = (session.availableInputs ?? []).map { $0.portType.rawValue }.joined(separator: ",")
+        let usingHeadphoneMic = route.inputs.contains { $0.portType == .bluetoothHFP || $0.portType == .headsetMic }
+        AppLog.info("[\(context)] audio route inputs=[\(inputs)] outputs=[\(outputs)] available=[\(available)] usingHeadphoneMic=\(usingHeadphoneMic)")
     }
 
     func cancel() {
