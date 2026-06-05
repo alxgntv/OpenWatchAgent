@@ -7,8 +7,8 @@ struct ContentView: View {
         NavigationStack {
             if model.isPaired {
                 // Outer axis = HORIZONTAL (default watchOS paging): page 0 is the live stack (unchanged),
-                // swiping left/right reveals one page per real gateway session mirrored from the iPhone.
-                // Horizontal order: Usage · Agents · live stack (main) · gateway sessions.
+                // swiping left/right reveals the other top-level pages.
+                // Horizontal order: Usage · Agents · live stack (main) · all gateway sessions (single vertical list page).
                 TabView(selection: $model.horizontalIndex) {
                     UsagePage(model: model)
                         .tag(0)
@@ -16,10 +16,8 @@ struct ContentView: View {
                         .tag(1)
                     liveStack
                         .tag(2)
-                    ForEach(Array(model.filteredGatewaySessions.enumerated()), id: \.element.id) { idx, gatewaySession in
-                        GatewaySessionPage(model: model, session: gatewaySession)
-                            .tag(idx + 3)
-                    }
+                    GatewaySessionsListPage(model: model)
+                        .tag(3)
                 }
             } else {
                 WatchNotPairedView(model: model)

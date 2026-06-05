@@ -467,8 +467,17 @@ final class AppModel: ObservableObject {
 
     /// Receives a voice recording captured on the Watch, transcribes it on iPhone, and runs it through the session the
     /// Watch chose (each Watch session has its own sessionKey).
+    ///
+    /// Background behavior: the whole turn (transcription + the long gateway WebSocket round-trip) is wrapped in
+    /// `BackgroundAudioKeepAlive`, which activates a silent playback audio session so the app's declared `audio`
+    /// UIBackgroundMode keeps the process alive while the iPhone app is merely backgrounded (not foreground). This is
+    /// what lets the Watch send and receive without the user re-opening the iPhone app.
     func handleWatchAudio(jobId: UUID, fileURL: URL, sessionKey: String) async {
-        defer { try? FileManager.default.removeItem(at: fileURL) }
+        BackgroundAudioKeepAlive.begin(reason: "watchAudio-\(jobId)")
+        defer {
+            try? FileManager.default.removeItem(at: fileURL)
+            BackgroundAudioKeepAlive.end(reason: "watchAudio-\(jobId)")
+        }
 
         guard isPaired else {
             errorBanner = "Pair on iPhone before using the watch."

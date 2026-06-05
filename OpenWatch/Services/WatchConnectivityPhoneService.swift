@@ -81,6 +81,16 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         guard session.activationState == .activated else { return }
         let envelope = WatchEnvelope(kind: .jobUpdated, job: job)
         pushToWatch(envelope, preferImmediate: true)
+        // Background-safe delivery: when the Watch app is suspended/closed (wrist down, screen off) it is not
+        // reachable, so the immediate sendMessageData above is dropped and only the latest applicationContext survives.
+        // Queue every job update via transferUserInfo too — watchOS persists this queue and delivers it (via
+        // didReceiveUserInfo) as soon as the Watch app wakes, so the status/result catches up without a manual reopen.
+        guard let userInfo = WatchConnectivityCodec.userInfo(from: envelope) else {
+            AppLog.error("Failed to encode job update for transferUserInfo jobId=\(job.id)")
+            return
+        }
+        session.transferUserInfo(userInfo)
+        AppLog.info("Queued job update to Watch via transferUserInfo jobId=\(job.id) status=\(job.status.rawValue) (background-safe)")
     }
 
     /// Pushes the real gateway session index (with recent history) so the Watch can show horizontal session pages.

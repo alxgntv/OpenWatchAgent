@@ -263,6 +263,75 @@ struct GatewaySessionPage: View {
     }
 }
 
+/// Sessions page (one screen right of the live stack): a single vertical list of every gateway session for the
+/// active agent. Scrolls down (Digital Crown) instead of paging sideways. Tapping a row opens that session.
+struct GatewaySessionsListPage: View {
+    @ObservedObject var model: WatchAppModel
+
+    var body: some View {
+        let sessions = model.filteredGatewaySessions
+        return Group {
+            if sessions.isEmpty {
+                ScrollView {
+                    Text("No sessions yet.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 24)
+                }
+            } else {
+                List {
+                    ForEach(sessions) { session in
+                        NavigationLink {
+                            GatewaySessionPage(model: model, session: session)
+                        } label: {
+                            GatewaySessionListRow(session: session)
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Sessions")
+    }
+}
+
+/// Compact row for the gateway sessions list: title/preview plus a short last-activity stamp.
+struct GatewaySessionListRow: View {
+    let session: WatchGatewaySession
+
+    private var rowTitle: String {
+        if !session.title.isEmpty, session.title != session.id { return session.title }
+        return "Session"
+    }
+
+    private var rowSubtitle: String? {
+        if let preview = session.preview, !preview.isEmpty { return preview }
+        if let last = session.messages.last?.text, !last.isEmpty { return last }
+        return nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(rowTitle)
+                .font(.footnote)
+                .lineLimit(1)
+            if let subtitle = rowSubtitle {
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            if let updatedAt = session.updatedAt {
+                Text(watchCompactStamp(updatedAt))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 /// Agents page (one screen left of the live stack): standard watchOS list rows.
 struct AgentsPage: View {
     @ObservedObject var model: WatchAppModel
