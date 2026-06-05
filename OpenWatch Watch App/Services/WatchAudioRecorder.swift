@@ -29,21 +29,18 @@ final class WatchAudioRecorder: NSObject, ObservableObject {
         guard !isRecording else { return }
 
         let session = AVAudioSession.sharedInstance()
-        // Route-aware capture on the Watch: when Bluetooth HFP is allowed the system records from connected Bluetooth
-        // headphones (e.g. AirPods) when present, and automatically falls back to the built-in Watch microphone
-        // when no headset is connected. We never force the built-in mic, so the fallback is fully automatic.
-        // The Bluetooth-input option only exists on watchOS 11.0+, so it is added behind a runtime availability check;
-        // on watchOS 10 the recorder simply uses the built-in mic (unchanged previous behavior).
-        var options: AVAudioSession.CategoryOptions = [.duckOthers]
-        if #available(watchOS 11.0, *) {
-            #if compiler(>=6.2)
-            options.insert(.allowBluetoothHFP)
-            #else
-            options.insert(.allowBluetooth)
-            #endif
-        }
+        // ─── Ariadne's Thread [AT-0003] ─────────────────────
+        // What: Force Watch recordings through the built-in microphone.
+        // Why:  watchOS kept routing capture to stale Bluetooth HFP AirPods, producing audio files
+        //       that Apple Speech accepted but transcribed as empty ("No speech detected").
+        // Date: 2026-06-05
+        // Related: WatchAudioRecorder.logCurrentAudioRoute, AppModel.processWatchAudioTurn
+        // ─────────────────────────────────────────────────────
+        // Keep playback ducking, but do not allow Bluetooth HFP as an input route for command capture.
+        let options: AVAudioSession.CategoryOptions = [.duckOthers]
         try session.setCategory(.playAndRecord, mode: .default, options: options)
         try session.setActive(true, options: .notifyOthersOnDeactivation)
+        logAvailableInputs(session: session, context: "Watch startRecording")
         logCurrentAudioRoute(session: session, context: "Watch startRecording")
 
         let url = FileManager.default.temporaryDirectory
@@ -66,6 +63,14 @@ final class WatchAudioRecorder: NSObject, ObservableObject {
         currentURL = url
         isRecording = true
         AppLog.info("Watch started audio recording url=\(url.lastPathComponent)")
+    }
+
+    private func logAvailableInputs(session: AVAudioSession, context: String) {
+        let availableInputs = session.availableInputs ?? []
+        let available = availableInputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+        let hasBuiltInMic = availableInputs.contains { $0.portType == .builtInMic }
+        let hasBluetoothHFP = availableInputs.contains { $0.portType == .bluetoothHFP }
+        AppLog.info("[\(context)] availableInputs=[\(available)] hasBuiltInMic=\(hasBuiltInMic) hasBluetoothHFP=\(hasBluetoothHFP) bluetoothHFPAllowed=false")
     }
 
     /// Stops recording and returns the recorded file URL.
