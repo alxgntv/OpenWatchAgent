@@ -33,10 +33,16 @@ final class WatchAppModel: ObservableObject {
     @Published var currentIndex: Int = 0 {
         didSet {
             guard oldValue != currentIndex else { return }
+            lastSessionSwitchAt = Date()
             AppLog.info("Watch session switched \(oldValue) -> \(currentIndex); stopping any active speech")
             SpeechPlaybackService.shared.stop()
         }
     }
+    /// Timestamp of the last vertical session switch. Used to swallow a Speak tap that is really the tail end of a
+    /// page-swipe gesture, so changing sessions never auto-starts a recording.
+    private var lastSessionSwitchAt: Date?
+    /// How long after a session switch a Speak tap is treated as an accidental swipe tail and ignored.
+    private let sessionSwitchTapGuardInterval: TimeInterval = 0.4
     /// Selected HORIZONTAL page: 0 = Usage, 1 = Agents, 2 = live stack (main), 3...N = gateway sessions.
     /// Defaults to 2 so the app always opens on the main screen. Switching pages stops any active speech.
     @Published var horizontalIndex: Int = 2 {
@@ -303,8 +309,16 @@ final class WatchAppModel: ObservableObject {
         AppLog.info("Watch applyEnvelope kind=\(envelope.kind.rawValue) pairingPhase=\(envelope.pairing?.phase.rawValue ?? "unchanged") revoke=\(envelope.revokeGatewayPairing == true)")
         applyRemotePairingAndTts(from: envelope)
         switch envelope.kind {
-        case .pairingSnapshot, .jobsSnapshot:
+        case .pairingSnapshot:
             break
+        case .jobsSnapshot:
+            // Full jobs snapshot (e.g. the iPhone's reply to requestSync). Apply every job so a turn that finished
+            // while the Watch was suspended — and whose single jobUpdated push was missed — is reconciled and leaves
+            // the "Sending…" state. upsert() recovers the session mapping by job id when needed.
+            if let snapshot = envelope.jobs {
+                AppLog.info("Watch applying jobsSnapshot count=\(snapshot.count)")
+                for job in snapshot { upsert(job) }
+            }
         case .jobUpdated:
             if let job = envelope.job { upsert(job) }
         case .startListening:
@@ -397,6 +411,13 @@ final class WatchAppModel: ObservableObject {
         if recorder.isRecording {
             Task { await finishRecordingAndSend() }
         } else {
+            // Guard against accidental starts: when the user swipes between sessions on the vertical stack, watchOS can
+            // register the swipe's release as a tap on the large Speak button. If a switch just happened, ignore this
+            // start so navigating sessions never auto-starts a recording. Stopping is never guarded.
+            if let switchedAt = lastSessionSwitchAt, Date().timeIntervalSince(switchedAt) < sessionSwitchTapGuardInterval {
+                AppLog.info("Watch toggleRecord ignored: within \(sessionSwitchTapGuardInterval)s of a session switch (treated as swipe tail)")
+                return
+            }
             Task { await beginRecording() }
         }
     }
@@ -452,14 +473,33 @@ final class WatchAppModel: ObservableObject {
         recordingSessionId = nil
         let session = sessions[si]
 
-        let job = VoiceJob(status: .sending, statusDetail: "Sending…")
+        // The iPhone serializes all voice turns into a single queue. If another turn is already in flight, show this
+        // one as queued right away (instead of "Sending…") so back-to-back recordings across sessions never look stuck;
+        // the iPhone later confirms with its own "Queued — waiting…"/progress updates.
+        let hasTurnInFlight = hasUnfinishedSentJob(excluding: nil)
+        let detail = hasTurnInFlight ? "Queued — waiting…" : "Sending…"
+        let job = VoiceJob(status: .sending, statusDetail: detail)
         pendingJobIds.insert(job.id)
         jobSession[job.id] = session.id
         sessions[si].jobs.insert(job, at: 0)
 
         bridge.sendAudio(fileURL: url, jobId: job.id, sessionKey: session.sessionKey)
         statusHint = nil
-        AppLog.info("Watch sent audio jobId=\(job.id) sessionKey=\(session.sessionKey)")
+        AppLog.info("Watch sent audio jobId=\(job.id) sessionKey=\(session.sessionKey) queued=\(hasTurnInFlight)")
+    }
+
+    /// True when any session already has a sent-but-not-finished turn (status .sending/.running). Used to label a new
+    /// recording as queued immediately on the Watch, matching the iPhone's serial queue.
+    private func hasUnfinishedSentJob(excluding excludedJobId: UUID?) -> Bool {
+        for session in sessions {
+            for job in session.jobs {
+                if let excludedJobId, job.id == excludedJobId { continue }
+                if job.status == .sending || job.status == .running {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     func cancelRecording() {
@@ -594,8 +634,22 @@ final class WatchAppModel: ObservableObject {
             upsertGateway(job, key: key)
             return
         }
-        guard let sessionId = jobSession[job.id],
-              let si = sessions.firstIndex(where: { $0.id == sessionId }) else {
+        // Resolve which local session this job belongs to. Primary source is the in-memory jobSession map, but that map
+        // can be lost if the Watch app was suspended/relaunched between sending the audio and the iPhone's reply. In
+        // that case fall back to locating the job by id inside the existing sessions (the job row itself survives in the
+        // sessions array) and rebuild the mapping, so a finished reply is never dropped and stuck on "Sending…".
+        let resolvedIndex: Int?
+        if let sessionId = jobSession[job.id], let si = sessions.firstIndex(where: { $0.id == sessionId }) {
+            resolvedIndex = si
+        } else if let si = sessions.firstIndex(where: { $0.jobs.contains(where: { $0.id == job.id }) }) {
+            jobSession[job.id] = sessions[si].id
+            AppLog.info("Watch upsert: recovered session mapping for jobId=\(job.id) via existing session row")
+            resolvedIndex = si
+        } else {
+            resolvedIndex = nil
+        }
+
+        guard let si = resolvedIndex else {
             AppLog.info("Watch upsert: job has no known session jobId=\(job.id); ignoring")
             return
         }
