@@ -116,6 +116,42 @@ nonisolated public struct WatchGatewaySession: Codable, Sendable, Identifiable, 
     }
 }
 
+// ─── Ariadne's Thread [AT-0007] ─────────────────────
+// What: Add Watch record-button haptic options to the shared envelope model.
+// Why:  The iPhone settings screen controls which native Watch haptic plays when recording starts/stops.
+// Date: 2026-06-05
+// Related: AppModel.setHapticType, WatchAppModel.playRecordHaptic
+// ─────────────────────────────────────────────────────
+nonisolated public enum WatchHapticType: String, Codable, Sendable, CaseIterable, Identifiable {
+    case off
+    case notification
+    case directionUp
+    case directionDown
+    case success
+    case failure
+    case retry
+    case start
+    case stop
+    case click
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .off: return "Off"
+        case .notification: return "Notification"
+        case .directionUp: return "Direction Up"
+        case .directionDown: return "Direction Down"
+        case .success: return "Success"
+        case .failure: return "Failure"
+        case .retry: return "Retry"
+        case .start: return "Start"
+        case .stop: return "Stop"
+        case .click: return "Click"
+        }
+    }
+}
+
 nonisolated public struct WatchEnvelope: Codable, Sendable {
     public let kind: WatchMessageKind
     public let jobId: UUID?
@@ -127,6 +163,10 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
     public let ttsEnabled: Bool?
     /// BCP-47 language code the Watch should use to speak replies (e.g. "en-US"). nil means "unchanged / unknown".
     public let ttsLanguage: String?
+    /// Watch haptic played on record start/stop. nil means "unchanged / unknown".
+    public let hapticType: String?
+    /// Watch speech rate multiplier for spoken replies. nil means "unchanged / unknown".
+    public let ttsRate: Double?
     /// Real gateway session index (with recent history) for the Watch's horizontal pages. nil means "unchanged / unknown".
     public let gatewaySessions: [WatchGatewaySession]?
     /// Aggregate usage for the Watch's Usage page. nil means "unchanged / unknown".
@@ -148,6 +188,8 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         text: String? = nil,
         ttsEnabled: Bool? = nil,
         ttsLanguage: String? = nil,
+        hapticType: String? = nil,
+        ttsRate: Double? = nil,
         gatewaySessions: [WatchGatewaySession]? = nil,
         usage: WatchUsage? = nil,
         gatewayAgents: [WatchGatewayAgent]? = nil,
@@ -162,6 +204,8 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         self.text = text
         self.ttsEnabled = ttsEnabled
         self.ttsLanguage = ttsLanguage
+        self.hapticType = hapticType
+        self.ttsRate = ttsRate
         self.gatewaySessions = gatewaySessions
         self.usage = usage
         self.gatewayAgents = gatewayAgents

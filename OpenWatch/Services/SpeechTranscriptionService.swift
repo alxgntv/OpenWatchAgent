@@ -9,7 +9,22 @@ final class SpeechTranscriptionService: NSObject, ObservableObject {
     private let audioEngine = AVAudioEngine()
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
-    private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ru-RU"))
+    // ─── Ariadne's Thread [AT-0005] ─────────────────────
+    // What: Remove the hardcoded Russian recognizer locale.
+    // Why:  Voice input can be Russian, English, or another language per session; recognition
+    //       must use the system Speech recognizer instead of forcing every audio file through ru-RU.
+    // Date: 2026-06-05
+    // Related: WatchAudioRecorder, AppModel.processWatchAudioTurn
+    // ─────────────────────────────────────────────────────
+    private func speechRecognizer(localeIdentifier: String) throws -> SFSpeechRecognizer {
+        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier)) else {
+            throw NSError(domain: "OpenWatch", code: 6, userInfo: [NSLocalizedDescriptionKey: "Speech recognizer is unavailable for \(localeIdentifier)."])
+        }
+        guard recognizer.isAvailable else {
+            throw NSError(domain: "OpenWatch", code: 6, userInfo: [NSLocalizedDescriptionKey: "Speech recognizer is unavailable for \(recognizer.locale.identifier)."])
+        }
+        return recognizer
+    }
 
     func requestPermissions() async -> Bool {
         let speechStatus = await withCheckedContinuation { continuation in
@@ -77,7 +92,7 @@ final class SpeechTranscriptionService: NSObject, ObservableObject {
         AppLog.info("Started listening for voice command")
     }
 
-    func stopAndTranscribe() async throws -> String {
+    func stopAndTranscribe(localeIdentifier: String) async throws -> String {
         guard isListening else {
             throw NSError(domain: "OpenWatch", code: 2, userInfo: [NSLocalizedDescriptionKey: "Not currently listening."])
         }
@@ -87,8 +102,10 @@ final class SpeechTranscriptionService: NSObject, ObservableObject {
         recognitionRequest?.endAudio()
         isListening = false
 
+        let speechRecognizer = try speechRecognizer(localeIdentifier: localeIdentifier)
+        AppLog.info("Transcribing live audio recognizerLocale=\(speechRecognizer.locale.identifier)")
         return try await withCheckedThrowingContinuation { continuation in
-            guard let speechRecognizer, let recognitionRequest else {
+            guard let recognitionRequest else {
                 continuation.resume(throwing: NSError(domain: "OpenWatch", code: 3, userInfo: [NSLocalizedDescriptionKey: "Speech recognizer unavailable."]))
                 return
             }
@@ -137,15 +154,13 @@ final class SpeechTranscriptionService: NSObject, ObservableObject {
     }
 
     /// Transcribes an audio file recorded on the Apple Watch. The Watch cannot run the Speech framework, so the iPhone does it.
-    func transcribeFile(at url: URL) async throws -> String {
+    func transcribeFile(at url: URL, localeIdentifier: String) async throws -> String {
         guard await ensurePermissions() else {
             throw NSError(domain: "OpenWatch", code: 5, userInfo: [NSLocalizedDescriptionKey: "Microphone and speech recognition permissions are required. Grant them once in OpenWatch on iPhone."])
         }
-        guard let speechRecognizer, speechRecognizer.isAvailable else {
-            throw NSError(domain: "OpenWatch", code: 6, userInfo: [NSLocalizedDescriptionKey: "Speech recognizer is unavailable."])
-        }
+        let speechRecognizer = try speechRecognizer(localeIdentifier: localeIdentifier)
 
-        AppLog.info("Transcribing watch audio file=\(url.lastPathComponent)")
+        AppLog.info("Transcribing watch audio file=\(url.lastPathComponent) recognizerLocale=\(speechRecognizer.locale.identifier)")
         let request = SFSpeechURLRecognitionRequest(url: url)
         request.shouldReportPartialResults = false
 

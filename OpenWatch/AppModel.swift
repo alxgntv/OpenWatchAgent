@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import Foundation
+import Speech
 import SwiftUI
 
 @MainActor
@@ -22,17 +23,56 @@ final class AppModel: ObservableObject {
     @Published var errorBanner: String?
     /// Global "speak replies on Watch" switch. Persisted on iPhone and mirrored to the Watch on every sync.
     @Published var ttsEnabled: Bool = UserDefaults.standard.object(forKey: "ttsEnabled") as? Bool ?? true
-    /// BCP-47 language used by the Watch to speak replies. Persisted on iPhone and mirrored to the Watch.
-    @Published var ttsLanguage: String = UserDefaults.standard.string(forKey: "ttsLanguage") ?? "en-US"
+    /// BCP-47 language used for both Apple Speech input and Watch spoken replies. Defaults to the user's device language.
+    @Published var voiceLanguage: String = UserDefaults.standard.string(forKey: "voiceLanguage") ?? AppModel.defaultVoiceLanguage()
+    /// Haptic feedback the Watch plays when record starts/stops. Persisted on iPhone and mirrored to the Watch.
+    @Published var hapticType: WatchHapticType = WatchHapticType(rawValue: UserDefaults.standard.string(forKey: "hapticType") ?? "") ?? .start
+    /// Speech rate multiplier the Watch uses to speak replies. Persisted on iPhone and mirrored to the Watch.
+    @Published var ttsRate: Double = UserDefaults.standard.object(forKey: "ttsRate") as? Double ?? 1.0
 
-    /// Every speech language available for the picker, shown with English display names (code, name), sorted by name.
+    /// Selectable Watch speech rate multipliers.
+    static let availableTTSRates: [Double] = [1.0, 1.10, 1.25, 1.30, 1.40, 1.50, 1.75, 2.0]
+
+    /// Languages supported by both Apple Speech recognition and AVSpeechSynthesizer output.
     static let availableVoiceLanguages: [(code: String, name: String)] = {
-        let codes = Set(AVSpeechSynthesisVoice.speechVoices().map { $0.language })
         let english = Locale(identifier: "en_US")
-        return codes
-            .map { code in (code: code, name: english.localizedString(forIdentifier: code) ?? code) }
+        let recognitionCodes = Set(SFSpeechRecognizer.supportedLocales().map(\.identifier))
+        let synthesisCodes = Set(AVSpeechSynthesisVoice.speechVoices().map(\.language))
+        return recognitionCodes
+            .intersection(synthesisCodes)
+            .map { locale in
+                let name = english.localizedString(forIdentifier: locale) ?? locale
+                return (code: locale, name: name)
+            }
             .sorted { $0.name < $1.name }
     }()
+
+    private static func defaultVoiceLanguage() -> String {
+        let supportedCodes = availableVoiceLanguages.map(\.code)
+        let candidates = Locale.preferredLanguages + [Locale.autoupdatingCurrent.identifier]
+        for candidate in candidates {
+            if let supported = matchingSupportedSpeechLocale(for: candidate, supportedCodes: supportedCodes) {
+                return supported
+            }
+        }
+        return SFSpeechRecognizer()?.locale.identifier ?? "en-US"
+    }
+
+    private static func matchingSupportedSpeechLocale(for candidate: String, supportedCodes: [String]) -> String? {
+        let normalizedCandidate = normalizedLocaleIdentifier(candidate)
+        if let exact = supportedCodes.first(where: { normalizedLocaleIdentifier($0) == normalizedCandidate }) {
+            return exact
+        }
+        let languageCode = normalizedCandidate.split(separator: "-").first.map(String.init) ?? normalizedCandidate
+        return supportedCodes.first {
+            normalizedLocaleIdentifier($0).split(separator: "-").first.map(String.init) == languageCode
+        }
+    }
+
+    private static func normalizedLocaleIdentifier(_ identifier: String) -> String {
+        identifier.replacingOccurrences(of: "_", with: "-").lowercased()
+    }
+
     /// Every voice command goes to this gateway session until the user explicitly starts a new one.
     @Published private(set) var currentSessionKey = "agent:main:main"
 
@@ -60,9 +100,15 @@ final class AppModel: ObservableObject {
         if KeychainStore.isPaired, let url = KeychainStore.loadGatewayURL()?.absoluteString {
             pairing = PairingSnapshot(phase: .connected, gatewayURL: url, message: "Connected.")
         }
-        watchBridge.publish(pairing: pairing, jobs: jobs, ttsEnabled: ttsEnabled, ttsLanguage: ttsLanguage)
-        // Warm the voice catalog off the main thread so the language Picker never computes speechVoices() during render.
-        Task.detached(priority: .utility) { _ = AppModel.availableVoiceLanguages }
+        watchBridge.publish(
+            pairing: pairing,
+            jobs: jobs,
+            ttsEnabled: ttsEnabled,
+            ttsLanguage: voiceLanguage,
+            hapticType: hapticType.rawValue,
+            ttsRate: ttsRate
+        )
+        _ = AppModel.availableVoiceLanguages
     }
 
     /// Toggles global voice playback and immediately mirrors the new state to the Watch (which does the speaking).
@@ -73,11 +119,38 @@ final class AppModel: ObservableObject {
         syncWatch()
     }
 
-    /// Sets the speech language and mirrors it to the Watch.
-    func setTTSLanguage(_ language: String) {
-        ttsLanguage = language
-        UserDefaults.standard.set(language, forKey: "ttsLanguage")
-        AppLog.info("Global TTS language set=\(language)")
+    // ─── Ariadne's Thread [AT-0006] ─────────────────────
+    // What: Persist one voice language selected on iPhone.
+    // Why:  Input recognition and spoken replies must use the same user-selected language,
+    //       defaulting to the device language on first launch.
+    // Date: 2026-06-05
+    // Related: [AT-0005] SpeechTranscriptionService speechRecognizer locale removal
+    // ─────────────────────────────────────────────────────
+    func setVoiceLanguage(_ language: String) {
+        voiceLanguage = language
+        UserDefaults.standard.set(language, forKey: "voiceLanguage")
+        AppLog.info("Voice language set=\(language)")
+        syncWatch()
+    }
+
+    // ─── Ariadne's Thread [AT-0008] ─────────────────────
+    // What: Persist and mirror Watch haptic and TTS-rate controls from iPhone settings.
+    // Why:  The iPhone app owns global voice preferences, and the Watch must use the selected
+    //       native haptic on record-button start/stop plus the selected speech-rate multiplier.
+    // Date: 2026-06-05
+    // Related: [AT-0007] WatchEnvelope haptic/rate fields, WatchAppModel.applyHapticType
+    // ─────────────────────────────────────────────────────
+    func setHapticType(_ haptic: WatchHapticType) {
+        hapticType = haptic
+        UserDefaults.standard.set(haptic.rawValue, forKey: "hapticType")
+        AppLog.info("Watch haptic type set=\(haptic.rawValue)")
+        syncWatch()
+    }
+
+    func setTTSRate(_ rate: Double) {
+        ttsRate = rate
+        UserDefaults.standard.set(rate, forKey: "ttsRate")
+        AppLog.info("Watch TTS rate set=\(rate)")
         syncWatch()
     }
 
@@ -191,7 +264,7 @@ final class AppModel: ObservableObject {
     }
 
     /// Loads agents + session index from the gateway. Called on home appear and on pull-to-refresh.
-    func refreshSessions() async {
+    func refreshSessions(showErrors: Bool = true) async {
         guard isPaired else { return }
         sessionsLoading = true
         agentsLoading = true
@@ -217,9 +290,25 @@ final class AppModel: ObservableObject {
             pushUsageToWatch(usage)
             startWatchEnrichment(rows: gatewaySessions(forAgentId: selectedAgentId))
         } catch {
-            errorBanner = error.localizedDescription
-            AppLog.error("refreshSessions failed: \(error.localizedDescription)")
+            handleRefreshSessionsError(error, showErrors: showErrors)
         }
+    }
+
+    // ─── Ariadne's Thread [AT-0010] ─────────────────────
+    // What: Suppress read-only refresh alerts while a voice job is running.
+    // Why:  Reopening the iPhone app during Watch "Working…" starts sessions.list/chat.history refreshes;
+    //       those can time out independently of the active chat.send socket and should not look like the job failed.
+    // Date: 2026-06-05
+    // Related: AppModel.refreshSessions, GatewayJobClient.readRPC, AppModel.processWatchAudioTurn
+    // ─────────────────────────────────────────────────────
+    private func handleRefreshSessionsError(_ error: Error, showErrors: Bool) {
+        let message = error.localizedDescription
+        if !showErrors || activeVoiceJob != nil {
+            AppLog.error("refreshSessions failed silently showErrors=\(showErrors) activeVoiceJob=\(activeVoiceJob?.id.uuidString ?? "nil"): \(message)")
+            return
+        }
+        errorBanner = message
+        AppLog.error("refreshSessions failed: \(message)")
     }
 
     /// Parses `agent:<agentId>:…` from a gateway session key.
@@ -560,7 +649,7 @@ final class AppModel: ObservableObject {
         syncWatch(job: jobs[index])
 
         do {
-            let transcript = try await speech.transcribeFile(at: fileURL)
+            let transcript = try await speech.transcribeFile(at: fileURL, localeIdentifier: voiceLanguage)
             guard !transcript.isEmpty else {
                 throw NSError(domain: "OpenWatch", code: 4, userInfo: [NSLocalizedDescriptionKey: "No speech detected."])
             }
@@ -740,7 +829,7 @@ final class AppModel: ObservableObject {
         jobs[index].statusDetail = "Sending…"
         syncWatch(job: jobs[index])
         do {
-            let transcript = try await speech.stopAndTranscribe()
+            let transcript = try await speech.stopAndTranscribe(localeIdentifier: voiceLanguage)
             guard !transcript.isEmpty else {
                 throw NSError(domain: "OpenWatch", code: 4, userInfo: [NSLocalizedDescriptionKey: "No speech detected."])
             }
@@ -842,7 +931,9 @@ final class AppModel: ObservableObject {
             pairing: pairing,
             jobs: jobs,
             ttsEnabled: ttsEnabled,
-            ttsLanguage: ttsLanguage,
+            ttsLanguage: voiceLanguage,
+            hapticType: hapticType.rawValue,
+            ttsRate: ttsRate,
             revokeGatewayPairing: revokeGatewayPairing
         )
         if let job { watchBridge.publish(job: job) }

@@ -18,6 +18,8 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
     private var cachedPairingForWatch: PairingSnapshot?
     private var cachedTtsEnabledForWatch: Bool?
     private var cachedTtsLanguageForWatch: String?
+    private var cachedHapticTypeForWatch: String?
+    private var cachedTtsRateForWatch: Double?
 
     /// True only when the Watch app is currently reachable (its app is active/foreground). The iPhone cannot launch
     /// the Watch app itself — watchOS provides no such API — so commands only take effect while this is true.
@@ -39,13 +41,17 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         jobs: [VoiceJob],
         ttsEnabled: Bool,
         ttsLanguage: String,
+        hapticType: String,
+        ttsRate: Double,
         revokeGatewayPairing: Bool = false
     ) {
         let outbound = revokeGatewayPairing ? pairing : Self.pairingForWatchOutbound(pairing)
         cachedPairingForWatch = outbound
         cachedTtsEnabledForWatch = ttsEnabled
         cachedTtsLanguageForWatch = ttsLanguage
-        AppLog.info("Cached Watch pairing phase=\(outbound.phase.rawValue) revoke=\(revokeGatewayPairing) for context enrichment")
+        cachedHapticTypeForWatch = hapticType
+        cachedTtsRateForWatch = ttsRate
+        AppLog.info("Cached Watch pairing phase=\(outbound.phase.rawValue) haptic=\(hapticType) rate=\(ttsRate) revoke=\(revokeGatewayPairing) for context enrichment")
         guard session.activationState == .activated else {
             AppLog.info("WCSession not activated on iPhone; pairing cached but push deferred")
             return
@@ -56,6 +62,8 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
             jobs: jobs,
             ttsEnabled: ttsEnabled,
             ttsLanguage: ttsLanguage,
+            hapticType: hapticType,
+            ttsRate: ttsRate,
             revokeGatewayPairing: revokeGatewayPairing ? true : nil
         )
         pushToWatch(envelope, preferImmediate: true)
@@ -163,6 +171,8 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
             text: envelope.text,
             ttsEnabled: envelope.ttsEnabled ?? cachedTtsEnabledForWatch,
             ttsLanguage: envelope.ttsLanguage ?? cachedTtsLanguageForWatch,
+            hapticType: envelope.hapticType ?? cachedHapticTypeForWatch,
+            ttsRate: envelope.ttsRate ?? cachedTtsRateForWatch,
             gatewaySessions: envelope.gatewaySessions,
             usage: envelope.usage,
             gatewayAgents: envelope.gatewayAgents,

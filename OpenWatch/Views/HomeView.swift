@@ -26,6 +26,17 @@ struct HomeView: View {
             }
 
             Section {
+                Picker(selection: Binding(
+                    get: { model.voiceLanguage },
+                    set: { model.setVoiceLanguage($0) }
+                )) {
+                    ForEach(AppModel.availableVoiceLanguages, id: \.code) { lang in
+                        Text(lang.name).tag(lang.code)
+                    }
+                } label: {
+                    Label("Language", systemImage: "globe")
+                }
+
                 Toggle(isOn: Binding(
                     get: { model.ttsEnabled },
                     set: { model.setTTSEnabled($0) }
@@ -34,20 +45,31 @@ struct HomeView: View {
                 }
 
                 Picker(selection: Binding(
-                    get: { model.ttsLanguage },
-                    set: { model.setTTSLanguage($0) }
+                    get: { model.hapticType },
+                    set: { model.setHapticType($0) }
                 )) {
-                    ForEach(AppModel.availableVoiceLanguages, id: \.code) { lang in
-                        Text(lang.name).tag(lang.code)
+                    ForEach(WatchHapticType.allCases) { haptic in
+                        Text(haptic.displayName).tag(haptic)
                     }
                 } label: {
-                    Label("Language", systemImage: "globe")
+                    Label("Haptic Feedback", systemImage: "hand.tap.fill")
+                }
+
+                Picker(selection: Binding(
+                    get: { model.ttsRate },
+                    set: { model.setTTSRate($0) }
+                )) {
+                    ForEach(AppModel.availableTTSRates, id: \.self) { rate in
+                        Text(Self.rateLabel(rate)).tag(rate)
+                    }
+                } label: {
+                    Label("Speech Rate", systemImage: "speedometer")
                 }
                 .disabled(!model.ttsEnabled)
             } header: {
-                Text("Voice")
+                Text("Settings")
             } footer: {
-                Text("Tap to listen is under each agent. Recording runs on Apple Watch while OpenWatch is open on the Watch screen.")
+                Text("Language controls both speech recognition and spoken answers on Apple Watch.")
             }
 
             if model.agentsLoading && model.gatewayAgents.isEmpty {
@@ -103,7 +125,7 @@ struct HomeView: View {
             }
         }
         .refreshable { await model.refreshSessions() }
-        .task { await model.refreshSessions() }
+        .task { await model.refreshSessions(showErrors: false) }
         .onAppear { AppLog.info("HomeView appeared jobs=\(model.jobs.count)") }
         .sheet(isPresented: $showAddAgent) {
             AddAgentSheet(model: model, isPresented: $showAddAgent)
@@ -119,6 +141,10 @@ struct HomeView: View {
         } message: {
             Text(model.errorBanner ?? "")
         }
+    }
+
+    private static func rateLabel(_ rate: Double) -> String {
+        rate == 1.0 ? "1x" : String(format: "%.2fx", rate)
     }
 }
 

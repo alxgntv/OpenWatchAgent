@@ -12,7 +12,7 @@ final class SpeechPlaybackService: NSObject {
 
     /// Speaks the reply to completion in the requested language. Utterances are queued (not interrupted), so playback
     /// always finishes the full text. Falls back to the system default voice if the language is unavailable on the Watch.
-    func speak(_ text: String, language: String) {
+    func speak(_ text: String, language: String, rateMultiplier: Double) {
         guard !text.isEmpty else { return }
         do {
             let session = AVAudioSession.sharedInstance()
@@ -28,8 +28,9 @@ final class SpeechPlaybackService: NSObject {
         }
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(language: language) ?? AVSpeechSynthesisVoice(language: "en-US")
-        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
-        AppLog.info("Watch TTS speaking length=\(text.count) language=\(language)")
+        let resolvedRate = min(AVSpeechUtteranceMaximumSpeechRate, max(AVSpeechUtteranceMinimumSpeechRate, AVSpeechUtteranceDefaultSpeechRate * Float(rateMultiplier)))
+        utterance.rate = resolvedRate
+        AppLog.info("Watch TTS speaking length=\(text.count) language=\(language) rateMultiplier=\(rateMultiplier) resolvedRate=\(resolvedRate)")
         synthesizer.speak(utterance)
     }
 

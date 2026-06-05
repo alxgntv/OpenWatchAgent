@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import SwiftUI
+import WatchKit
 
 /// One conversation on the Watch. Each session has its own gateway sessionKey and its own message history.
 /// Swiping to the trailing empty session starts a brand-new conversation.
@@ -57,6 +58,10 @@ final class WatchAppModel: ObservableObject {
     @Published var globalTtsEnabled: Bool = true
     /// BCP-47 language used to speak replies, mirrored from the iPhone app.
     @Published var globalTtsLanguage: String = "en-US"
+    /// Speech rate multiplier used to speak replies, mirrored from the iPhone app.
+    @Published var globalTtsRate: Double = 1.0
+    /// Haptic feedback played when Watch recording starts/stops, mirrored from the iPhone app.
+    @Published var hapticType: WatchHapticType = .start
     /// Real gateway sessions (with recent history) mirrored from the iPhone — shown as horizontal pages.
     @Published var gatewaySessions: [WatchGatewaySession] = []
     /// Aggregate usage mirrored from the iPhone — shown on the Usage page.
@@ -197,6 +202,8 @@ final class WatchAppModel: ObservableObject {
         }
         applyGlobalTts(envelope.ttsEnabled)
         applyTtsLanguage(envelope.ttsLanguage)
+        applyHapticType(envelope.hapticType)
+        applyTtsRate(envelope.ttsRate)
     }
 
     var isRecording: Bool { recorder.isRecording }
@@ -289,15 +296,26 @@ final class WatchAppModel: ObservableObject {
         return agent.id == "main" ? "🎯" : "🤖"
     }
 
-    private func newSessionKey() -> String {
+    private func newSessionKey(for agentId: String? = nil) -> String {
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        return "agent:\(selectedAgentId):\(token)"
+        return "agent:\(agentId ?? selectedAgentId):\(token)"
     }
 
-    /// User picked an agent on the Watch — sync selection to the iPhone (which filters sessions and re-pushes).
+    // ─── Ariadne's Thread [AT-0004] ─────────────────────
+    // What: Start a fresh Watch live session whenever an agent is selected.
+    // Why:  The Agents page is an explicit "new conversation with this agent" entry point; the extra
+    //       swipe-up new-session page should appear only after the current session has sent a turn.
+    // Date: 2026-06-05
+    // Related: WatchAppModel.finishRecordingAndSend, WatchAppModel.ensureTopNewSessionPageAfterSend
+    // ─────────────────────────────────────────────────────
+    /// User picked an agent on the Watch — open a fresh live session for that agent and sync selection to the iPhone.
     func selectAgent(_ agentId: String) {
         selectedAgentId = agentId
-        AppLog.info("Watch selectAgent id=\(agentId); sending to iPhone")
+        sessions = [WatchSession(sessionKey: newSessionKey(for: agentId))]
+        currentIndex = 0
+        horizontalIndex = 2
+        statusHint = nil
+        AppLog.info("Watch selectAgent id=\(agentId); started fresh live session key=\(sessions[0].sessionKey); sending to iPhone")
         bridge.sendCommand(WatchEnvelope(kind: .selectAgent, text: agentId))
     }
 
@@ -391,6 +409,48 @@ final class WatchAppModel: ObservableObject {
         AppLog.info("Watch TTS language set to \(language) by iPhone")
     }
 
+    // ─── Ariadne's Thread [AT-0009] ─────────────────────
+    // What: Apply iPhone-controlled Watch haptic and speech-rate preferences.
+    // Why:  Record-button feedback and spoken reply speed are global voice settings owned by the iPhone app.
+    // Date: 2026-06-05
+    // Related: [AT-0007] WatchEnvelope haptic/rate fields, [AT-0008] AppModel voice settings
+    // ─────────────────────────────────────────────────────
+    private func applyTtsRate(_ rate: Double?) {
+        guard let rate, rate > 0, rate != globalTtsRate else { return }
+        globalTtsRate = rate
+        AppLog.info("Watch TTS rate set to \(rate) by iPhone")
+    }
+
+    private func applyHapticType(_ raw: String?) {
+        guard let raw, let parsed = WatchHapticType(rawValue: raw), parsed != hapticType else { return }
+        hapticType = parsed
+        AppLog.info("Watch record haptic set to \(parsed.rawValue) by iPhone")
+    }
+
+    func playRecordHaptic() {
+        guard let wkType = Self.wkHaptic(for: hapticType) else {
+            AppLog.info("Watch record haptic skipped (off)")
+            return
+        }
+        WKInterfaceDevice.current().play(wkType)
+        AppLog.info("Watch played record haptic=\(hapticType.rawValue)")
+    }
+
+    private static func wkHaptic(for type: WatchHapticType) -> WKHapticType? {
+        switch type {
+        case .off: return nil
+        case .notification: return .notification
+        case .directionUp: return .directionUp
+        case .directionDown: return .directionDown
+        case .success: return .success
+        case .failure: return .failure
+        case .retry: return .retry
+        case .start: return .start
+        case .stop: return .stop
+        case .click: return .click
+        }
+    }
+
     /// Per-session mute toggle. Muting a session that is currently speaking stops it immediately.
     func toggleMute(sessionId: UUID) {
         guard let si = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
@@ -432,7 +492,7 @@ final class WatchAppModel: ObservableObject {
         }
         do {
             try recorder.startRecording()
-            promoteCurrentEmptyIfNeeded()
+            playRecordHaptic()
             recordingSessionId = sessions.indices.contains(currentIndex) ? sessions[currentIndex].id : nil
             statusHint = nil
             objectWillChange.send()
@@ -443,15 +503,23 @@ final class WatchAppModel: ObservableObject {
         }
     }
 
-    /// When recording starts on the top empty "new session" page, turn it into the current session pinned at the bottom
-    /// and put a fresh empty page back on top, so the newest conversation is always lowest and swiping up starts a new one.
-    private func promoteCurrentEmptyIfNeeded() {
-        guard currentIndex == 0, sessions.indices.contains(0), sessions[0].isEmpty else { return }
-        let promoted = sessions.remove(at: 0)
-        sessions.append(promoted)
+    /// Adds the swipe-up "new session" page only after a real turn has been sent from the current session.
+    private func ensureTopNewSessionPageAfterSend(currentSessionId: UUID) {
+        guard let sentIndex = sessions.firstIndex(where: { $0.id == currentSessionId }) else {
+            AppLog.error("Watch ensureTopNewSessionPageAfterSend failed: sent session missing id=\(currentSessionId)")
+            return
+        }
+        guard !sessions[sentIndex].isEmpty else {
+            AppLog.info("Watch skipped new-session page: sent session still empty id=\(currentSessionId)")
+            return
+        }
+        if sessions.indices.contains(0), sessions[0].isEmpty {
+            AppLog.info("Watch new-session page already available; sentIndex=\(sentIndex) sessions=\(sessions.count)")
+            return
+        }
         sessions.insert(WatchSession(sessionKey: newSessionKey()), at: 0)
-        currentIndex = sessions.count - 1
-        AppLog.info("Watch promoted new session to bottom; sessions count=\(sessions.count) currentIndex=\(currentIndex)")
+        currentIndex = sentIndex + 1
+        AppLog.info("Watch added swipe-up new-session page after send; currentIndex=\(currentIndex) sessions=\(sessions.count)")
     }
 
     private func finishRecordingAndSend() async {
@@ -462,6 +530,7 @@ final class WatchAppModel: ObservableObject {
             objectWillChange.send()
             return
         }
+        playRecordHaptic()
         objectWillChange.send()
 
         guard let sid = recordingSessionId, let si = sessions.firstIndex(where: { $0.id == sid }) else {
@@ -482,6 +551,7 @@ final class WatchAppModel: ObservableObject {
         pendingJobIds.insert(job.id)
         jobSession[job.id] = session.id
         sessions[si].jobs.insert(job, at: 0)
+        ensureTopNewSessionPageAfterSend(currentSessionId: session.id)
 
         bridge.sendAudio(fileURL: url, jobId: job.id, sessionKey: session.sessionKey)
         statusHint = nil
@@ -570,6 +640,7 @@ final class WatchAppModel: ObservableObject {
         }
         do {
             try recorder.startRecording()
+            playRecordHaptic()
             gatewayRecordingKey = sessionKey
             recordingSessionId = nil
             statusHint = nil
@@ -589,6 +660,7 @@ final class WatchAppModel: ObservableObject {
             AppLog.error("Watch gateway finishRecording: no file")
             return
         }
+        playRecordHaptic()
         objectWillChange.send()
 
         guard let key = gatewayRecordingKey else {
@@ -680,6 +752,6 @@ final class WatchAppModel: ObservableObject {
             AppLog.info("Watch TTS skipped jobId=\(job.id) globalEnabled=\(globalTtsEnabled) muted=\(muted)")
             return
         }
-        SpeechPlaybackService.shared.speak(text, language: globalTtsLanguage)
+        SpeechPlaybackService.shared.speak(text, language: globalTtsLanguage, rateMultiplier: globalTtsRate)
     }
 }
