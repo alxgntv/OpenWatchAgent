@@ -93,6 +93,8 @@ final class AppModel: ObservableObject {
     private var watchEnrichTask: Task<Void, Never>?
     /// How many recent messages per session we mirror onto the Watch.
     private let watchHistoryLimit = 20
+    /// Already enriched sessions keyed by sessionKey. Used to avoid refetching/resending the same session messages.
+    private var watchEnrichedSessionCache: [String: WatchGatewaySession] = [:]
 
     private init() {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
@@ -358,7 +360,7 @@ final class AppModel: ObservableObject {
         )
     }
 
-    private func republishCachedUsageToWatch() {
+    private func republishCachedUsageToWatch(force: Bool = false) {
         guard let cached = watchUsage else { return }
         let updated = WatchUsage(
             sessionCount: cached.sessionCount,
@@ -371,15 +373,70 @@ final class AppModel: ObservableObject {
             agentCount: configuredAgentCount
         )
         watchUsage = updated
-        watchBridge.publishUsage(updated)
-        AppLog.info("Republished usage to Watch agents=\(updated.agentCount) sessions=\(updated.sessionCount)")
+        watchBridge.publishUsage(updated, force: force)
+        AppLog.info("Republished usage to Watch agents=\(updated.agentCount) sessions=\(updated.sessionCount) force=\(force)")
+    }
+
+    private func bareWatchGatewaySession(from row: GatewaySessionRow) -> WatchGatewaySession {
+        WatchGatewaySession(id: row.id, title: row.title, preview: row.preview, updatedAt: row.updatedAt, messages: [])
+    }
+
+    private func cachedEnrichedWatchSession(for row: GatewaySessionRow) -> WatchGatewaySession? {
+        guard let cached = watchEnrichedSessionCache[row.id],
+              cached.title == row.title,
+              cached.preview == row.preview,
+              cached.updatedAt == row.updatedAt,
+              !cached.messages.isEmpty else {
+            return nil
+        }
+        return cached
+    }
+
+    // ─── Ariadne's Thread [AT-0029] ─────────────────────
+    // What: Push only missing or changed sessions and session messages to Watch.
+    // Why:  Session/message data can be large; once Watch has a snapshot, repeat refreshes should not resend it.
+    // Date: 2026-06-06
+    // Related: [AT-0028] app→WatchConnectivityPhoneService queueSnapshotToWatch, app→WatchAppModel mergeGatewaySessionDelta
+    // ─────────────────────────────────────────────────────
+    private func mergeAndPublishWatchGatewaySessions(_ incoming: [WatchGatewaySession], replaceIfEmpty: Bool) {
+        guard !incoming.isEmpty || replaceIfEmpty else {
+            AppLog.info("Watch gateway sessions publish skipped: empty delta")
+            return
+        }
+        let previous = Dictionary(uniqueKeysWithValues: watchGatewaySessions.map { ($0.id, $0) })
+        var mergedById = previous
+        for session in incoming {
+            mergedById[session.id] = session
+            if !session.messages.isEmpty {
+                watchEnrichedSessionCache[session.id] = session
+            }
+        }
+        let ordered = gatewaySessions.map { row in
+            mergedById[row.id] ?? cachedEnrichedWatchSession(for: row) ?? bareWatchGatewaySession(from: row)
+        }
+        let shouldReplace = replaceIfEmpty && watchGatewaySessions.isEmpty
+        let delta = shouldReplace ? ordered : ordered.filter { previous[$0.id] != $0 }
+        watchGatewaySessions = ordered
+        guard !delta.isEmpty || shouldReplace else {
+            AppLog.info("Watch gateway sessions publish skipped: no changed or missing sessions")
+            return
+        }
+        watchBridge.publishGatewaySessions(delta, replace: shouldReplace)
+        AppLog.info("Watch gateway sessions published delta=\(delta.count) total=\(ordered.count) replace=\(shouldReplace)")
     }
 
     /// Pushes the bare session list (no messages yet) to the Watch so pages render immediately.
     private func pushSessionListToWatch(rows: [GatewaySessionRow]) {
-        let list = rows.map { WatchGatewaySession(id: $0.id, title: $0.title, preview: $0.preview, updatedAt: $0.updatedAt, messages: []) }
-        watchGatewaySessions = list
-        watchBridge.publishGatewaySessions(list)
+        let list = rows.map { row in
+            cachedEnrichedWatchSession(for: row) ?? bareWatchGatewaySession(from: row)
+        }
+        if rows.isEmpty {
+            watchGatewaySessions = []
+            watchBridge.publishGatewaySessions([], replace: true, force: true)
+            AppLog.info("Pushed empty gateway session list to Watch")
+            return
+        }
+        mergeAndPublishWatchGatewaySessions(list, replaceIfEmpty: true)
     }
 
     /// Fetches recent history for each gateway session and re-pushes the enriched list to the Watch.
@@ -391,6 +448,10 @@ final class AppModel: ObservableObject {
             var built: [WatchGatewaySession] = []
             for row in rows {
                 if Task.isCancelled { return }
+                if await MainActor.run(body: { self.cachedEnrichedWatchSession(for: row) != nil }) {
+                    AppLog.info("Watch enrich skipped cached sessionKey=\(row.id)")
+                    continue
+                }
                 var recent: [WatchHistoryMessage] = []
                 do {
                     let messages = try await self.jobClient.fetchHistory(sessionKey: row.id)
@@ -404,9 +465,8 @@ final class AppModel: ObservableObject {
             }
             if Task.isCancelled { return }
             await MainActor.run {
-                self.watchGatewaySessions = built
-                self.watchBridge.publishGatewaySessions(built)
-                AppLog.info("Pushed \(built.count) gateway sessions with recent history to Watch")
+                self.mergeAndPublishWatchGatewaySessions(built, replaceIfEmpty: false)
+                AppLog.info("Pushed \(built.count) changed gateway sessions with recent history to Watch")
             }
         }
     }
@@ -488,10 +548,14 @@ final class AppModel: ObservableObject {
         gatewayAgents = []
         watchEnrichTask?.cancel()
         watchGatewaySessions = []
+        watchEnrichedSessionCache = [:]
         watchUsage = nil
         watchAgentsPayload = []
         activeJobId = nil
-        watchBridge.publishGatewaySessions([])
+        watchBridge.resetSessionMessageAgentUsageDeliveryCache()
+        watchBridge.publishGatewaySessions([], replace: true, force: true)
+        watchBridge.publishUsage(WatchUsage(sessionCount: 0, totalTokens: 0, inputTokens: 0, outputTokens: 0, totalMessages: 0, lastActivityAt: nil, model: nil, agentCount: 0), force: true)
+        watchBridge.publishAgents([], selectedAgentId: "main", force: true)
         Task { await jobClient.closeReadSocket() }
         syncWatch(revokeGatewayPairing: true)
     }
@@ -541,10 +605,21 @@ final class AppModel: ObservableObject {
             syncWatch()
             // Mirror gateway sessions + usage too: re-push the cached values if we have them, otherwise fetch now.
             if !watchGatewaySessions.isEmpty {
-                watchBridge.publishGatewaySessions(watchGatewaySessions)
-                republishCachedUsageToWatch()
+                // ─── Ariadne's Thread [AT-0031] ─────────────────────
+                // What: Force resend sessions, messages, agents, and usage on explicit Watch sync.
+                // Why:  The iPhone delivery cache only knows what it attempted to send; Watch may have missed it while unreachable.
+                // Date: 2026-06-06
+                // Related: [AT-0029] app→AppModel mergeAndPublishWatchGatewaySessions, [AT-0028] app→WatchConnectivityPhoneService queueSnapshotToWatch
+                // ─────────────────────────────────────────────────────
+                watchBridge.resetSessionMessageAgentUsageDeliveryCache()
+                watchBridge.publishGatewaySessions(watchGatewaySessions, replace: true, force: true)
+                republishCachedUsageToWatch(force: true)
                 if !watchAgentsPayload.isEmpty {
-                    watchBridge.publishAgents(watchAgentsPayload, selectedAgentId: selectedAgentId)
+                    watchBridge.publishAgents(watchAgentsPayload, selectedAgentId: selectedAgentId, force: true)
+                }
+                if watchUsage == nil || watchAgentsPayload.isEmpty {
+                    AppLog.info("Watch sync missing agents/usage cache; refreshing gateway metadata usagePresent=\(watchUsage != nil) agents=\(watchAgentsPayload.count)")
+                    Task { await refreshSessions(showErrors: false) }
                 }
             } else if isPaired {
                 Task { await refreshSessions() }

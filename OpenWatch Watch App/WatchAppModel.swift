@@ -203,11 +203,39 @@ final class WatchAppModel: ObservableObject {
         }
         if revoke {
             AppLog.info("Watch received explicit gateway pairing revoke")
+            clearSessionMessageAgentUsageDataAfterPairingRevoke()
         }
         applyGlobalTts(envelope.ttsEnabled)
         applyTtsLanguage(envelope.ttsLanguage)
         applyHapticType(envelope.hapticType)
         applyTtsRate(envelope.ttsRate)
+    }
+
+    // ─── Ariadne's Thread [AT-0030] ─────────────────────
+    // What: Clear mirrored sessions, messages, agents, and usage when iPhone revokes pairing.
+    // Why:  After devices are unpaired, Watch must not keep stale sessions, messages, usage, agents, jobs, or local caches.
+    // Date: 2026-06-06
+    // Related: app→AppModel disconnect, [AT-0029] app→AppModel mergeAndPublishWatchGatewaySessions
+    // ─────────────────────────────────────────────────────
+    private func clearSessionMessageAgentUsageDataAfterPairingRevoke() {
+        gatewaySessions = []
+        gatewayJobs = [:]
+        gatewayMutedKeys = []
+        usage = nil
+        gatewayAgents = []
+        selectedAgentId = "main"
+        sessions = [WatchSession(sessionKey: "agent:main:main")]
+        currentIndex = 0
+        horizontalIndex = 2
+        pendingJobIds = []
+        jobSession = [:]
+        spokenJobIds = []
+        recordingSessionId = nil
+        jobGatewayKey = [:]
+        gatewayRecordingKey = nil
+        recordingJobId = nil
+        statusHint = nil
+        AppLog.info("Watch cleared sessions/messages/agents/usage after pairing revoke")
     }
 
     var isRecording: Bool { recorder.isRecording }
@@ -323,6 +351,21 @@ final class WatchAppModel: ObservableObject {
         bridge.sendCommand(WatchEnvelope(kind: .selectAgent, text: agentId))
     }
 
+    private func mergeGatewaySessionDelta(_ incoming: [WatchGatewaySession]) {
+        guard !incoming.isEmpty else { return }
+        var byId = Dictionary(uniqueKeysWithValues: gatewaySessions.map { ($0.id, $0) })
+        for session in incoming {
+            byId[session.id] = session
+        }
+        var merged = gatewaySessions.compactMap { byId[$0.id] }
+        let existingIds = Set(merged.map(\.id))
+        merged.append(contentsOf: incoming.filter { !existingIds.contains($0.id) })
+        merged.sort {
+            ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast)
+        }
+        gatewaySessions = merged
+    }
+
     func applyEnvelope(_ data: Data) {
         guard let envelope = try? JSONDecoder().decode(WatchEnvelope.self, from: data) else {
             AppLog.error("Watch failed to decode envelope")
@@ -353,8 +396,13 @@ final class WatchAppModel: ObservableObject {
             handleRemoteStartListening()
         case .gatewaySessions:
             if let sessions = envelope.gatewaySessions {
-                gatewaySessions = sessions
-                AppLog.info("Watch received \(sessions.count) gateway sessions from iPhone")
+                if envelope.replaceGatewaySessions == false {
+                    mergeGatewaySessionDelta(sessions)
+                    AppLog.info("Watch merged \(sessions.count) gateway session delta items from iPhone")
+                } else {
+                    gatewaySessions = sessions
+                    AppLog.info("Watch replaced gateway sessions count=\(sessions.count) from iPhone")
+                }
             }
         case .usage:
             if let usage = envelope.usage {

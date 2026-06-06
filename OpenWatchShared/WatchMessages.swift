@@ -169,6 +169,8 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
     public let ttsRate: Double?
     /// Real gateway session index (with recent history) for the Watch's horizontal pages. nil means "unchanged / unknown".
     public let gatewaySessions: [WatchGatewaySession]?
+    /// true/nil = replace Watch gateway sessions; false = merge only changed/missing sessions.
+    public let replaceGatewaySessions: Bool?
     /// Aggregate usage for the Watch's Usage page. nil means "unchanged / unknown".
     public let usage: WatchUsage?
     /// Configured agents for the Watch's Agents page. nil means "unchanged / unknown".
@@ -190,6 +192,7 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         hapticType: String? = nil,
         ttsRate: Double? = nil,
         gatewaySessions: [WatchGatewaySession]? = nil,
+        replaceGatewaySessions: Bool? = nil,
         usage: WatchUsage? = nil,
         gatewayAgents: [WatchGatewayAgent]? = nil,
         selectedAgentId: String? = nil,
@@ -206,6 +209,7 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         self.hapticType = hapticType
         self.ttsRate = ttsRate
         self.gatewaySessions = gatewaySessions
+        self.replaceGatewaySessions = replaceGatewaySessions
         self.usage = usage
         self.gatewayAgents = gatewayAgents
         self.selectedAgentId = selectedAgentId

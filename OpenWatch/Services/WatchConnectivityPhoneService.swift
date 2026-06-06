@@ -20,6 +20,10 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
     private var cachedTtsLanguageForWatch: String?
     private var cachedHapticTypeForWatch: String?
     private var cachedTtsRateForWatch: Double?
+    private var deliveredGatewaySessionSnapshots: [String: WatchGatewaySession] = [:]
+    private var deliveredUsageSnapshot: WatchUsage?
+    private var deliveredAgentsSnapshot: [WatchGatewayAgent] = []
+    private var deliveredSelectedAgentId: String?
 
     /// True only when the Watch app is currently reachable (its app is active/foreground). The iPhone cannot launch
     /// the Watch app itself — watchOS provides no such API — so commands only take effect while this is true.
@@ -102,27 +106,82 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
     }
 
     /// Pushes the real gateway session index (with recent history) so the Watch can show horizontal session pages.
-    func publishGatewaySessions(_ sessions: [WatchGatewaySession]) {
+    func publishGatewaySessions(_ sessions: [WatchGatewaySession], replace: Bool = true, force: Bool = false) {
         guard session.activationState == .activated else { return }
-        let envelope = WatchEnvelope(kind: .gatewaySessions, gatewaySessions: sessions)
+        let sessionsToSend: [WatchGatewaySession]
+        if replace {
+            sessionsToSend = sessions
+        } else {
+            sessionsToSend = sessions.filter { deliveredGatewaySessionSnapshots[$0.id] != $0 }
+        }
+        guard force || replace || !sessionsToSend.isEmpty else {
+            AppLog.info("Skipped Watch gatewaySessions snapshot: no changed or missing sessions")
+            return
+        }
+        let envelope = WatchEnvelope(kind: .gatewaySessions, gatewaySessions: sessionsToSend, replaceGatewaySessions: replace)
         pushToWatch(envelope, preferImmediate: true)
-        AppLog.info("Pushed \(sessions.count) gateway sessions to Watch")
+        queueSnapshotToWatch(envelope, label: "gatewaySessions")
+        if replace {
+            deliveredGatewaySessionSnapshots = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
+        } else {
+            for item in sessionsToSend {
+                deliveredGatewaySessionSnapshots[item.id] = item
+            }
+        }
+        AppLog.info("Pushed \(sessionsToSend.count) gateway sessions to Watch replace=\(replace) sourceCount=\(sessions.count)")
     }
 
     /// Pushes aggregate usage (session count, tokens, model) to the Watch's Usage page.
-    func publishUsage(_ usage: WatchUsage) {
+    func publishUsage(_ usage: WatchUsage, force: Bool = false) {
         guard session.activationState == .activated else { return }
+        guard force || deliveredUsageSnapshot != usage else {
+            AppLog.info("Skipped Watch usage snapshot: unchanged")
+            return
+        }
         let envelope = WatchEnvelope(kind: .usage, usage: usage)
         pushToWatch(envelope, preferImmediate: true)
+        queueSnapshotToWatch(envelope, label: "usage")
+        deliveredUsageSnapshot = usage
         AppLog.info("Pushed usage to Watch agents=\(usage.agentCount) sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens)")
     }
 
     /// Pushes configured gateway agents and the active selection to the Watch's Agents page.
-    func publishAgents(_ agents: [WatchGatewayAgent], selectedAgentId: String) {
+    func publishAgents(_ agents: [WatchGatewayAgent], selectedAgentId: String, force: Bool = false) {
         guard session.activationState == .activated else { return }
+        guard force || deliveredAgentsSnapshot != agents || deliveredSelectedAgentId != selectedAgentId else {
+            AppLog.info("Skipped Watch agents snapshot: unchanged")
+            return
+        }
         let envelope = WatchEnvelope(kind: .agents, gatewayAgents: agents, selectedAgentId: selectedAgentId)
         pushToWatch(envelope, preferImmediate: true)
+        queueSnapshotToWatch(envelope, label: "agents")
+        deliveredAgentsSnapshot = agents
+        deliveredSelectedAgentId = selectedAgentId
         AppLog.info("Pushed \(agents.count) agents to Watch selectedAgentId=\(selectedAgentId)")
+    }
+
+    func resetSessionMessageAgentUsageDeliveryCache() {
+        deliveredGatewaySessionSnapshots = [:]
+        deliveredUsageSnapshot = nil
+        deliveredAgentsSnapshot = []
+        deliveredSelectedAgentId = nil
+        AppLog.info("Reset Watch sessions/messages/agents/usage delivery cache")
+    }
+
+    // ─── Ariadne's Thread [AT-0028] ─────────────────────
+    // What: Persist sessions, messages, agents, and usage Watch snapshots through transferUserInfo.
+    // Why:  applicationContext keeps only the latest envelope, so sessions/usage/agents can be overwritten before Watch wakes.
+    // Date: 2026-06-06
+    // Related: [AT-0001] app→WatchConnectivityPhoneService enrichWatchEnvelope, app→WatchAppModel applyEnvelope
+    // ─────────────────────────────────────────────────────
+    private func queueSnapshotToWatch(_ envelope: WatchEnvelope, label: String) {
+        let enriched = enrichWatchEnvelope(envelope)
+        guard let userInfo = WatchConnectivityCodec.userInfo(from: enriched) else {
+            AppLog.error("Failed to encode Watch \(label) snapshot for transferUserInfo")
+            return
+        }
+        session.transferUserInfo(userInfo)
+        AppLog.info("Queued Watch \(label) snapshot via transferUserInfo kind=\(enriched.kind.rawValue)")
     }
 
     /// iPhone → Watch command (e.g. remote-start a recording). Delivered immediately when the Watch app is reachable,
@@ -174,6 +233,7 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
             hapticType: envelope.hapticType ?? cachedHapticTypeForWatch,
             ttsRate: envelope.ttsRate ?? cachedTtsRateForWatch,
             gatewaySessions: envelope.gatewaySessions,
+            replaceGatewaySessions: envelope.replaceGatewaySessions,
             usage: envelope.usage,
             gatewayAgents: envelope.gatewayAgents,
             selectedAgentId: envelope.selectedAgentId,
