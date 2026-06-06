@@ -299,7 +299,7 @@ final class AppModel: ObservableObject {
     // Why:  Reopening the iPhone app during Watch "Working…" starts sessions.list/chat.history refreshes;
     //       those can time out independently of the active chat.send socket and should not look like the job failed.
     // Date: 2026-06-05
-    // Related: AppModel.refreshSessions, GatewayJobClient.readRPC, AppModel.processWatchAudioTurn
+    // Related: AppModel.refreshSessions, GatewayJobClient.readRPC
     // ─────────────────────────────────────────────────────
     private func handleRefreshSessionsError(_ error: Error, showErrors: Bool) {
         let message = error.localizedDescription
@@ -554,135 +554,60 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Tail of the serial Watch-audio queue. Every incoming Watch recording chains onto this task so turns are
-    /// transcribed + run through the gateway strictly one-at-a-time, in arrival order. Without this, launching several
-    /// recordings before the first finished opened several gateway sockets at once and they all hung on "Sending…".
-    private var watchAudioQueueTail: Task<Void, Never>?
-    /// Number of Watch-audio turns currently queued or running. Used only for logging the queue depth.
-    private var watchAudioQueueDepth = 0
-
-    /// Receives a voice recording captured on the Watch and ENQUEUES it. The job is immediately shown as "Queued…" on
-    /// the Watch, then processed in strict arrival order by `processWatchAudioTurn`. Returning fast keeps the
-    /// WatchConnectivity file-receive handler snappy and lets the user fire several recordings back-to-back.
-    func handleWatchAudio(jobId: UUID, fileURL: URL, sessionKey: String) async {
+    // ─── Ariadne's Thread [AT-0025] ─────────────────────
+    // What: Forward a Watch-recorded audio file to OpenClaw as a chat.send attachment.
+    // Why:  OpenClaw tools.media.audio performs the boxed batch transcription; the iPhone does not run STT.
+    // Date: 2026-06-06
+    // Related: app→WatchConnectivityPhoneService didReceive file, app→GatewayJobClient runAudioAttachment
+    // ─────────────────────────────────────────────────────
+    func handleWatchAudioFile(fileURL: URL, jobId: UUID, sessionKey: String, fileName: String, mimeType: String) async {
         guard isPaired else {
-            errorBanner = "Pair on iPhone before using the watch."
-            AppLog.error("handleWatchAudio blocked: not paired jobId=\(jobId)")
+            AppLog.error("Watch audio file blocked: not paired jobId=\(jobId)")
             try? FileManager.default.removeItem(at: fileURL)
             return
         }
+        defer { try? FileManager.default.removeItem(at: fileURL) }
 
-        // Register/refresh the job up front so the Watch shows it is accepted and waiting, never a silent void.
-        let isFirstInLine = watchAudioQueueDepth == 0
+        let job = VoiceJob(id: jobId, status: .sending, statusDetail: "Transcribing…")
         if let existing = jobs.firstIndex(where: { $0.id == jobId }) {
-            jobs[existing].status = .sending
-            jobs[existing].statusDetail = isFirstInLine ? "Transcribing…" : "Queued — waiting…"
-            syncWatch(job: jobs[existing])
+            jobs[existing] = job
         } else {
-            let job = VoiceJob(
-                id: jobId,
-                status: .sending,
-                statusDetail: isFirstInLine ? "Transcribing…" : "Queued — waiting…"
-            )
             jobs.insert(job, at: 0)
-            syncWatch(job: job)
         }
-
-        watchAudioQueueDepth += 1
-        AppLog.info("handleWatchAudio enqueued jobId=\(jobId) sessionKey=\(sessionKey) queueDepth=\(watchAudioQueueDepth) firstInLine=\(isFirstInLine)")
-
-        // Keep the iPhone alive for the WHOLE queue, not per-turn. A per-turn begin/end left a gap between turns where
-        // iOS could suspend the app and drop the next gateway socket (surfacing as "agent did not respond"). We begin
-        // once when the queue starts (depth goes 0 -> 1) and end only when the queue fully drains, so the long run of
-        // back-to-back turns stays continuously alive while backgrounded.
-        if isFirstInLine {
-            BackgroundAudioKeepAlive.begin(reason: "watchAudioQueue")
-        }
-
-        // Chain onto the existing tail so processing is serialized in arrival order.
-        let previous = watchAudioQueueTail
-        watchAudioQueueTail = Task { [weak self] in
-            await previous?.value
-            guard let self else {
-                try? FileManager.default.removeItem(at: fileURL)
-                return
-            }
-            await self.processWatchAudioTurn(jobId: jobId, fileURL: fileURL, sessionKey: sessionKey)
-            await MainActor.run {
-                self.watchAudioQueueDepth -= 1
-                if self.watchAudioQueueDepth == 0 {
-                    BackgroundAudioKeepAlive.end(reason: "watchAudioQueue")
-                    AppLog.info("Watch audio queue fully drained; released background keep-alive")
-                }
-            }
-        }
-    }
-
-    /// Runs ONE queued Watch turn end-to-end: transcribe the file, run it through the gateway session, publish results.
-    /// The whole queue is kept alive in the background by handleWatchAudio (begin on first enqueue, end on drain), so
-    /// this method only owns the temp-file cleanup. Failures are isolated: a failed turn never blocks the next one.
-    private func processWatchAudioTurn(jobId: UUID, fileURL: URL, sessionKey: String) async {
-        defer {
-            try? FileManager.default.removeItem(at: fileURL)
-        }
-
-        guard isPaired else {
-            if let failIndex = jobs.firstIndex(where: { $0.id == jobId }) {
-                jobs[failIndex].status = .failed
-                jobs[failIndex].errorMessage = "Pair on iPhone before using the watch."
-                jobs[failIndex].statusDetail = nil
-                jobs[failIndex].completedAt = Date()
-                syncWatch(job: jobs[failIndex])
-            }
-            AppLog.error("processWatchAudioTurn blocked: not paired jobId=\(jobId)")
-            return
-        }
-
-        guard let index = jobs.firstIndex(where: { $0.id == jobId }) else {
-            AppLog.error("processWatchAudioTurn: job vanished before processing jobId=\(jobId)")
-            return
-        }
-        jobs[index].status = .sending
-        jobs[index].statusDetail = "Transcribing…"
         activeJobId = jobId
-        AppLog.info("processWatchAudioTurn transcribing jobId=\(jobId) sessionKey=\(sessionKey)")
-        syncWatch(job: jobs[index])
+        syncWatch(job: job)
+        BackgroundAudioKeepAlive.begin(reason: "watchAudioFile")
+        defer { BackgroundAudioKeepAlive.end(reason: "watchAudioFile") }
 
         do {
-            let transcript = try await speech.transcribeFile(at: fileURL, localeIdentifier: voiceLanguage)
-            guard !transcript.isEmpty else {
-                throw NSError(domain: "OpenWatch", code: 4, userInfo: [NSLocalizedDescriptionKey: "No speech detected."])
-            }
-            guard let runningIndex = jobs.firstIndex(where: { $0.id == jobId }) else { return }
-            jobs[runningIndex].transcript = transcript
-            jobs[runningIndex].status = .running
-            jobs[runningIndex].statusDetail = "Working…"
-            AppLog.info("processWatchAudioTurn transcript ready jobId=\(jobId) length=\(transcript.count)")
-            syncWatch(job: jobs[runningIndex])
-
-            let reply = try await jobClient.runCommand(
-                transcript: transcript,
+            let audioData = try Data(contentsOf: fileURL)
+            AppLog.info("Watch audio file forwarding to OpenClaw jobId=\(jobId) sessionKey=\(sessionKey) bytes=\(audioData.count) fileName=\(fileName) mimeType=\(mimeType)")
+            let reply = try await jobClient.runAudioAttachment(
+                audioData: audioData,
+                fileName: fileName,
+                mimeType: mimeType,
                 sessionKey: sessionKey,
+                idempotencyKey: jobId.uuidString,
                 onProgress: makeProgressHandler(jobId: jobId)
             )
-            guard let doneIndex = jobs.firstIndex(where: { $0.id == jobId }) else { return }
-            jobs[doneIndex].resultText = reply
-            jobs[doneIndex].status = .done
-            jobs[doneIndex].statusDetail = nil
-            jobs[doneIndex].completedAt = Date()
+            guard let idx = jobs.firstIndex(where: { $0.id == jobId }) else { return }
+            jobs[idx].resultText = reply
+            jobs[idx].status = .done
+            jobs[idx].statusDetail = nil
+            jobs[idx].completedAt = Date()
             if activeJobId == jobId { activeJobId = nil }
-            AppLog.info("processWatchAudioTurn done jobId=\(jobId) replyLength=\(reply.count)")
-            syncWatch(job: jobs[doneIndex])
+            syncWatch(job: jobs[idx])
+            AppLog.info("Watch audio file OpenClaw reply done jobId=\(jobId) replyLength=\(reply.count)")
         } catch {
-            guard let failIndex = jobs.firstIndex(where: { $0.id == jobId }) else { return }
-            jobs[failIndex].status = .failed
-            jobs[failIndex].errorMessage = error.localizedDescription
-            jobs[failIndex].statusDetail = nil
-            jobs[failIndex].completedAt = Date()
+            guard let idx = jobs.firstIndex(where: { $0.id == jobId }) else { return }
+            jobs[idx].status = .failed
+            jobs[idx].errorMessage = error.localizedDescription
+            jobs[idx].statusDetail = nil
+            jobs[idx].completedAt = Date()
             if activeJobId == jobId { activeJobId = nil }
             errorBanner = error.localizedDescription
-            AppLog.error("processWatchAudioTurn failed jobId=\(jobId): \(error.localizedDescription)")
-            syncWatch(job: jobs[failIndex])
+            syncWatch(job: jobs[idx])
+            AppLog.error("Watch audio file OpenClaw reply failed jobId=\(jobId): \(error.localizedDescription)")
         }
     }
 

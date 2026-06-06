@@ -256,31 +256,36 @@ extension WatchConnectivityPhoneService: WCSessionDelegate {
 
     nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
         let metadata = file.metadata ?? [:]
-        let isAudio = (metadata[WatchConnectivityCodec.audioKindKey] as? Bool) ?? false
-        let jobIdString = metadata[WatchConnectivityCodec.audioJobIdKey] as? String
-        let sessionKey = metadata[WatchConnectivityCodec.audioSessionKeyKey] as? String
-
-        // The incoming file is deleted once this method returns, so copy it to our own temp location first (synchronously).
-        let dest = FileManager.default.temporaryDirectory.appendingPathComponent("watch-\(UUID().uuidString).m4a")
-        let copied: Bool
+        let jobIdString = metadata["jobId"] as? String
+        let sessionKey = metadata["sessionKey"] as? String
+        let fileName = (metadata["fileName"] as? String) ?? file.fileURL.lastPathComponent
+        let mimeType = (metadata["mimeType"] as? String) ?? "audio/mp4"
+        let copiedURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("watch-\(UUID().uuidString)-\(fileName)")
         do {
-            try FileManager.default.copyItem(at: file.fileURL, to: dest)
-            copied = true
+            try FileManager.default.copyItem(at: file.fileURL, to: copiedURL)
         } catch {
-            copied = false
-            Task { @MainActor in AppLog.error("Failed to copy received watch audio: \(error.localizedDescription)") }
+            Task { @MainActor in
+                AppLog.error("Failed to copy Watch audio transferFile source=\(file.fileURL.lastPathComponent) target=\(copiedURL.lastPathComponent): \(error.localizedDescription)")
+            }
+            return
         }
-
         Task { @MainActor in
-            guard copied, isAudio, let jobIdString, let jobId = UUID(uuidString: jobIdString) else {
-                AppLog.error("Received file without valid audio metadata; ignoring")
-                try? FileManager.default.removeItem(at: dest)
+            guard let jobIdString, let jobId = UUID(uuidString: jobIdString) else {
+                AppLog.error("Received Watch audio file without valid jobId metadata file=\(file.fileURL.lastPathComponent)")
+                try? FileManager.default.removeItem(at: copiedURL)
                 return
             }
-            let resolvedSessionKey = sessionKey ?? "agent:main:main"
-            AppLog.info("iPhone received watch audio jobId=\(jobId) sessionKey=\(resolvedSessionKey) bytes=\((try? Data(contentsOf: dest))?.count ?? 0)")
-            BackgroundTaskService.begin("watchVoiceAudio")
-            await AppModel.shared.handleWatchAudio(jobId: jobId, fileURL: dest, sessionKey: resolvedSessionKey)
+            let targetSessionKey = (sessionKey?.isEmpty == false) ? sessionKey! : "agent:main:main"
+            AppLog.info("Received Watch audio transferFile jobId=\(jobId) sessionKey=\(targetSessionKey) file=\(fileName) mimeType=\(mimeType)")
+            BackgroundTaskService.begin("watchAudioFile")
+            await AppModel.shared.handleWatchAudioFile(
+                fileURL: copiedURL,
+                jobId: jobId,
+                sessionKey: targetSessionKey,
+                fileName: fileName,
+                mimeType: mimeType
+            )
             BackgroundTaskService.end()
         }
     }

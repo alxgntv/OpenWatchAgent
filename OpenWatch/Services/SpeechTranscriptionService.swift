@@ -10,11 +10,10 @@ final class SpeechTranscriptionService: NSObject, ObservableObject {
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     // ─── Ariadne's Thread [AT-0005] ─────────────────────
-    // What: Remove the hardcoded Russian recognizer locale.
-    // Why:  Voice input can be Russian, English, or another language per session; recognition
-    //       must use the system Speech recognizer instead of forcing every audio file through ru-RU.
+    // What: Use the selected locale for iPhone live speech recognition.
+    // Why:  Voice input can be Russian, English, or another language per session without forcing ru-RU.
     // Date: 2026-06-05
-    // Related: WatchAudioRecorder, AppModel.processWatchAudioTurn
+    // Related: AppModel.stopAndSendFromWatch
     // ─────────────────────────────────────────────────────
     private func speechRecognizer(localeIdentifier: String) throws -> SFSpeechRecognizer {
         guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier)) else {
@@ -151,31 +150,5 @@ final class SpeechTranscriptionService: NSObject, ObservableObject {
         }
         isListening = false
         AppLog.info("Cancelled speech listening")
-    }
-
-    /// Transcribes an audio file recorded on the Apple Watch. The Watch cannot run the Speech framework, so the iPhone does it.
-    func transcribeFile(at url: URL, localeIdentifier: String) async throws -> String {
-        guard await ensurePermissions() else {
-            throw NSError(domain: "OpenWatch", code: 5, userInfo: [NSLocalizedDescriptionKey: "Microphone and speech recognition permissions are required. Grant them once in OpenWatch on iPhone."])
-        }
-        let speechRecognizer = try speechRecognizer(localeIdentifier: localeIdentifier)
-
-        AppLog.info("Transcribing watch audio file=\(url.lastPathComponent) recognizerLocale=\(speechRecognizer.locale.identifier)")
-        let request = SFSpeechURLRecognitionRequest(url: url)
-        request.shouldReportPartialResults = false
-
-        return try await withCheckedThrowingContinuation { continuation in
-            var didResume = false
-            recognitionTask = speechRecognizer.recognitionTask(with: request) { result, error in
-                if let error {
-                    if !didResume { didResume = true; continuation.resume(throwing: error) }
-                    return
-                }
-                guard let result, result.isFinal else { return }
-                let text = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
-                AppLog.info("Watch audio transcription completed length=\(text.count)")
-                if !didResume { didResume = true; continuation.resume(returning: text) }
-            }
-        }
     }
 }

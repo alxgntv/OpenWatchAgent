@@ -128,13 +128,57 @@ actor GatewayJobClient {
         return reply
     }
 
+    // ─── Ariadne's Thread [AT-0027] ─────────────────────
+    // What: Send Watch audio as a chat.send attachment.
+    // Why:  OpenClaw normalizes RPC attachments into inbound media and tools.media.audio transcribes the audio server-side.
+    // Date: 2026-06-06
+    // Related: app→AppModel handleWatchAudioFile, OpenClaw docs→Audio and voice notes
+    // ─────────────────────────────────────────────────────
+    func runAudioAttachment(
+        audioData: Data,
+        fileName: String,
+        mimeType: String,
+        sessionKey: String,
+        idempotencyKey: String,
+        onProgress: @escaping @Sendable (String) -> Void = { _ in }
+    ) async throws -> String {
+        AppLog.info("Submitting Watch audio attachment via chat.send sessionKey=\(sessionKey) bytes=\(audioData.count) fileName=\(fileName) mimeType=\(mimeType)")
+        let task = try await openOperatorSocket()
+        defer {
+            task.cancel(with: .goingAway, reason: nil)
+        }
+
+        try await sendSessionMessagesSubscribe(on: task, sessionKey: sessionKey)
+
+        let chatSendId = UUID().uuidString
+        try await sendChatSend(
+            on: task,
+            chatSendId: chatSendId,
+            sessionKey: sessionKey,
+            message: "",
+            idempotencyKey: idempotencyKey,
+            attachments: [[
+                "type": "audio",
+                "fileName": fileName,
+                "mimeType": mimeType,
+                "content": audioData.base64EncodedString(),
+            ]]
+        )
+        AppLog.info("chat.send audio attachment dispatched sessionKey=\(sessionKey) id=\(chatSendId)")
+        onProgress("Sent audio. Transcribing…")
+
+        let reply = try await waitForReply(on: task, sessionKey: sessionKey, chatSendId: chatSendId, onProgress: onProgress)
+        AppLog.info("chat.send audio attachment reply received length=\(reply.count)")
+        return reply
+    }
+
     private func sendSessionMessagesSubscribe(on task: URLSessionWebSocketTask, sessionKey: String) async throws {
         let frame: [String: Any] = [
             "type": "req",
             "id": UUID().uuidString,
             "method": "sessions.messages.subscribe",
             "params": [
-                "sessionKey": sessionKey,
+                "key": sessionKey,
             ],
         ]
         try await sendJSON(frame, on: task)
@@ -487,18 +531,24 @@ actor GatewayJobClient {
         on task: URLSessionWebSocketTask,
         chatSendId: String,
         sessionKey: String,
-        message: String
+        message: String,
+        idempotencyKey: String = UUID().uuidString,
+        attachments: [[String: Any]] = []
     ) async throws {
+        var params: [String: Any] = [
+            "sessionKey": sessionKey,
+            "message": message,
+            "idempotencyKey": idempotencyKey,
+            "deliver": false,
+        ]
+        if !attachments.isEmpty {
+            params["attachments"] = attachments
+        }
         let chatFrame: [String: Any] = [
             "type": "req",
             "id": chatSendId,
             "method": "chat.send",
-            "params": [
-                "sessionKey": sessionKey,
-                "message": message,
-                "idempotencyKey": UUID().uuidString,
-                "deliver": false,
-            ],
+            "params": params,
         ]
         try await sendJSON(chatFrame, on: task)
     }

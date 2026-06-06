@@ -132,7 +132,7 @@ struct WatchSessionPage: View {
         }
         .buttonStyle(.borderedProminent)
         .tint(isRecordingHere ? .red : .blue)
-        .disabled(session.activeJob != nil)
+        .disabled(session.activeJob != nil && !isRecordingHere)
     }
 
     /// Per-session voice mute — hidden when iPhone has disabled "Speak replies on Watch".
@@ -224,7 +224,7 @@ struct GatewaySessionPage: View {
         }
         .buttonStyle(.borderedProminent)
         .tint(isRecordingHere ? .red : .blue)
-        .disabled(activeJob != nil)
+        .disabled(activeJob != nil && !isRecordingHere)
     }
 
     @ViewBuilder

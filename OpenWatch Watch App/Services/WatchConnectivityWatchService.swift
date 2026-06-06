@@ -44,20 +44,25 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
         }
     }
 
-    /// Transfers a recorded voice file to the iPhone. The iPhone transcribes it and forwards the text to the gateway.
-    /// Uses `transferFile`, which is delivered reliably (in the background too) and carries metadata natively.
+    // ─── Ariadne's Thread [AT-0024] ─────────────────────
+    // What: Transfer a completed Watch audio file to the iPhone.
+    // Why:  The iPhone forwards the file as a chat.send attachment so OpenClaw tools.media.audio transcribes it.
+    // Date: 2026-06-06
+    // Related: app→WatchAudioRecorder, app→WatchConnectivityPhoneService didReceive file
+    // ─────────────────────────────────────────────────────
     func sendAudio(fileURL: URL, jobId: UUID, sessionKey: String) {
         guard session.activationState == .activated else {
-            AppLog.error("WCSession not activated on Watch; cannot send audio")
+            AppLog.error("WCSession not activated on Watch; audio file not transferred jobId=\(jobId)")
             return
         }
         let metadata: [String: Any] = [
-            WatchConnectivityCodec.audioKindKey: true,
-            WatchConnectivityCodec.audioJobIdKey: jobId.uuidString,
-            WatchConnectivityCodec.audioSessionKeyKey: sessionKey,
+            "jobId": jobId.uuidString,
+            "sessionKey": sessionKey,
+            "fileName": fileURL.lastPathComponent,
+            "mimeType": "audio/mp4",
         ]
         session.transferFile(fileURL, metadata: metadata)
-        AppLog.info("Watch transferFile audio jobId=\(jobId) sessionKey=\(sessionKey) file=\(fileURL.lastPathComponent)")
+        AppLog.info("Watch queued audio transferFile jobId=\(jobId) sessionKey=\(sessionKey) file=\(fileURL.lastPathComponent)")
     }
 
     /// Ask the iPhone to push the current pairing + jobs snapshot back to the Watch.

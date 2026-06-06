@@ -72,7 +72,7 @@ final class WatchAppModel: ObservableObject {
     @Published var selectedAgentId: String = "main"
 
     private let bridge = WatchConnectivityWatchService.shared
-    let recorder = WatchAudioRecorder()
+    private let recorder = WatchAudioRecorder()
     /// Local jobs the iPhone has not acknowledged yet.
     private var pendingJobIds: Set<UUID> = []
     /// Maps a jobId to the session it belongs to, so iPhone-driven updates land on the right screen.
@@ -90,6 +90,7 @@ final class WatchAppModel: ObservableObject {
     private var gatewayRecordingKey: String?
     /// Gateway sessionKeys whose replies are muted on the Watch (local, per-session). Not persisted/synced.
     @Published private var gatewayMutedKeys: Set<String> = []
+    private var recordingJobId: UUID?
 
     // ─── Ariadne's Thread [AT-0002] ─────────────────────
     // What: UserDefaults cache of last connected gateway pairing on the Watch.
@@ -199,6 +200,9 @@ final class WatchAppModel: ObservableObject {
         let revoke = envelope.revokeGatewayPairing == true
         if let remote = envelope.pairing {
             persistPairingFromPhone(remote, envelopeKind: envelope.kind, revokeGatewayPairing: revoke)
+        }
+        if revoke {
+            AppLog.info("Watch received explicit gateway pairing revoke")
         }
         applyGlobalTts(envelope.ttsEnabled)
         applyTtsLanguage(envelope.ttsLanguage)
@@ -468,7 +472,7 @@ final class WatchAppModel: ObservableObject {
             AppLog.error("Watch toggleRecord blocked: not paired")
             return
         }
-        if recorder.isRecording {
+        if isRecording {
             Task { await finishRecordingAndSend() }
         } else {
             // Guard against accidental starts: when the user swipes between sessions on the vertical stack, watchOS can
@@ -490,16 +494,43 @@ final class WatchAppModel: ObservableObject {
             AppLog.error("Watch beginRecording blocked: mic denied")
             return
         }
+        guard sessions.indices.contains(currentIndex) else {
+            statusHint = "Recording failed"
+            AppLog.error("Watch beginRecording blocked: current session missing index=\(currentIndex)")
+            return
+        }
+        beginFileRecording(session: sessions[currentIndex], gatewayKey: nil)
+    }
+
+    // ─── Ariadne's Thread [AT-0026] ─────────────────────
+    // What: Record one local Watch audio file and transfer it to iPhone.
+    // Why:  OpenClaw batch audio understanding expects an attachment, not Watch PCM chunks.
+    // Date: 2026-06-06
+    // Related: app→WatchAudioRecorder, app→WatchConnectivityWatchService sendAudio
+    // ─────────────────────────────────────────────────────
+    private func beginFileRecording(session: WatchSession, gatewayKey: String?) {
         do {
             try recorder.startRecording()
             playRecordHaptic()
-            recordingSessionId = sessions.indices.contains(currentIndex) ? sessions[currentIndex].id : nil
+            let job = VoiceJob(status: .listening, statusDetail: "Listening…", agentId: sessionAgentId(from: session.sessionKey))
+            pendingJobIds.insert(job.id)
+            if let gatewayKey {
+                jobGatewayKey[job.id] = gatewayKey
+                gatewayJobs[gatewayKey, default: []].insert(job, at: 0)
+            } else if let index = sessions.firstIndex(where: { $0.id == session.id }) {
+                jobSession[job.id] = session.id
+                sessions[index].jobs.insert(job, at: 0)
+                ensureTopNewSessionPageAfterSend(currentSessionId: session.id)
+            }
+            recordingJobId = job.id
+            recordingSessionId = gatewayKey == nil ? session.id : nil
+            gatewayRecordingKey = gatewayKey
             statusHint = nil
             objectWillChange.send()
-            AppLog.info("Watch recording started sessionIndex=\(currentIndex)")
+            AppLog.info("Watch file recording started jobId=\(job.id) sessionKey=\(session.sessionKey) gatewayKey=\(gatewayKey ?? "nil")")
         } catch {
             statusHint = "Mic error"
-            AppLog.error("Watch startRecording failed: \(error.localizedDescription)")
+            AppLog.error("Watch file startRecording failed: \(error.localizedDescription)")
         }
     }
 
@@ -523,60 +554,50 @@ final class WatchAppModel: ObservableObject {
     }
 
     private func finishRecordingAndSend() async {
-        guard let url = recorder.stopRecording() else {
-            statusHint = "Recording failed"
-            recordingSessionId = nil
-            AppLog.error("Watch finishRecording: no file")
-            objectWillChange.send()
+        if recorder.isRecording {
+            finishFileRecording()
+            return
+        }
+        statusHint = "Recording failed"
+        recordingSessionId = nil
+        AppLog.error("Watch finishRecording blocked: file recorder is not active")
+        objectWillChange.send()
+    }
+
+    private func finishFileRecording() {
+        guard let jobId = recordingJobId else {
+            _ = recorder.stopRecording()
+            AppLog.error("Watch file finishRecording: job id missing")
+            return
+        }
+        guard let fileURL = recorder.stopRecording() else {
+            updateDirectJob(jobId: jobId, status: .failed, errorMessage: "Recording file is missing.", statusDetail: nil, completedAt: Date())
+            AppLog.error("Watch file finishRecording: recorder returned nil URL jobId=\(jobId)")
             return
         }
         playRecordHaptic()
-        objectWillChange.send()
-
-        guard let sid = recordingSessionId, let si = sessions.firstIndex(where: { $0.id == sid }) else {
-            statusHint = "Recording failed"
-            recordingSessionId = nil
-            AppLog.error("Watch finishRecording: target session missing")
-            return
-        }
+        updateDirectJob(jobId: jobId, status: .sending, statusDetail: "Sending…")
+        let sessionKey = gatewayRecordingKey
+            ?? recordingSessionId.flatMap { sid in sessions.first(where: { $0.id == sid })?.sessionKey }
+            ?? "agent:\(selectedAgentId):main"
+        bridge.sendAudio(fileURL: fileURL, jobId: jobId, sessionKey: sessionKey)
+        recordingJobId = nil
         recordingSessionId = nil
-        let session = sessions[si]
-
-        // The iPhone serializes all voice turns into a single queue. If another turn is already in flight, show this
-        // one as queued right away (instead of "Sending…") so back-to-back recordings across sessions never look stuck;
-        // the iPhone later confirms with its own "Queued — waiting…"/progress updates.
-        let hasTurnInFlight = hasUnfinishedSentJob(excluding: nil)
-        let detail = hasTurnInFlight ? "Queued — waiting…" : "Sending…"
-        let job = VoiceJob(status: .sending, statusDetail: detail)
-        pendingJobIds.insert(job.id)
-        jobSession[job.id] = session.id
-        sessions[si].jobs.insert(job, at: 0)
-        ensureTopNewSessionPageAfterSend(currentSessionId: session.id)
-
-        bridge.sendAudio(fileURL: url, jobId: job.id, sessionKey: session.sessionKey)
+        gatewayRecordingKey = nil
         statusHint = nil
-        AppLog.info("Watch sent audio jobId=\(job.id) sessionKey=\(session.sessionKey) queued=\(hasTurnInFlight)")
-    }
-
-    /// True when any session already has a sent-but-not-finished turn (status .sending/.running). Used to label a new
-    /// recording as queued immediately on the Watch, matching the iPhone's serial queue.
-    private func hasUnfinishedSentJob(excluding excludedJobId: UUID?) -> Bool {
-        for session in sessions {
-            for job in session.jobs {
-                if let excludedJobId, job.id == excludedJobId { continue }
-                if job.status == .sending || job.status == .running {
-                    return true
-                }
-            }
-        }
-        return false
+        objectWillChange.send()
+        AppLog.info("Watch file recording stopped and transferred jobId=\(jobId) sessionKey=\(sessionKey) file=\(fileURL.lastPathComponent)")
     }
 
     func cancelRecording() {
         guard recorder.isRecording else { return }
         recorder.cancel()
+        if let jobId = recordingJobId {
+            updateDirectJob(jobId: jobId, status: .cancelled, statusDetail: nil, completedAt: Date())
+        }
         recordingSessionId = nil
         gatewayRecordingKey = nil
+        recordingJobId = nil
         statusHint = nil
         objectWillChange.send()
         AppLog.info("Watch cancelled recording")
@@ -623,7 +644,7 @@ final class WatchAppModel: ObservableObject {
             AppLog.error("Watch gateway toggleRecord blocked: not paired")
             return
         }
-        if recorder.isRecording {
+        if isRecording {
             Task { await finishGatewayRecordingAndSend() }
         } else {
             Task { await beginGatewayRecording(sessionKey: sessionKey) }
@@ -638,46 +659,92 @@ final class WatchAppModel: ObservableObject {
             AppLog.error("Watch gateway beginRecording blocked: mic denied")
             return
         }
-        do {
-            try recorder.startRecording()
-            playRecordHaptic()
-            gatewayRecordingKey = sessionKey
-            recordingSessionId = nil
-            statusHint = nil
-            objectWillChange.send()
-            AppLog.info("Watch gateway recording started sessionKey=\(sessionKey)")
-        } catch {
-            statusHint = "Mic error"
-            AppLog.error("Watch gateway startRecording failed: \(error.localizedDescription)")
-        }
+        beginFileRecording(session: WatchSession(sessionKey: sessionKey), gatewayKey: sessionKey)
     }
 
     private func finishGatewayRecordingAndSend() async {
-        guard let url = recorder.stopRecording() else {
-            statusHint = "Recording failed"
-            gatewayRecordingKey = nil
-            objectWillChange.send()
-            AppLog.error("Watch gateway finishRecording: no file")
+        if recorder.isRecording {
+            finishFileRecording()
             return
         }
-        playRecordHaptic()
-        objectWillChange.send()
-
-        guard let key = gatewayRecordingKey else {
-            statusHint = "Recording failed"
-            AppLog.error("Watch gateway finishRecording: target sessionKey missing")
-            return
-        }
+        statusHint = "Recording failed"
         gatewayRecordingKey = nil
+        objectWillChange.send()
+        AppLog.error("Watch gateway finishRecording blocked: file recorder is not active")
+    }
 
-        let job = VoiceJob(status: .sending, statusDetail: "Sending…")
-        pendingJobIds.insert(job.id)
-        jobGatewayKey[job.id] = key
-        gatewayJobs[key, default: []].insert(job, at: 0)
+    private func updateDirectJob(
+        jobId: UUID,
+        status: JobStatus,
+        transcript: String? = nil,
+        resultText: String? = nil,
+        errorMessage: String? = nil,
+        statusDetail: String?,
+        completedAt: Date? = nil
+    ) {
+        let updated = applyDirectJobUpdate(
+            jobId: jobId,
+            status: status,
+            transcript: transcript,
+            resultText: resultText,
+            errorMessage: errorMessage,
+            statusDetail: statusDetail,
+            completedAt: completedAt
+        )
+        if let updated, updated.status == .done {
+            if let key = jobGatewayKey[jobId] {
+                speakOnce(updated, muted: isGatewayMuted(key))
+            } else if let sessionId = jobSession[jobId], let si = sessions.firstIndex(where: { $0.id == sessionId }) {
+                speakOnce(updated, muted: sessions[si].muted)
+            }
+        }
+        objectWillChange.send()
+    }
 
-        bridge.sendAudio(fileURL: url, jobId: job.id, sessionKey: key)
-        statusHint = nil
-        AppLog.info("Watch sent gateway audio jobId=\(job.id) sessionKey=\(key)")
+    private func applyDirectJobUpdate(
+        jobId: UUID,
+        status: JobStatus,
+        transcript: String?,
+        resultText: String?,
+        errorMessage: String?,
+        statusDetail: String?,
+        completedAt: Date?
+    ) -> VoiceJob? {
+        if let key = jobGatewayKey[jobId] {
+            var arr = gatewayJobs[key] ?? []
+            guard let index = arr.firstIndex(where: { $0.id == jobId }) else {
+                AppLog.error("Watch direct gateway update missed jobId=\(jobId) sessionKey=\(key)")
+                return nil
+            }
+            arr[index].status = status
+            if let transcript { arr[index].transcript = transcript }
+            if let resultText { arr[index].resultText = resultText }
+            if let errorMessage { arr[index].errorMessage = errorMessage }
+            arr[index].statusDetail = statusDetail
+            if let completedAt { arr[index].completedAt = completedAt }
+            gatewayJobs[key] = arr
+            if status.isTerminal { pendingJobIds.remove(jobId) }
+            AppLog.info("Watch direct gateway job update jobId=\(jobId) status=\(status.rawValue) detail=\(statusDetail ?? "nil") transcriptLength=\(arr[index].transcript?.count ?? 0) replyLength=\(arr[index].resultText?.count ?? 0)")
+            return arr[index]
+        }
+
+        guard
+            let sessionId = jobSession[jobId],
+            let si = sessions.firstIndex(where: { $0.id == sessionId }),
+            let ji = sessions[si].jobs.firstIndex(where: { $0.id == jobId })
+        else {
+            AppLog.error("Watch direct local update missed jobId=\(jobId)")
+            return nil
+        }
+        sessions[si].jobs[ji].status = status
+        if let transcript { sessions[si].jobs[ji].transcript = transcript }
+        if let resultText { sessions[si].jobs[ji].resultText = resultText }
+        if let errorMessage { sessions[si].jobs[ji].errorMessage = errorMessage }
+        sessions[si].jobs[ji].statusDetail = statusDetail
+        if let completedAt { sessions[si].jobs[ji].completedAt = completedAt }
+        if status.isTerminal { pendingJobIds.remove(jobId) }
+        AppLog.info("Watch direct local job update jobId=\(jobId) status=\(status.rawValue) detail=\(statusDetail ?? "nil") transcriptLength=\(sessions[si].jobs[ji].transcript?.count ?? 0) replyLength=\(sessions[si].jobs[ji].resultText?.count ?? 0)")
+        return sessions[si].jobs[ji]
     }
 
     /// Applies an iPhone job update to a gateway-session turn (mirrors the local upsert behavior, but on `gatewayJobs`).

@@ -178,7 +178,6 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
     /// When true, the iPhone explicitly disconnected (Disconnect button). The Watch may clear its sticky pairing cache.
     /// Any other envelope must not unpair the Watch even if pairing.phase is needsSetupCode.
     public let revokeGatewayPairing: Bool?
-
     public init(
         kind: WatchMessageKind,
         jobId: UUID? = nil,

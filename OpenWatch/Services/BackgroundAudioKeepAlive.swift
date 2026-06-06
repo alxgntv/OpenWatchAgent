@@ -1,15 +1,11 @@
 import AVFoundation
 import Foundation
 
-/// Keeps the iPhone app alive while it processes work triggered by the Watch (transcription + the long gateway
-/// WebSocket round-trip) even when the app itself is backgrounded.
+/// Keeps the iPhone app alive while it relays Watch audio chunks through the long gateway WebSocket round-trip.
 ///
-/// Why this exists: a Watch `transferFile` wakes the backgrounded iPhone app, but `beginBackgroundTask` only grants
-/// ~30s of runtime — far less than a long agent reply can take, so the WebSocket gets suspended and the turn never
-/// completes until the user manually foregrounds the app. The app already declares the `audio` UIBackgroundMode, but
-/// that mode only actually holds the app alive while an audio session is active. This service activates a silent,
-/// non-mixing playback audio session for the duration of the work so the `audio` background mode keeps the process
-/// running, then deactivates it when the work is done.
+/// Why this exists: `beginBackgroundTask` only grants a short runtime window, but an OpenClaw Talk + chat turn can run
+/// longer. The app already declares the `audio` UIBackgroundMode, but that mode only holds the app alive while an audio
+/// session is active. This service activates silent playback for the duration of relay work, then deactivates it.
 ///
 /// It is reference-counted so overlapping Watch turns (multiple jobs in flight) only deactivate once everyone is done.
 @MainActor
