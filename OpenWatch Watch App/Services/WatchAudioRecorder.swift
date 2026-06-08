@@ -33,6 +33,9 @@ final class WatchAudioRecorder: NSObject, ObservableObject {
     func startRecording() throws {
         guard !isRecording else { return }
 
+        FlowLog.started(step: 3, side: .watch, flow: "audio-record")
+        FlowLog.function(step: 3, side: .watch, flow: "audio-record", name: "WatchAudioRecorder.startRecording")
+
         let session = AVAudioSession.sharedInstance()
         let options: AVAudioSession.CategoryOptions = [.duckOthers]
         try session.setCategory(.playAndRecord, mode: .default, options: options)
@@ -58,6 +61,7 @@ final class WatchAudioRecorder: NSObject, ObservableObject {
         self.recorder = recorder
         currentURL = url
         isRecording = true
+        FlowLog.progress(step: 3, side: .watch, flow: "audio-record", detail: "writing audio file url=\(url.lastPathComponent)")
         AppLog.info("Watch started file audio recording url=\(url.lastPathComponent)")
     }
 
@@ -67,6 +71,7 @@ final class WatchAudioRecorder: NSObject, ObservableObject {
         isRecording = false
         self.recorder = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        FlowLog.finished(step: 3, side: .watch, flow: "audio-record", detail: "url=\(currentURL?.lastPathComponent ?? "nil")")
         AppLog.info("Watch stopped file audio recording url=\(currentURL?.lastPathComponent ?? "nil")")
         return currentURL
     }

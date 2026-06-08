@@ -95,10 +95,30 @@ final class AppModel: ObservableObject {
     private let watchHistoryLimit = 20
     /// Already enriched sessions keyed by sessionKey. Used to avoid refetching/resending the same session messages.
     private var watchEnrichedSessionCache: [String: WatchGatewaySession] = [:]
+    private var pendingAudioJobs: [PendingAudioJob] = []
+    private var pendingResumeTask: Task<Void, Never>?
+    private let pendingAudioJobsKey = "openwatch.pendingAudioJobs.v1"
+
+    // ─── Ariadne's Thread [AT-0045] ─────────────────────
+    // What: Persist accepted Watch audio jobs until a later reconcile fetches their final gateway reply.
+    // Why:  Locked/background iPhone cannot reliably wait on one long WSS run after chat.send is accepted.
+    // Date: 2026-06-07
+    // Related: [AT-0044] app→GatewayJobClient.submitAudioAttachment
+    // ─────────────────────────────────────────────────────
+    private struct PendingAudioJob: Codable, Equatable {
+        let watchJobId: UUID
+        let sessionKey: String
+        let chatSendId: String
+        let idempotencyKey: String
+        let acceptedAt: Date
+        let historyBaselineAssistantCount: Int
+        var lastCheckedAt: Date?
+    }
 
     private init() {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
         pairingClient = GatewayPairingClient(appVersion: version)
+        pendingAudioJobs = Self.loadPendingAudioJobs(key: pendingAudioJobsKey)
         if KeychainStore.isPaired, let url = KeychainStore.loadGatewayURL()?.absoluteString {
             pairing = PairingSnapshot(phase: .connected, gatewayURL: url, message: "Connected.")
         }
@@ -111,6 +131,26 @@ final class AppModel: ObservableObject {
             ttsRate: ttsRate
         )
         _ = AppModel.availableVoiceLanguages
+    }
+
+    private static func loadPendingAudioJobs(key: String) -> [PendingAudioJob] {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+        do {
+            return try JSONDecoder().decode([PendingAudioJob].self, from: data)
+        } catch {
+            AppLog.error("Failed to decode pending audio jobs: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    private func savePendingAudioJobs() {
+        do {
+            let data = try JSONEncoder().encode(pendingAudioJobs)
+            UserDefaults.standard.set(data, forKey: pendingAudioJobsKey)
+            AppLog.info("Saved pending audio jobs count=\(pendingAudioJobs.count)")
+        } catch {
+            AppLog.error("Failed to encode pending audio jobs: \(error.localizedDescription)")
+        }
     }
 
     /// Toggles global voice playback and immediately mirrors the new state to the Watch (which does the speaking).
@@ -601,8 +641,23 @@ final class AppModel: ObservableObject {
             pushSessionListToWatch(rows: gatewaySessions)
             startWatchEnrichment(rows: gatewaySessions(forAgentId: agentId))
         case .requestSync:
+            restoreGatewayURLFromWatchRequest(envelope.pairing)
+            let activeWatchJobs = envelope.jobs ?? []
+            // ─── Ariadne's Thread [AT-0066] ─────────────────────
+            // What: Treat Watch requestSync as an explicit short poll for accepted async audio jobs.
+            // Why:  Watch drives job status checks every few seconds; iPhone opens only short backend requests.
+            // Date: 2026-06-08
+            // Related: [AT-0065] AppModel.handleWatchAudioFile, [AT-0046] AppModel.resumePendingAudioJobs
+            // ─────────────────────────────────────────────────────
+            await resumePendingAudioJobs(reason: "watch-request-sync")
+            await reconcileActiveWatchJobsFromHistory(activeWatchJobs)
             AppLog.info("Watch requested sync; republishing pairing + jobs phase=\(pairing.phase.rawValue) keychainPaired=\(KeychainStore.isPaired)")
             syncWatch()
+            if !activeWatchJobs.isEmpty {
+                AppLog.info("Watch requestSync handled as active job poll only count=\(activeWatchJobs.count)")
+                return
+            }
+            Task { await publishGatewayProbeToWatch(reason: "watch-request-sync") }
             // Mirror gateway sessions + usage too: re-push the cached values if we have them, otherwise fetch now.
             if !watchGatewaySessions.isEmpty {
                 // ─── Ariadne's Thread [AT-0031] ─────────────────────
@@ -629,6 +684,112 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // ─── Ariadne's Thread [AT-0050] ─────────────────────
+    // What: Close active Watch jobs from Gateway history during requestSync.
+    // Why:  If iPhone is reinstalled/relaunched after the server answered, in-memory jobs are gone but Watch still knows jobId/sessionKey.
+    // Date: 2026-06-07
+    // Related: [AT-0048] shared→VoiceJob.gatewaySessionKey, [AT-0049] watch→WatchAppModel.upsert
+    // ─────────────────────────────────────────────────────
+    private func reconcileActiveWatchJobsFromHistory(_ watchJobs: [VoiceJob]?) async {
+        guard let watchJobs, !watchJobs.isEmpty else { return }
+        AppLog.info("Reconciling active Watch jobs from history count=\(watchJobs.count)")
+        for watchJob in watchJobs where !watchJob.status.isTerminal {
+            guard let sessionKey = watchJob.gatewaySessionKey, !sessionKey.isEmpty else {
+                AppLog.error("Watch active job missing gatewaySessionKey jobId=\(watchJob.id)")
+                continue
+            }
+            do {
+                let messages = try await jobClient.fetchHistory(sessionKey: sessionKey)
+                guard let reply = latestAssistantText(in: messages, after: watchJob.createdAt) else {
+                    AppLog.info("No history reply yet for Watch jobId=\(watchJob.id) sessionKey=\(sessionKey)")
+                    continue
+                }
+                var done = watchJob
+                done.status = .done
+                done.statusDetail = nil
+                done.resultText = reply
+                done.completedAt = Date()
+                done.gatewaySessionKey = sessionKey
+                if !jobs.contains(where: { $0.id == done.id }) {
+                    jobs.insert(done, at: 0)
+                }
+                if activeJobId == done.id { activeJobId = nil }
+                syncWatch(job: done)
+                AppLog.info("Reconciled Watch job from history jobId=\(done.id) sessionKey=\(sessionKey) replyLength=\(reply.count)")
+            } catch {
+                AppLog.error("History reconcile failed jobId=\(watchJob.id) sessionKey=\(sessionKey): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func latestAssistantText(in messages: [ChatHistoryMessage], after createdAt: Date) -> String? {
+        let threshold = createdAt.addingTimeInterval(-10)
+        return messages
+            .filter { !$0.isUser && ($0.createdAt ?? .distantPast) >= threshold }
+            .last?
+            .text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // ─── Ariadne's Thread [AT-0042] ─────────────────────
+    // What: Restore missing iPhone gateway URL from the Watch requestSync snapshot.
+    // Why:  Locked/background iPhone WSS probe needs its Keychain URL; Watch can only provide the cached URL, not tokens.
+    // Date: 2026-06-07
+    // Related: WatchConnectivityWatchService.requestSync, publishGatewayProbeToWatch
+    // ─────────────────────────────────────────────────────
+    private func restoreGatewayURLFromWatchRequest(_ snapshot: PairingSnapshot?) {
+        guard KeychainStore.loadGatewayURL() == nil,
+              let rawURL = snapshot?.gatewayURL,
+              let url = URL(string: rawURL) else {
+            return
+        }
+        KeychainStore.saveGatewayURLForLockedAccess(url)
+        AppLog.info("Restored missing iPhone gateway URL from Watch requestSync url=\(url.absoluteString) hasOperatorToken=\(KeychainStore.loadOperatorToken() != nil)")
+    }
+
+    // ─── Ariadne's Thread [AT-0038] ─────────────────────
+    // What: Publish real gateway WSS hello-ok probe result to Watch.
+    // Why:  Watch Speak must unlock only after iPhone proves the gateway socket path works.
+    // Date: 2026-06-07
+    // Related: [AT-0036] FlowLog, Gateway runbook liveness (connect -> hello-ok)
+    // ─────────────────────────────────────────────────────
+    func publishGatewayProbeToWatch(reason: String) async {
+        if !KeychainStore.isPaired, let url = KeychainStore.loadGatewayURL() {
+            do {
+                AppLog.info("Gateway probe recovering pairing before probe reason=\(reason)")
+                pairing = try await pairingClient.recheckApproval(gatewayURL: url, bootstrapToken: loadBootstrapFromKeychain())
+                syncWatch()
+            } catch {
+                AppLog.error("Gateway probe pairing recovery failed reason=\(reason): \(error.localizedDescription)")
+            }
+        }
+        let detail = await jobClient.probeGatewayHelloOk()
+        let reachable = detail == "wss hello-ok"
+        let envelope = WatchEnvelope(kind: .gatewayProbe, gatewayReachable: reachable, gatewayProbeDetail: "\(reason) \(detail)")
+        watchBridge.sendCommandToWatch(envelope)
+        AppLog.info("Published gateway probe to Watch reachable=\(reachable) detail=\(reason) \(detail)")
+    }
+
+    // ─── Ariadne's Thread [AT-0055] ─────────────────────
+    // What: Expose the iPhone WSS hello-ok probe for Watch-requested relay tests.
+    // Why:  WatchConnectivity sendMessage and transferUserInfo tests need a reply produced by the iPhone route itself.
+    // Date: 2026-06-07
+    // Related: [AT-0038] AppModel.publishGatewayProbeToWatch, [AT-0054] watch→WatchConnectivityWatchService.runIndependentWSSProbesIfNeeded
+    // ─────────────────────────────────────────────────────
+    func probeWSSForWatchRelay(requestId: String, route: String) async -> [String: Any] {
+        let detail = await jobClient.probeGatewayHelloOk()
+        let ok = detail == "wss hello-ok"
+        let reply: [String: Any] = [
+            "ok": ok,
+            "route": route,
+            "proof": ok ? "wss-hello-ok" : "failed",
+            "detail": detail,
+            "requestId": requestId,
+        ]
+        AppLog.info("IPHONE RELAY WSS result requestId=\(requestId) ok=\(ok) route=\(route) proof=\(ok ? "wss-hello-ok" : "failed") detail=\(detail)")
+        return reply
+    }
+
     // ─── Ariadne's Thread [AT-0025] ─────────────────────
     // What: Forward a Watch-recorded audio file to OpenClaw as a chat.send attachment.
     // Why:  OpenClaw tools.media.audio performs the boxed batch transcription; the iPhone does not run STT.
@@ -636,14 +797,24 @@ final class AppModel: ObservableObject {
     // Related: app→WatchConnectivityPhoneService didReceive file, app→GatewayJobClient runAudioAttachment
     // ─────────────────────────────────────────────────────
     func handleWatchAudioFile(fileURL: URL, jobId: UUID, sessionKey: String, fileName: String, mimeType: String) async {
+        let jobLogId = String(jobId.uuidString.prefix(3))
+        FlowLog.function(step: 5, side: .iphone, flow: "audio-send-server", name: "AppModel.handleWatchAudioFile")
         guard isPaired else {
+            FlowLog.result(step: 5, side: .iphone, flow: "audio-send-server", success: false, detail: "not paired jobId=\(jobId)")
+            FlowLog.finished(step: 5, side: .iphone, flow: "audio-send-server")
             AppLog.error("Watch audio file blocked: not paired jobId=\(jobId)")
             try? FileManager.default.removeItem(at: fileURL)
             return
         }
         defer { try? FileManager.default.removeItem(at: fileURL) }
 
-        let job = VoiceJob(id: jobId, status: .sending, statusDetail: "Transcribing…")
+        let job = VoiceJob(
+            id: jobId,
+            status: .sending,
+            statusDetail: "Transcribing…",
+            gatewaySessionKey: sessionKey,
+            agentId: agentId(fromSessionKey: sessionKey) ?? "main"
+        )
         if let existing = jobs.firstIndex(where: { $0.id == jobId }) {
             jobs[existing] = job
         } else {
@@ -656,34 +827,224 @@ final class AppModel: ObservableObject {
 
         do {
             let audioData = try Data(contentsOf: fileURL)
+            FlowLog.progress(step: 5, side: .iphone, flow: "audio-send-server", detail: "uploading to gateway jobId=\(jobId) bytes=\(audioData.count) internetAvailable=\(PhoneNetworkPathMonitor.shared.internetAvailable)")
+            AppLog.info("[IPHONE][JOB \(jobLogId)] backend send started jobId=\(jobId) sessionKey=\(sessionKey) bytes=\(audioData.count) fileName=\(fileName) mimeType=\(mimeType)")
             AppLog.info("Watch audio file forwarding to OpenClaw jobId=\(jobId) sessionKey=\(sessionKey) bytes=\(audioData.count) fileName=\(fileName) mimeType=\(mimeType)")
-            let reply = try await jobClient.runAudioAttachment(
+            // ─── Ariadne's Thread [AT-0065] ─────────────────────
+            // What: Submit Watch audio only until Gateway accepts the job, then return Processing to Watch.
+            // Why:  iPhone relay must not hold one long WSS open while the backend agent is working.
+            // Date: 2026-06-08
+            // Related: [AT-0044] app→GatewayJobClient.submitAudioAttachment, [AT-0046] AppModel.resumePendingAudioJobs
+            // ─────────────────────────────────────────────────────
+            let submitted = try await jobClient.submitAudioAttachment(
                 audioData: audioData,
                 fileName: fileName,
                 mimeType: mimeType,
                 sessionKey: sessionKey,
-                idempotencyKey: jobId.uuidString,
-                onProgress: makeProgressHandler(jobId: jobId)
+                idempotencyKey: jobId.uuidString
             )
+            let pending = PendingAudioJob(
+                watchJobId: jobId,
+                sessionKey: sessionKey,
+                chatSendId: submitted.chatSendId,
+                idempotencyKey: jobId.uuidString,
+                acceptedAt: submitted.acceptedAt,
+                historyBaselineAssistantCount: submitted.historyBaselineAssistantCount,
+                lastCheckedAt: nil
+            )
+            upsertPendingAudioJob(pending)
             guard let idx = jobs.firstIndex(where: { $0.id == jobId }) else { return }
-            jobs[idx].resultText = reply
-            jobs[idx].status = .done
-            jobs[idx].statusDetail = nil
-            jobs[idx].completedAt = Date()
-            if activeJobId == jobId { activeJobId = nil }
+            jobs[idx].status = .running
+            jobs[idx].statusDetail = "Processing…"
+            jobs[idx].completedAt = nil
+            jobs[idx].gatewayRunId = submitted.chatSendId
+            jobs[idx].gatewaySessionKey = sessionKey
+            jobs[idx].failureSource = nil
+            jobs[idx].elapsedSinceSend = nil
+            jobs[idx].elapsedSinceLastWSFrame = nil
+            jobs[idx].elapsedSinceWorking = nil
+            jobs[idx].wsCloseCode = nil
+            jobs[idx].backendErrorCode = nil
             syncWatch(job: jobs[idx])
-            AppLog.info("Watch audio file OpenClaw reply done jobId=\(jobId) replyLength=\(reply.count)")
+            AppLog.info("[IPHONE][JOB \(jobLogId)] backend accepted async jobId=\(jobId) serverJobId=\(submitted.chatSendId) baselineAssistantCount=\(submitted.historyBaselineAssistantCount)")
+            AppLog.info("[IPHONE][JOB \(jobLogId)] sent result to Watch jobId=\(jobId) status=processing serverJobId=\(submitted.chatSendId)")
+            FlowLog.result(step: 5, side: .iphone, flow: "audio-send-server", success: true, detail: "accepted by server jobId=\(jobId) serverJobId=\(submitted.chatSendId)")
+            FlowLog.finished(step: 5, side: .iphone, flow: "audio-send-server")
         } catch {
             guard let idx = jobs.firstIndex(where: { $0.id == jobId }) else { return }
+            let failureDiagnostics = (error as? GatewayJobError)?.diagnostics
+            AppLog.info("[IPHONE][JOB \(jobLogId)] backend send finished status=failed jobId=\(jobId) error=\(error.localizedDescription)")
+            AppLog.error("[IPHONE][JOB \(jobLogId)] failure diagnostics jobId=\(jobId) source=\(failureDiagnostics?.failureSource ?? "unknown") elapsedSinceSend=\(failureDiagnostics?.elapsedSinceSend ?? -1) elapsedSinceLastWSFrame=\(failureDiagnostics?.elapsedSinceLastWSFrame ?? -1) elapsedSinceWorking=\(failureDiagnostics?.elapsedSinceWorking ?? -1) runId=\(failureDiagnostics?.runId ?? "nil") wsCloseCode=\(failureDiagnostics?.wsCloseCode ?? "nil") backendErrorCode=\(failureDiagnostics?.backendErrorCode ?? "nil")")
             jobs[idx].status = .failed
             jobs[idx].errorMessage = error.localizedDescription
             jobs[idx].statusDetail = nil
             jobs[idx].completedAt = Date()
+            jobs[idx].failureSource = failureDiagnostics?.failureSource ?? "submitFailed"
+            jobs[idx].elapsedSinceSend = failureDiagnostics?.elapsedSinceSend
+            jobs[idx].elapsedSinceLastWSFrame = failureDiagnostics?.elapsedSinceLastWSFrame
+            jobs[idx].elapsedSinceWorking = failureDiagnostics?.elapsedSinceWorking
+            jobs[idx].gatewayRunId = failureDiagnostics?.runId
+            jobs[idx].wsCloseCode = failureDiagnostics?.wsCloseCode
+            jobs[idx].backendErrorCode = failureDiagnostics?.backendErrorCode
             if activeJobId == jobId { activeJobId = nil }
             errorBanner = error.localizedDescription
             syncWatch(job: jobs[idx])
+            AppLog.info("[IPHONE][JOB \(jobLogId)] sent result to Watch jobId=\(jobId) status=failed error=\(error.localizedDescription)")
+            FlowLog.result(step: 5, side: .iphone, flow: "audio-send-server", success: false, detail: "upload failed jobId=\(jobId) error=\(error.localizedDescription)")
+            FlowLog.finished(step: 5, side: .iphone, flow: "audio-send-server")
+            FlowLog.started(step: 6, side: .iphone, flow: "server-response", detail: "jobId=\(jobId)")
+            FlowLog.function(step: 6, side: .iphone, flow: "server-response", name: "AppModel.handleWatchAudioFile")
+            FlowLog.result(step: 6, side: .iphone, flow: "server-response", success: false, detail: "received=no error=\(error.localizedDescription)")
+            FlowLog.finished(step: 6, side: .iphone, flow: "server-response")
             AppLog.error("Watch audio file OpenClaw reply failed jobId=\(jobId): \(error.localizedDescription)")
         }
+    }
+
+    // ─── Ariadne's Thread [AT-0061] ─────────────────────
+    // What: Recover Watch audio replies from chat.history when live WSS reports an empty final response.
+    // Why:  The gateway can persist a non-empty assistant message even when the live frame parser sees empty completion.
+    // Date: 2026-06-08
+    // Related: [AT-0027] GatewayJobClient.runAudioAttachment, [AT-0050] AppModel.reconcileActiveWatchJobsFromHistory
+    // ─────────────────────────────────────────────────────
+    private func recoverWatchAudioReplyFromHistory(jobId: UUID, sessionKey: String) async -> String? {
+        do {
+            let messages = try await jobClient.fetchHistory(sessionKey: sessionKey)
+            let createdAt = jobs.first(where: { $0.id == jobId })?.createdAt ?? Date()
+            let reply = latestAssistantText(in: messages, after: createdAt)
+            AppLog.info("Watch audio empty-response recovery jobId=\(jobId) sessionKey=\(sessionKey) replyLength=\(reply?.count ?? 0)")
+            return reply
+        } catch {
+            AppLog.error("Watch audio empty-response recovery failed jobId=\(jobId) sessionKey=\(sessionKey): \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func upsertPendingAudioJob(_ pending: PendingAudioJob) {
+        if let index = pendingAudioJobs.firstIndex(where: { $0.watchJobId == pending.watchJobId }) {
+            pendingAudioJobs[index] = pending
+        } else {
+            pendingAudioJobs.append(pending)
+        }
+        savePendingAudioJobs()
+        AppLog.info("Pending audio job stored jobId=\(pending.watchJobId) sessionKey=\(pending.sessionKey) chatSendId=\(pending.chatSendId) baseline=\(pending.historyBaselineAssistantCount)")
+    }
+
+    func triggerPendingAudioResume(reason: String) {
+        guard !pendingAudioJobs.isEmpty else {
+            AppLog.info("Pending audio resume skipped reason=\(reason): no pending jobs")
+            return
+        }
+        guard pendingResumeTask == nil else {
+            AppLog.info("Pending audio resume already running reason=\(reason)")
+            return
+        }
+        pendingResumeTask = Task { [weak self] in
+            guard let self else { return }
+            await self.resumePendingAudioJobs(reason: reason)
+            await MainActor.run {
+                self.pendingResumeTask = nil
+            }
+        }
+    }
+
+    // ─── Ariadne's Thread [AT-0046] ─────────────────────
+    // What: Reconcile accepted Watch audio jobs by fetching Gateway history later.
+    // Why:  Any Watch/iPhone wake should recover final replies without relying on the original WSS staying alive.
+    // Date: 2026-06-07
+    // Related: [AT-0045] AppModel.PendingAudioJob, [AT-0044] GatewayJobClient.submitAudioAttachment
+    // ─────────────────────────────────────────────────────
+    func resumePendingAudioJobs(reason: String) async {
+        guard isPaired else {
+            AppLog.info("Pending audio resume skipped reason=\(reason): not paired")
+            return
+        }
+        guard !pendingAudioJobs.isEmpty else {
+            AppLog.info("Pending audio resume skipped reason=\(reason): no pending jobs")
+            return
+        }
+        AppLog.info("Pending audio resume started reason=\(reason) count=\(pendingAudioJobs.count)")
+
+        for pending in pendingAudioJobs {
+            if let index = pendingAudioJobs.firstIndex(where: { $0.watchJobId == pending.watchJobId }) {
+                pendingAudioJobs[index].lastCheckedAt = Date()
+                savePendingAudioJobs()
+            }
+
+            do {
+                let reply = try await jobClient.latestAssistantReplyAfterBaseline(
+                    sessionKey: pending.sessionKey,
+                    baselineAssistantCount: pending.historyBaselineAssistantCount
+                )
+                guard let reply, !reply.isEmpty else {
+                    ensureProcessingJobExists(for: pending)
+                    continue
+                }
+                finishPendingAudioJob(pending, reply: reply)
+            } catch {
+                AppLog.error("Pending audio resume failed jobId=\(pending.watchJobId) sessionKey=\(pending.sessionKey): \(error.localizedDescription)")
+                ensureProcessingJobExists(for: pending)
+            }
+        }
+
+        AppLog.info("Pending audio resume finished reason=\(reason) remaining=\(pendingAudioJobs.count)")
+    }
+
+    private func ensureProcessingJobExists(for pending: PendingAudioJob) {
+        if let index = jobs.firstIndex(where: { $0.id == pending.watchJobId }) {
+            guard jobs[index].status == .sending || jobs[index].status == .running else { return }
+            jobs[index].status = .running
+            jobs[index].statusDetail = "Processing…"
+            syncWatch(job: jobs[index])
+            return
+        }
+        let job = VoiceJob(
+            id: pending.watchJobId,
+            status: .running,
+            statusDetail: "Processing…",
+            gatewayRunId: pending.chatSendId,
+            gatewaySessionKey: pending.sessionKey,
+            agentId: agentId(fromSessionKey: pending.sessionKey) ?? "main",
+            createdAt: pending.acceptedAt
+        )
+        jobs.insert(job, at: 0)
+        activeJobId = pending.watchJobId
+        syncWatch(job: job)
+    }
+
+    private func finishPendingAudioJob(_ pending: PendingAudioJob, reply: String) {
+        let completed = Date()
+        let updated: VoiceJob
+        if let index = jobs.firstIndex(where: { $0.id == pending.watchJobId }) {
+            jobs[index].status = .done
+            jobs[index].statusDetail = nil
+            jobs[index].resultText = reply
+            jobs[index].completedAt = completed
+            jobs[index].gatewayRunId = pending.chatSendId
+            jobs[index].gatewaySessionKey = pending.sessionKey
+            updated = jobs[index]
+        } else {
+            updated = VoiceJob(
+                id: pending.watchJobId,
+                status: .done,
+                resultText: reply,
+                gatewayRunId: pending.chatSendId,
+                gatewaySessionKey: pending.sessionKey,
+                agentId: agentId(fromSessionKey: pending.sessionKey) ?? "main",
+                createdAt: pending.acceptedAt,
+                completedAt: completed
+            )
+            jobs.insert(updated, at: 0)
+        }
+        if activeJobId == pending.watchJobId { activeJobId = nil }
+        pendingAudioJobs.removeAll { $0.watchJobId == pending.watchJobId }
+        savePendingAudioJobs()
+        syncWatch(job: updated)
+        FlowLog.started(step: 6, side: .iphone, flow: "server-response", detail: "jobId=\(pending.watchJobId) source=history")
+        FlowLog.function(step: 6, side: .iphone, flow: "server-response", name: "AppModel.resumePendingAudioJobs")
+        FlowLog.result(step: 6, side: .iphone, flow: "server-response", success: true, detail: "received=yes replyLength=\(reply.count)")
+        FlowLog.finished(step: 6, side: .iphone, flow: "server-response")
+        FlowLog.progress(step: 7, side: .iphone, flow: "display-reply", detail: "pushing reply to Watch jobId=\(pending.watchJobId) replyLength=\(reply.count)")
+        AppLog.info("Pending audio job finished jobId=\(pending.watchJobId) replyLength=\(reply.count)")
     }
 
     /// Sends a TYPED text message from the iPhone straight into a specific gateway session via chat.send.
@@ -926,24 +1287,34 @@ final class AppModel: ObservableObject {
         syncWatch(job: jobs[index])
     }
 
+    // ─── Ariadne's Thread [AT-0060] ─────────────────────
+    // What: Stop sending historical jobsSnapshot during per-job status updates.
+    // Why:  Watch active turns must receive only their current jobUpdated, not old done/failed jobs mixed into every push.
+    // Date: 2026-06-08
+    // Related: [AT-0025] AppModel.handleWatchAudioFile, [AT-0049] watch→WatchAppModel.upsert
+    // ─────────────────────────────────────────────────────
     private func syncWatch(job: VoiceJob? = nil, revokeGatewayPairing: Bool = false) {
+        if let job {
+            watchBridge.publish(job: job)
+            return
+        }
+        let activeJobs = jobs.filter { !$0.status.isTerminal && $0.status != .idle }
         watchBridge.publish(
             pairing: pairing,
-            jobs: jobs,
+            jobs: activeJobs,
             ttsEnabled: ttsEnabled,
             ttsLanguage: voiceLanguage,
             hapticType: hapticType.rawValue,
             ttsRate: ttsRate,
             revokeGatewayPairing: revokeGatewayPairing
         )
-        if let job { watchBridge.publish(job: job) }
     }
 
     /// Builds a progress sink for a run: every streamed step from the gateway becomes the job's live `statusDetail`
     /// and is pushed to the Watch so both screens show what OpenClaw is currently doing.
     private func makeProgressHandler(jobId: UUID) -> @Sendable (String) -> Void {
         { [weak self] step in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 guard let idx = self.jobs.firstIndex(where: { $0.id == jobId }) else { return }
                 guard self.jobs[idx].status == .running || self.jobs[idx].status == .sending else { return }

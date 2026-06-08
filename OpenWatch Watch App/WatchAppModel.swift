@@ -91,6 +91,8 @@ final class WatchAppModel: ObservableObject {
     /// Gateway sessionKeys whose replies are muted on the Watch (local, per-session). Not persisted/synced.
     @Published private var gatewayMutedKeys: Set<String> = []
     private var recordingJobId: UUID?
+    private var jobLastUpdateAt: [UUID: Date] = [:]
+    private var jobLastWatchdogSyncAt: [UUID: Date] = [:]
 
     // ─── Ariadne's Thread [AT-0002] ─────────────────────
     // What: UserDefaults cache of last connected gateway pairing on the Watch.
@@ -189,8 +191,10 @@ final class WatchAppModel: ObservableObject {
                 AppLog.info("Watch kept sticky cache despite phase=\(snapshot.phase.rawValue) (no revoke)")
                 return
             }
-            UserDefaults.standard.set(false, forKey: PairingLocalCache.wasConnectedKey)
-            AppLog.info("Watch cleared sticky pairing cache after explicit revoke phase=\(snapshot.phase.rawValue)")
+            UserDefaults.standard.removeObject(forKey: PairingLocalCache.wasConnectedKey)
+            UserDefaults.standard.removeObject(forKey: PairingLocalCache.gatewayURLKey)
+            UserDefaults.standard.removeObject(forKey: PairingLocalCache.deviceIdKey)
+            AppLog.info("Watch cleared sticky pairing cache and gateway identity after explicit revoke phase=\(snapshot.phase.rawValue)")
         case .connecting, .waitingForApproval:
             AppLog.info("Watch pairing intermediate phase=\(snapshot.phase.rawValue); sticky cache unchanged")
         }
@@ -209,6 +213,11 @@ final class WatchAppModel: ObservableObject {
         applyTtsLanguage(envelope.ttsLanguage)
         applyHapticType(envelope.hapticType)
         applyTtsRate(envelope.ttsRate)
+        WatchGatewayCredentialStore.save(
+            gatewayURL: envelope.pairing?.gatewayURL,
+            operatorToken: envelope.gatewayOperatorToken,
+            operatorScopes: envelope.gatewayOperatorScopes
+        )
     }
 
     // ─── Ariadne's Thread [AT-0030] ─────────────────────
@@ -224,6 +233,7 @@ final class WatchAppModel: ObservableObject {
         usage = nil
         gatewayAgents = []
         selectedAgentId = "main"
+        WatchGatewayCredentialStore.clear()
         sessions = [WatchSession(sessionKey: "agent:main:main")]
         currentIndex = 0
         horizontalIndex = 2
@@ -351,6 +361,18 @@ final class WatchAppModel: ObservableObject {
         bridge.sendCommand(WatchEnvelope(kind: .selectAgent, text: agentId))
     }
 
+    private func applySelectedAgentFromIPhone(_ agentId: String) {
+        let previous = selectedAgentId
+        selectedAgentId = agentId
+        guard !recorder.isRecording, sessions.allSatisfy(\.isEmpty) else {
+            AppLog.info("Watch selectedAgentId=\(agentId) from iPhone; kept live sessions previous=\(previous)")
+            return
+        }
+        sessions = [WatchSession(sessionKey: newSessionKey(for: agentId))]
+        currentIndex = 0
+        AppLog.info("Watch selectedAgentId=\(agentId) from iPhone; reset empty live session key=\(sessions[0].sessionKey) previous=\(previous)")
+    }
+
     private func mergeGatewaySessionDelta(_ incoming: [WatchGatewaySession]) {
         guard !incoming.isEmpty else { return }
         var byId = Dictionary(uniqueKeysWithValues: gatewaySessions.map { ($0.id, $0) })
@@ -385,7 +407,10 @@ final class WatchAppModel: ObservableObject {
                 for job in snapshot { upsert(job) }
             }
         case .jobUpdated:
-            if let job = envelope.job { upsert(job) }
+            if let job = envelope.job {
+                logStep6ServerResponse(job: job)
+                upsert(job)
+            }
         case .startListening:
             if let agentId = envelope.text?.trimmingCharacters(in: .whitespacesAndNewlines), !agentId.isEmpty {
                 selectedAgentId = agentId
@@ -415,9 +440,13 @@ final class WatchAppModel: ObservableObject {
                 AppLog.info("Watch received \(agents.count) gateway agents from iPhone")
             }
             if let selected = envelope.selectedAgentId, !selected.isEmpty {
-                selectedAgentId = selected
-                AppLog.info("Watch selectedAgentId=\(selected) from iPhone")
+                applySelectedAgentFromIPhone(selected)
             }
+        case .gatewayProbe:
+            WatchConnectivityWatchService.shared.applyGatewayProbe(
+                reachable: envelope.gatewayReachable == true,
+                detail: envelope.gatewayProbeDetail
+            )
         default:
             break
         }
@@ -535,6 +564,7 @@ final class WatchAppModel: ObservableObject {
     }
 
     private func beginRecording() async {
+        FlowLog.function(step: 3, side: .watch, flow: "audio-record", name: "WatchAppModel.beginRecording")
         AppLog.info("Watch beginRecording — requesting mic permission")
         let granted = await recorder.ensurePermission()
         guard granted else {
@@ -560,8 +590,14 @@ final class WatchAppModel: ObservableObject {
         do {
             try recorder.startRecording()
             playRecordHaptic()
-            let job = VoiceJob(status: .listening, statusDetail: "Listening…", agentId: sessionAgentId(from: session.sessionKey))
+            let job = VoiceJob(
+                status: .listening,
+                statusDetail: "Listening…",
+                gatewaySessionKey: session.sessionKey,
+                agentId: sessionAgentId(from: session.sessionKey)
+            )
             pendingJobIds.insert(job.id)
+            markJobUpdate(job.id, source: "record-start")
             if let gatewayKey {
                 jobGatewayKey[job.id] = gatewayKey
                 gatewayJobs[gatewayKey, default: []].insert(job, at: 0)
@@ -603,7 +639,8 @@ final class WatchAppModel: ObservableObject {
 
     private func finishRecordingAndSend() async {
         if recorder.isRecording {
-            finishFileRecording()
+            guard let savedAudio = finishFileRecording() else { return }
+            sendSavedAudioFileToIPhoneBot(savedAudio)
             return
         }
         statusHint = "Recording failed"
@@ -612,29 +649,153 @@ final class WatchAppModel: ObservableObject {
         objectWillChange.send()
     }
 
-    private func finishFileRecording() {
+    // ─── Ariadne's Thread [AT-0037] ─────────────────────
+    // What: Split Watch audio into a save stage and a separate iPhone/bot send stage.
+    // Why:  The system must not treat "recording stopped" and "file sent" as one operation.
+    // Date: 2026-06-07
+    // Related: [AT-0026] WatchAppModel beginFileRecording, [AT-0024] WatchConnectivityWatchService sendAudio
+    // ─────────────────────────────────────────────────────
+    private struct SavedWatchAudioFile {
+        let jobId: UUID
+        let fileURL: URL
+        let sessionKey: String
+        let bytes: Int
+    }
+
+    private func finishFileRecording() -> SavedWatchAudioFile? {
         guard let jobId = recordingJobId else {
             _ = recorder.stopRecording()
             AppLog.error("Watch file finishRecording: job id missing")
-            return
+            return nil
         }
         guard let fileURL = recorder.stopRecording() else {
+            FlowLog.started(step: 4, side: .watch, flow: "audio-save", detail: "jobId=\(jobId)")
+            FlowLog.result(step: 4, side: .watch, flow: "audio-save", success: false, detail: "recording file missing jobId=\(jobId)")
+            FlowLog.finished(step: 4, side: .watch, flow: "audio-save")
             updateDirectJob(jobId: jobId, status: .failed, errorMessage: "Recording file is missing.", statusDetail: nil, completedAt: Date())
             AppLog.error("Watch file finishRecording: recorder returned nil URL jobId=\(jobId)")
-            return
+            return nil
         }
+        let fileBytes = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.intValue ?? -1
+        FlowLog.started(step: 4, side: .watch, flow: "audio-save", detail: "jobId=\(jobId)")
+        FlowLog.function(step: 4, side: .watch, flow: "audio-save", name: "WatchAppModel.finishFileRecording")
+        FlowLog.progress(step: 4, side: .watch, flow: "audio-save", detail: "saved on Watch path=\(fileURL.path) bytes=\(fileBytes)")
+        FlowLog.result(step: 4, side: .watch, flow: "audio-save", success: fileBytes > 0, detail: "fileExists=\(FileManager.default.fileExists(atPath: fileURL.path)) bytes=\(fileBytes)")
+        FlowLog.finished(step: 4, side: .watch, flow: "audio-save")
         playRecordHaptic()
-        updateDirectJob(jobId: jobId, status: .sending, statusDetail: "Sending…")
         let sessionKey = gatewayRecordingKey
             ?? recordingSessionId.flatMap { sid in sessions.first(where: { $0.id == sid })?.sessionKey }
             ?? "agent:\(selectedAgentId):main"
-        bridge.sendAudio(fileURL: fileURL, jobId: jobId, sessionKey: sessionKey)
+        AppLog.info("Watch audio file saved jobId=\(jobId) sessionKey=\(sessionKey) file=\(fileURL.lastPathComponent) bytes=\(fileBytes)")
+        return SavedWatchAudioFile(jobId: jobId, fileURL: fileURL, sessionKey: sessionKey, bytes: fileBytes)
+    }
+
+    private func sendSavedAudioFileToIPhoneBot(_ savedAudio: SavedWatchAudioFile) {
+        updateDirectJob(jobId: savedAudio.jobId, status: .sending, statusDetail: "Sending…")
+        let queuedForIPhone = bridge.sendAudio(
+            fileURL: savedAudio.fileURL,
+            jobId: savedAudio.jobId,
+            sessionKey: savedAudio.sessionKey
+        )
+        if queuedForIPhone {
+            try? FileManager.default.removeItem(at: savedAudio.fileURL)
+            AppLog.info("Watch iPhone relay audio send requested jobId=\(savedAudio.jobId) sessionKey=\(savedAudio.sessionKey) file=\(savedAudio.fileURL.lastPathComponent) bytes=\(savedAudio.bytes)")
+        } else if WatchNetworkPathMonitor.shared.internetAvailable {
+            Task { await sendSavedAudioFileDirectToGateway(savedAudio) }
+            AppLog.info("Watch direct WSS fallback started jobId=\(savedAudio.jobId) sessionKey=\(savedAudio.sessionKey) file=\(savedAudio.fileURL.lastPathComponent) bytes=\(savedAudio.bytes)")
+        } else {
+            updateDirectJob(
+                jobId: savedAudio.jobId,
+                status: .failed,
+                errorMessage: "iPhone relay is unavailable and Watch has no direct internet.",
+                statusDetail: nil,
+                completedAt: Date()
+            )
+            try? FileManager.default.removeItem(at: savedAudio.fileURL)
+            AppLog.error("Watch audio send failed: relay queue unavailable and direct internet unavailable jobId=\(savedAudio.jobId)")
+        }
         recordingJobId = nil
         recordingSessionId = nil
         gatewayRecordingKey = nil
         statusHint = nil
         objectWillChange.send()
-        AppLog.info("Watch file recording stopped and transferred jobId=\(jobId) sessionKey=\(sessionKey) file=\(fileURL.lastPathComponent)")
+    }
+
+    private func sendSavedAudioFileDirectToGateway(_ savedAudio: SavedWatchAudioFile) async {
+        do {
+            let audioData = try Data(contentsOf: savedAudio.fileURL)
+            FlowLog.started(step: 5, side: .watch, flow: "audio-send-server", detail: "jobId=\(savedAudio.jobId) sessionKey=\(savedAudio.sessionKey) file=\(savedAudio.fileURL.lastPathComponent) bytes=\(audioData.count) path=direct-watch-wss")
+            FlowLog.function(step: 5, side: .watch, flow: "audio-send-server", name: "WatchGatewayDirectClient.runAudioAttachment")
+            let reply = try await WatchGatewayDirectClient.shared.runAudioAttachment(
+                audioData: audioData,
+                fileName: savedAudio.fileURL.lastPathComponent,
+                mimeType: "audio/mp4",
+                sessionKey: savedAudio.sessionKey,
+                idempotencyKey: savedAudio.jobId.uuidString,
+                onProgress: { detail in
+                    let jobId = savedAudio.jobId
+                    Task { @MainActor in
+                        FlowLog.progress(step: 5, side: .watch, flow: "audio-send-server", detail: "direct-wss jobId=\(savedAudio.jobId) \(detail)")
+                        WatchAppModel.shared.updateDirectJob(jobId: jobId, status: .sending, statusDetail: detail)
+                    }
+                }
+            )
+            updateDirectJob(jobId: savedAudio.jobId, status: .done, resultText: reply, statusDetail: nil, completedAt: Date())
+            FlowLog.result(step: 5, side: .watch, flow: "audio-send-server", success: true, detail: "direct WSS sent jobId=\(savedAudio.jobId)")
+            FlowLog.finished(step: 5, side: .watch, flow: "audio-send-server")
+            FlowLog.started(step: 6, side: .watch, flow: "server-response", detail: "jobId=\(savedAudio.jobId) status=done")
+            FlowLog.result(step: 6, side: .watch, flow: "server-response", success: true, detail: "received=yes replyLength=\(reply.count)")
+            FlowLog.finished(step: 6, side: .watch, flow: "server-response")
+            AppLog.info("Watch direct WSS audio reply done jobId=\(savedAudio.jobId) replyLength=\(reply.count)")
+        } catch {
+            updateDirectJob(jobId: savedAudio.jobId, status: .failed, errorMessage: error.localizedDescription, statusDetail: nil, completedAt: Date())
+            FlowLog.result(step: 5, side: .watch, flow: "audio-send-server", success: false, detail: "direct WSS failed jobId=\(savedAudio.jobId) error=\(error.localizedDescription)")
+            FlowLog.finished(step: 5, side: .watch, flow: "audio-send-server")
+            FlowLog.started(step: 6, side: .watch, flow: "server-response", detail: "jobId=\(savedAudio.jobId) status=failed")
+            FlowLog.result(step: 6, side: .watch, flow: "server-response", success: false, detail: "received=no error=\(error.localizedDescription)")
+            FlowLog.finished(step: 6, side: .watch, flow: "server-response")
+            AppLog.error("Watch direct WSS audio failed jobId=\(savedAudio.jobId): \(error.localizedDescription)")
+        }
+        try? FileManager.default.removeItem(at: savedAudio.fileURL)
+    }
+
+    func activeJobsForSync() -> [VoiceJob] {
+        let local = sessions.flatMap(\.jobs).filter { !$0.status.isTerminal && $0.status != .idle && $0.status != .listening }
+        let gateway = gatewayJobs.values.flatMap { $0 }.filter { !$0.status.isTerminal && $0.status != .idle && $0.status != .listening }
+        let all = local + gateway
+        var seen: Set<UUID> = []
+        return all.filter { job in
+            guard !seen.contains(job.id) else { return false }
+            seen.insert(job.id)
+            return job.gatewaySessionKey?.isEmpty == false
+        }
+    }
+
+    // ─── Ariadne's Thread [AT-0059] ─────────────────────
+    // What: Poll iPhone every 5 seconds for active async audio jobs, capped at 120 seconds.
+    // Why:  iPhone relay now creates a backend job and answers short Watch-driven status checks instead of holding WSS open.
+    // Date: 2026-06-08
+    // Related: [AT-0024] watch→WatchConnectivityWatchService.requestSync, [AT-0066] app→AppModel.handleWatchMessage
+    // ─────────────────────────────────────────────────────
+    func tickJobStatusWatchdog() {
+        let now = Date()
+        for job in activeJobsForSync() {
+            let age = now.timeIntervalSince(job.createdAt)
+            guard age >= 5 else { continue }
+            guard age <= 120 else {
+                AppLog.info("Watch job polling stopped after 120s jobId=\(job.id) status=\(job.status.rawValue) detail=\(job.statusDetail ?? "nil") serverJobId=\(job.gatewayRunId ?? "nil")")
+                continue
+            }
+            if let lastSync = jobLastWatchdogSyncAt[job.id], now.timeIntervalSince(lastSync) < 5 { continue }
+            jobLastWatchdogSyncAt[job.id] = now
+            AppLog.info("Watch job poll requestSync jobId=\(job.id) serverJobId=\(job.gatewayRunId ?? "nil") status=\(job.status.rawValue) detail=\(job.statusDetail ?? "nil") age=\(Int(age))s")
+            WatchConnectivityWatchService.shared.requestSync()
+        }
+    }
+
+    private func markJobUpdate(_ jobId: UUID, source: String) {
+        jobLastUpdateAt[jobId] = Date()
+        AppLog.info("Watch job update timestamp jobId=\(jobId) source=\(source)")
     }
 
     func cancelRecording() {
@@ -712,7 +873,7 @@ final class WatchAppModel: ObservableObject {
 
     private func finishGatewayRecordingAndSend() async {
         if recorder.isRecording {
-            finishFileRecording()
+            _ = finishFileRecording()
             return
         }
         statusHint = "Recording failed"
@@ -764,6 +925,9 @@ final class WatchAppModel: ObservableObject {
                 AppLog.error("Watch direct gateway update missed jobId=\(jobId) sessionKey=\(key)")
                 return nil
             }
+            guard shouldApplyJobStatus(current: arr[index].status, incoming: status, jobId: jobId, source: "direct-gateway") else {
+                return arr[index]
+            }
             arr[index].status = status
             if let transcript { arr[index].transcript = transcript }
             if let resultText { arr[index].resultText = resultText }
@@ -772,6 +936,7 @@ final class WatchAppModel: ObservableObject {
             if let completedAt { arr[index].completedAt = completedAt }
             gatewayJobs[key] = arr
             if status.isTerminal { pendingJobIds.remove(jobId) }
+            markJobUpdate(jobId, source: "direct-gateway")
             AppLog.info("Watch direct gateway job update jobId=\(jobId) status=\(status.rawValue) detail=\(statusDetail ?? "nil") transcriptLength=\(arr[index].transcript?.count ?? 0) replyLength=\(arr[index].resultText?.count ?? 0)")
             return arr[index]
         }
@@ -784,6 +949,9 @@ final class WatchAppModel: ObservableObject {
             AppLog.error("Watch direct local update missed jobId=\(jobId)")
             return nil
         }
+        guard shouldApplyJobStatus(current: sessions[si].jobs[ji].status, incoming: status, jobId: jobId, source: "direct-local") else {
+            return sessions[si].jobs[ji]
+        }
         sessions[si].jobs[ji].status = status
         if let transcript { sessions[si].jobs[ji].transcript = transcript }
         if let resultText { sessions[si].jobs[ji].resultText = resultText }
@@ -791,6 +959,7 @@ final class WatchAppModel: ObservableObject {
         sessions[si].jobs[ji].statusDetail = statusDetail
         if let completedAt { sessions[si].jobs[ji].completedAt = completedAt }
         if status.isTerminal { pendingJobIds.remove(jobId) }
+        markJobUpdate(jobId, source: "direct-local")
         AppLog.info("Watch direct local job update jobId=\(jobId) status=\(status.rawValue) detail=\(statusDetail ?? "nil") transcriptLength=\(sessions[si].jobs[ji].transcript?.count ?? 0) replyLength=\(sessions[si].jobs[ji].resultText?.count ?? 0)")
         return sessions[si].jobs[ji]
     }
@@ -799,11 +968,16 @@ final class WatchAppModel: ObservableObject {
     private func upsertGateway(_ job: VoiceJob, key: String) {
         var arr = gatewayJobs[key] ?? []
         if let ji = arr.firstIndex(where: { $0.id == job.id }) {
+            guard shouldApplyJobStatus(current: arr[ji].status, incoming: job.status, jobId: job.id, source: "gateway-snapshot") else {
+                return
+            }
             arr[ji] = job
         } else {
             arr.insert(job, at: 0)
         }
         gatewayJobs[key] = arr
+        markJobUpdate(job.id, source: "gateway-upsert")
+        AppLog.info("Watch gateway job update jobId=\(job.id) sessionKey=\(key) status=\(job.status.rawValue) detail=\(job.statusDetail ?? "nil") transcriptLength=\(job.transcript?.count ?? 0) replyLength=\(job.resultText?.count ?? 0) error=\(job.errorMessage ?? "nil")")
         if job.status.isTerminal { pendingJobIds.remove(job.id) }
 
         switch job.status {
@@ -815,10 +989,49 @@ final class WatchAppModel: ObservableObject {
         }
     }
 
+    // ─── Ariadne's Thread [AT-0049] ─────────────────────
+    // What: Restore gateway job-to-session mapping from iPhone job snapshots.
+    // Why:  Pending result reconciliation can finish after Watch relaunch, when in-memory jobGatewayKey is gone.
+    // Date: 2026-06-07
+    // Related: [AT-0048] shared→VoiceJob.gatewaySessionKey, [AT-0046] app→AppModel.resumePendingAudioJobs
+    // ─────────────────────────────────────────────────────
     private func upsert(_ job: VoiceJob) {
+        if let si = sessions.firstIndex(where: { $0.jobs.contains(where: { $0.id == job.id }) }) {
+            jobSession[job.id] = sessions[si].id
+            if let ji = sessions[si].jobs.firstIndex(where: { $0.id == job.id }) {
+                guard shouldApplyJobStatus(current: sessions[si].jobs[ji].status, incoming: job.status, jobId: job.id, source: "live-session-snapshot") else {
+                    return
+                }
+                sessions[si].jobs[ji] = job
+            } else {
+                sessions[si].jobs.insert(job, at: 0)
+            }
+            if job.status.isTerminal {
+                pendingJobIds.remove(job.id)
+            }
+            markJobUpdate(job.id, source: "live-upsert")
+            AppLog.info("Watch upsert: updated existing live session jobId=\(job.id) status=\(job.status.rawValue) detail=\(job.statusDetail ?? "nil")")
+            switch job.status {
+            case .done:
+                statusHint = nil
+                logStep7DisplayReply(job: job, sessionIndex: si)
+                speakOnce(job, muted: sessions[si].muted)
+            case .failed:
+                logStep7DisplayReply(job: job, sessionIndex: si)
+            case .cancelled, .sending, .running, .idle, .listening:
+                break
+            }
+            return
+        }
         // Turns started on a gateway-session page are tracked separately and never touch the local vertical sessions.
         if let key = jobGatewayKey[job.id] {
             upsertGateway(job, key: key)
+            return
+        }
+        if let key = job.gatewaySessionKey, !key.isEmpty {
+            jobGatewayKey[job.id] = key
+            upsertGateway(job, key: key)
+            AppLog.info("Watch upsert: attached iPhone job update to gateway session jobId=\(job.id) sessionKey=\(key)")
             return
         }
         // Resolve which local session this job belongs to. Primary source is the in-memory jobSession map, but that map
@@ -841,6 +1054,9 @@ final class WatchAppModel: ObservableObject {
             return
         }
         if let ji = sessions[si].jobs.firstIndex(where: { $0.id == job.id }) {
+            guard shouldApplyJobStatus(current: sessions[si].jobs[ji].status, incoming: job.status, jobId: job.id, source: "local-snapshot") else {
+                return
+            }
             sessions[si].jobs[ji] = job
         } else {
             sessions[si].jobs.insert(job, at: 0)
@@ -848,14 +1064,84 @@ final class WatchAppModel: ObservableObject {
         if job.status.isTerminal {
             pendingJobIds.remove(job.id)
         }
+        markJobUpdate(job.id, source: "local-upsert")
 
         switch job.status {
         case .done:
             statusHint = nil
+            logStep7DisplayReply(job: job, sessionIndex: si)
             speakOnce(job, muted: sessions[si].muted)
-        case .failed, .cancelled, .sending, .running, .idle, .listening:
+        case .failed:
+            logStep7DisplayReply(job: job, sessionIndex: si)
+        case .cancelled, .sending, .running, .idle, .listening:
             break
         }
+    }
+
+    // ─── Ariadne's Thread [AT-0055] ─────────────────────
+    // What: Reject stale Watch job status regressions.
+    // Why:  Older iPhone snapshots can arrive after newer jobUpdated messages and must not overwrite a completed result.
+    // Date: 2026-06-07
+    // Related: WatchAppModel.upsert, WatchAppModel.upsertGateway, WatchAppModel.applyDirectJobUpdate
+    // ─────────────────────────────────────────────────────
+    private func shouldApplyJobStatus(current: JobStatus, incoming: JobStatus, jobId: UUID, source: String) -> Bool {
+        if current == .done, incoming != .done {
+            AppLog.info("Watch ignored stale job status source=\(source) jobId=\(jobId) current=done incoming=\(incoming.rawValue)")
+            return false
+        }
+        if current.isTerminal, !incoming.isTerminal {
+            AppLog.info("Watch ignored non-terminal job status over terminal source=\(source) jobId=\(jobId) current=\(current.rawValue) incoming=\(incoming.rawValue)")
+            return false
+        }
+        return true
+    }
+
+    private func logStep6ServerResponse(job: VoiceJob) {
+        guard job.status.isTerminal else { return }
+        FlowLog.started(step: 6, side: .watch, flow: "server-response", detail: "jobId=\(job.id) status=\(job.status.rawValue)")
+        FlowLog.function(step: 6, side: .watch, flow: "server-response", name: "WatchAppModel.applyEnvelope.jobUpdated")
+        switch job.status {
+        case .done:
+            FlowLog.result(
+                step: 6,
+                side: .watch,
+                flow: "server-response",
+                success: true,
+                detail: "received=yes replyLength=\(job.resultText?.count ?? 0) transcriptLength=\(job.transcript?.count ?? 0)"
+            )
+        case .failed:
+            FlowLog.result(
+                step: 6,
+                side: .watch,
+                flow: "server-response",
+                success: false,
+                detail: "received=no error=\(job.errorMessage ?? "unknown") failureSource=\(job.failureSource ?? "nil") elapsedSinceSend=\(job.elapsedSinceSend ?? -1) elapsedSinceLastWSFrame=\(job.elapsedSinceLastWSFrame ?? -1) elapsedSinceWorking=\(job.elapsedSinceWorking ?? -1) runId=\(job.gatewayRunId ?? "nil") wsCloseCode=\(job.wsCloseCode ?? "nil") backendErrorCode=\(job.backendErrorCode ?? "nil")"
+            )
+        case .cancelled:
+            FlowLog.result(step: 6, side: .watch, flow: "server-response", success: false, detail: "received=no reason=cancelled")
+        default:
+            break
+        }
+        FlowLog.finished(step: 6, side: .watch, flow: "server-response")
+    }
+
+    // ─── Ariadne's Thread [AT-0062] ─────────────────────
+    // What: Treat failed jobs with non-empty reply text as displayable replies.
+    // Why:  A transport/parser failure should not hide a backend reply that was already recovered into the job.
+    // Date: 2026-06-08
+    // Related: [AT-0061] app→AppModel.recoverWatchAudioReplyFromHistory
+    // ─────────────────────────────────────────────────────
+    private func logStep7DisplayReply(job: VoiceJob, sessionIndex: Int) {
+        FlowLog.started(step: 7, side: .watch, flow: "display-reply", detail: "jobId=\(job.id) sessionIndex=\(sessionIndex)")
+        FlowLog.function(step: 7, side: .watch, flow: "display-reply", name: "WatchAppModel.upsert")
+        if let reply = job.resultText, !reply.isEmpty {
+            FlowLog.result(step: 7, side: .watch, flow: "display-reply", success: true, detail: "showing replyLength=\(reply.count)")
+        } else if job.status == .failed {
+            FlowLog.result(step: 7, side: .watch, flow: "display-reply", success: false, detail: "showing error=\(job.errorMessage ?? "unknown")")
+        } else {
+            FlowLog.result(step: 7, side: .watch, flow: "display-reply", success: false, detail: "nothing to display status=\(job.status.rawValue)")
+        }
+        FlowLog.finished(step: 7, side: .watch, flow: "display-reply")
     }
 
     /// Speaks the reply exactly once per job, letting it read to the end without restarting.

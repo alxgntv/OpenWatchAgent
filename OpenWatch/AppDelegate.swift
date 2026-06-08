@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         AppLog.info("AppDelegate didFinishLaunching — activating WatchConnectivity early")
+        KeychainStore.migrateExistingItemsForLockedAccess()
         _ = WatchConnectivityPhoneService.shared
         _ = AppModel.shared
         return true

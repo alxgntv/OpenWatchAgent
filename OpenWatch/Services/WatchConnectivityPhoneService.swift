@@ -20,6 +20,8 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
     private var cachedTtsLanguageForWatch: String?
     private var cachedHapticTypeForWatch: String?
     private var cachedTtsRateForWatch: Double?
+    private var cachedGatewayOperatorTokenForWatch: String?
+    private var cachedGatewayOperatorScopesForWatch: [String]?
     private var deliveredGatewaySessionSnapshots: [String: WatchGatewaySession] = [:]
     private var deliveredUsageSnapshot: WatchUsage?
     private var deliveredAgentsSnapshot: [WatchGatewayAgent] = []
@@ -33,6 +35,7 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
 
     override private init() {
         super.init()
+        _ = PhoneNetworkPathMonitor.shared
         if WCSession.isSupported() {
             session.delegate = self
             session.activate()
@@ -40,6 +43,30 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         }
     }
 
+    private func logStep2IPhoneConnect(reason: String) {
+        let sessionActivated = session.activationState == .activated
+        let watchReachable = session.isReachable
+        let caughtWatch = sessionActivated && watchReachable
+        let internet = PhoneNetworkPathMonitor.shared.internetAvailable
+        FlowLog.started(step: 2, side: .iphone, flow: "iphone-connect", detail: "reason=\(reason)")
+        FlowLog.function(step: 2, side: .iphone, flow: "iphone-connect", name: "WatchConnectivityPhoneService.logStep2IPhoneConnect")
+        FlowLog.progress(step: 2, side: .iphone, flow: "iphone-connect", detail: "caughtWatch=\(caughtWatch) watchReachable=\(watchReachable) wcSessionActivated=\(sessionActivated)")
+        FlowLog.result(
+            step: 2,
+            side: .iphone,
+            flow: "iphone-connect",
+            success: internet,
+            detail: "internetAvailable=\(internet) path=\(PhoneNetworkPathMonitor.shared.lastPathSummary)"
+        )
+        FlowLog.finished(step: 2, side: .iphone, flow: "iphone-connect")
+    }
+
+    // ─── Ariadne's Thread [AT-0032] ─────────────────────
+    // What: Queue explicit Watch pairing revoke snapshots through transferUserInfo.
+    // Why:  Disconnect must reach the Watch even when its app is suspended and cannot receive immediate messages.
+    // Date: 2026-06-07
+    // Related: [AT-0001] app→WatchConnectivityPhoneService enrichWatchEnvelope, [AT-0030] app→WatchAppModel clearSessionMessageAgentUsageDataAfterPairingRevoke
+    // ─────────────────────────────────────────────────────
     func publish(
         pairing: PairingSnapshot,
         jobs: [VoiceJob],
@@ -55,6 +82,8 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         cachedTtsLanguageForWatch = ttsLanguage
         cachedHapticTypeForWatch = hapticType
         cachedTtsRateForWatch = ttsRate
+        cachedGatewayOperatorTokenForWatch = KeychainStore.loadOperatorToken()
+        cachedGatewayOperatorScopesForWatch = KeychainStore.loadOperatorScopes()
         AppLog.info("Cached Watch pairing phase=\(outbound.phase.rawValue) haptic=\(hapticType) rate=\(ttsRate) revoke=\(revokeGatewayPairing) for context enrichment")
         guard session.activationState == .activated else {
             AppLog.info("WCSession not activated on iPhone; pairing cached but push deferred")
@@ -68,13 +97,26 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
             ttsLanguage: ttsLanguage,
             hapticType: hapticType,
             ttsRate: ttsRate,
-            revokeGatewayPairing: revokeGatewayPairing ? true : nil
+            revokeGatewayPairing: revokeGatewayPairing ? true : nil,
+            gatewayOperatorToken: revokeGatewayPairing ? nil : cachedGatewayOperatorTokenForWatch,
+            gatewayOperatorScopes: revokeGatewayPairing ? nil : cachedGatewayOperatorScopesForWatch
         )
         pushToWatch(envelope, preferImmediate: true)
+        if revokeGatewayPairing {
+            queueSnapshotToWatch(envelope, label: "pairingRevoke")
+        }
     }
 
     /// While Keychain still has gateway credentials, never push needsSetupCode/failed to the Watch (sticky pairing).
     private static func pairingForWatchOutbound(_ pairing: PairingSnapshot) -> PairingSnapshot {
+        if !KeychainStore.isPaired, pairing.phase == .connected {
+            AppLog.info("Normalized outbound Watch pairing connected -> needsSetupCode (gateway Keychain no longer paired)")
+            return PairingSnapshot(
+                phase: .needsSetupCode,
+                message: "Enter a new setup code.",
+                deviceId: pairing.deviceId
+            )
+        }
         guard KeychainStore.isPaired,
               pairing.phase != .connected,
               let url = KeychainStore.loadGatewayURL()?.absoluteString else {
@@ -237,7 +279,11 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
             usage: envelope.usage,
             gatewayAgents: envelope.gatewayAgents,
             selectedAgentId: envelope.selectedAgentId,
-            revokeGatewayPairing: envelope.revokeGatewayPairing
+            revokeGatewayPairing: envelope.revokeGatewayPairing,
+            gatewayReachable: envelope.gatewayReachable,
+            gatewayProbeDetail: envelope.gatewayProbeDetail,
+            gatewayOperatorToken: envelope.gatewayOperatorToken ?? cachedGatewayOperatorTokenForWatch,
+            gatewayOperatorScopes: envelope.gatewayOperatorScopes ?? cachedGatewayOperatorScopesForWatch
         )
         if enriched.pairing == nil, cachedPairingForWatch == nil {
             AppLog.info("Watch context enrich kind=\(envelope.kind.rawValue) has no cached pairing yet")
@@ -263,6 +309,37 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         }
     }
 
+    // ─── Ariadne's Thread [AT-0056] ─────────────────────
+    // What: Handle Watch-requested live and queued iPhone WSS relay probes.
+    // Why:  The Watch needs separate proof for sendMessage relay and locked-phone transferUserInfo relay.
+    // Date: 2026-06-07
+    // Related: [AT-0054] watch→WatchConnectivityWatchService.runIndependentWSSProbesIfNeeded, [AT-0055] app→AppModel.probeWSSForWatchRelay
+    // ─────────────────────────────────────────────────────
+    private func handleProbeWSSMessage(_ message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
+        guard message["type"] as? String == "probeWSS" else {
+            replyHandler(["ok": false, "route": "iphone-relay", "proof": "failed", "detail": "unsupported-message"])
+            return
+        }
+        let requestId = message["requestId"] as? String ?? UUID().uuidString
+        AppLog.info("IPHONE RELAY WSS sendMessage received requestId=\(requestId) url=\(message["url"] as? String ?? "nil")")
+        Task { @MainActor in
+            let reply = await AppModel.shared.probeWSSForWatchRelay(requestId: requestId, route: "iphone-relay")
+            replyHandler(reply)
+        }
+    }
+
+    private func handleProbeWSSUserInfo(_ userInfo: [String: Any]) {
+        guard userInfo["type"] as? String == "probeWSS" else { return }
+        let requestId = userInfo["requestId"] as? String ?? UUID().uuidString
+        AppLog.info("LOCKED IPHONE WSS transferUserInfo received requestId=\(requestId) url=\(userInfo["url"] as? String ?? "nil")")
+        Task { @MainActor in
+            var reply = await AppModel.shared.probeWSSForWatchRelay(requestId: requestId, route: "iphone-relay")
+            reply["type"] = "probeWSSResult"
+            self.session.transferUserInfo(reply)
+            AppLog.info("LOCKED IPHONE WSS result queued to Watch requestId=\(requestId) ok=\(reply["ok"] as? Bool ?? false) detail=\(reply["detail"] as? String ?? "nil")")
+        }
+    }
+
     private func deliverWatchCommand(_ data: Data, source: String) {
         AppLog.info("Delivering watch command source=\(source) bytes=\(data.count)")
         Task { @MainActor in
@@ -281,6 +358,7 @@ extension WatchConnectivityPhoneService: WCSessionDelegate {
             Task { @MainActor in
                 AppLog.info("WCSession activated state=\(activationState.rawValue)")
                 if activationState == .activated {
+                    WatchConnectivityPhoneService.shared.logStep2IPhoneConnect(reason: "wc-activated")
                     AppModel.shared.republishToWatch(reason: "phone-wc-activated")
                 }
             }
@@ -290,8 +368,10 @@ extension WatchConnectivityPhoneService: WCSessionDelegate {
     nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
         Task { @MainActor in
             AppLog.info("iPhone reachability changed reachable=\(session.isReachable)")
+            WatchConnectivityPhoneService.shared.logStep2IPhoneConnect(reason: "watch-reachability-changed")
             if session.isReachable {
                 AppModel.shared.republishToWatch(reason: "watch-reachable")
+                Task { await AppModel.shared.publishGatewayProbeToWatch(reason: "watch-reachable") }
             }
         }
     }
@@ -307,8 +387,18 @@ extension WatchConnectivityPhoneService: WCSessionDelegate {
         }
     }
 
+    nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
+        Task { @MainActor in
+            WatchConnectivityPhoneService.shared.handleProbeWSSMessage(message, replyHandler: replyHandler)
+        }
+    }
+
     nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
         Task { @MainActor in
+            if userInfo["type"] as? String == "probeWSS" {
+                WatchConnectivityPhoneService.shared.handleProbeWSSUserInfo(userInfo)
+                return
+            }
             guard let data = WatchConnectivityCodec.payloadData(from: userInfo) else { return }
             deliverWatchCommand(data, source: "transferUserInfo")
         }
@@ -326,17 +416,26 @@ extension WatchConnectivityPhoneService: WCSessionDelegate {
             try FileManager.default.copyItem(at: file.fileURL, to: copiedURL)
         } catch {
             Task { @MainActor in
+                FlowLog.result(step: 5, side: .iphone, flow: "audio-send-server", success: false, detail: "copy transferFile failed error=\(error.localizedDescription)")
+                FlowLog.finished(step: 5, side: .iphone, flow: "audio-send-server")
                 AppLog.error("Failed to copy Watch audio transferFile source=\(file.fileURL.lastPathComponent) target=\(copiedURL.lastPathComponent): \(error.localizedDescription)")
             }
             return
         }
         Task { @MainActor in
             guard let jobIdString, let jobId = UUID(uuidString: jobIdString) else {
+                FlowLog.result(step: 5, side: .iphone, flow: "audio-send-server", success: false, detail: "missing jobId in transferFile metadata file=\(file.fileURL.lastPathComponent)")
                 AppLog.error("Received Watch audio file without valid jobId metadata file=\(file.fileURL.lastPathComponent)")
                 try? FileManager.default.removeItem(at: copiedURL)
                 return
             }
             let targetSessionKey = (sessionKey?.isEmpty == false) ? sessionKey! : "agent:main:main"
+            let fileBytes = (try? FileManager.default.attributesOfItem(atPath: copiedURL.path)[.size] as? NSNumber)?.intValue ?? -1
+            FlowLog.started(step: 5, side: .iphone, flow: "audio-send-server", detail: "jobId=\(jobId) sessionKey=\(targetSessionKey) file=\(fileName) bytes=\(fileBytes)")
+            FlowLog.function(step: 5, side: .iphone, flow: "audio-send-server", name: "WatchConnectivityPhoneService.didReceiveFile")
+            FlowLog.progress(step: 5, side: .iphone, flow: "audio-send-server", detail: "received transferFile from Watch mimeType=\(mimeType) internetAvailable=\(PhoneNetworkPathMonitor.shared.internetAvailable)")
+            let jobLogId = String(jobId.uuidString.prefix(3))
+            AppLog.info("[IPHONE][JOB \(jobLogId)] file received jobId=\(jobId) sessionKey=\(targetSessionKey) file=\(fileName) bytes=\(fileBytes) mimeType=\(mimeType)")
             AppLog.info("Received Watch audio transferFile jobId=\(jobId) sessionKey=\(targetSessionKey) file=\(fileName) mimeType=\(mimeType)")
             BackgroundTaskService.begin("watchAudioFile")
             await AppModel.shared.handleWatchAudioFile(

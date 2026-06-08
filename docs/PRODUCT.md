@@ -69,7 +69,48 @@ Once paired, the user should **not** need OpenWatch in the foreground on iPhone.
 
 Watch UI still updates via `applicationContext` / `sendMessageData` when the system delivers them; job results persist on iPhone and sync when connectivity is available.
 
-**Corner case:** iOS limits background execution (~30s per wake). Long agent runs (minutes) may need gateway push/poll in a later version; v1 keeps job authority on iPhone and syncs `done` when the wake completes or on next open.
+### Pending-result reconcile architecture
+
+OpenWatch does **not** rely on keeping the iPhone app alive until a long OpenClaw run finishes. The iPhone only needs to submit the Watch audio to the user's Gateway, verify that the server accepted the work, persist the pending job, and then reconcile the result later whenever iOS/watchOS gives the app another foreground or background opportunity.
+
+```mermaid
+flowchart TD
+    WatchAudio["Watch records audio"] --> Handoff["Watch transferFile to iPhone"]
+    Handoff --> Submit["iPhone WSS chat.send audio"]
+    Submit --> Accepted["Server accepted job"]
+    Accepted --> SavePending["Save pending job on iPhone"]
+    SavePending --> Processing["Watch shows Processing"]
+    Processing --> Trigger["Any reconcile trigger"]
+    Trigger --> FetchHistory["iPhone fetches chat.history or session messages"]
+    FetchHistory --> MatchResult["Match by sessionKey, timestamp, chatSendId, idempotencyKey"]
+    MatchResult --> Done["Watch receives done or failed"]
+```
+
+Pending job fields:
+
+- `watchJobId`
+- `sessionKey`
+- `chatSendId`
+- `createdAt` / accepted timestamp
+- `idempotencyKey`
+- last known status / last retry timestamp
+
+Reconcile triggers:
+
+- Watch app open / return to main screen.
+- Speak button screen appear.
+- iPhone app foreground.
+- `WCSession` reachability change.
+- Periodic Watch foreground timer while pending jobs exist, every 5 seconds with a bounded retry count.
+- Watch complication / timeline refresh, as a best-effort supplemental trigger.
+- iPhone Background App Refresh, as a best-effort supplemental trigger; if iOS grants runtime and pending jobs exist, retry result fetch during the allowed window.
+- Local notification tap, as a user-driven fallback.
+
+Result authority:
+
+- The old live WSS is **not** the source of truth after `chat.send` is accepted.
+- Final results are restored from Gateway history/session messages.
+- Watch result delivery uses `sendMessageData` when reachable and `transferUserInfo` as the queued fallback.
 
 ---
 
@@ -108,8 +149,8 @@ Each voice command creates one **Job** (persisted on iPhone, mirrored to Watch).
 
 ## Long-running work
 
-- Jobs may run minutes. **Job state authority = iPhone** (polling or SSE); Watch subscribes via `WCSession`.
-- If Watch app suspends, user still gets result when reopening job list (sync from iPhone).
+- Jobs may run minutes. **Job state authority = iPhone pending-job store + Gateway history**, not a single live WSS wait.
+- If Watch app suspends, user gets the result when any reconcile trigger runs and the iPhone fetches pending results.
 - Optional: haptic on Watch when job transitions to `done` / `failed`.
 
 ---

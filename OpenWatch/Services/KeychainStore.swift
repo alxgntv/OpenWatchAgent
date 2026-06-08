@@ -19,6 +19,11 @@ nonisolated enum KeychainStore {
         AppLog.info("Saved gateway session to Keychain")
     }
 
+    static func saveGatewayURLForLockedAccess(_ url: URL) {
+        save(key: "gatewayURL", value: url.absoluteString)
+        AppLog.info("Saved gateway URL to Keychain for locked access")
+    }
+
     static func loadGatewayURL() -> URL? {
         guard let raw = load(key: "gatewayURL") else { return nil }
         return URL(string: raw)
@@ -56,8 +61,29 @@ nonisolated enum KeychainStore {
         AppLog.info("Cleared gateway Keychain session")
     }
 
+    // ─── Ariadne's Thread [AT-0039] ─────────────────────
+    // What: Treat the iPhone as paired only when it has gateway URL + operator token.
+    // Why:  WSS chat/probe uses the operator token; some hello-ok payloads do not persist a deviceToken.
+    // Date: 2026-06-07
+    // Related: [AT-0038] AppModel.publishGatewayProbeToWatch, GatewayJobClient.openOperatorSocket
+    // ─────────────────────────────────────────────────────
     static var isPaired: Bool {
-        loadGatewayURL() != nil && loadDeviceToken() != nil
+        loadGatewayURL() != nil && loadOperatorToken() != nil
+    }
+
+    // ─── Ariadne's Thread [AT-0043] ─────────────────────
+    // What: Re-save existing gateway credentials with AfterFirstUnlock accessibility.
+    // Why:  Locked/background WatchConnectivity wake must read operatorToken to open the iPhone WSS tunnel.
+    // Date: 2026-06-07
+    // Related: GatewayJobClient.openOperatorSocket, WatchConnectivityPhoneService.didReceiveUserInfo
+    // ─────────────────────────────────────────────────────
+    static func migrateExistingItemsForLockedAccess() {
+        let keys = ["gatewayURL", "deviceToken", "bootstrapToken", "operatorToken", "operatorScopes"]
+        for key in keys {
+            guard let value = load(key: key) else { continue }
+            save(key: key, value: value)
+            AppLog.info("Migrated Keychain item for locked access key=\(key)")
+        }
     }
 
     private static func save(key: String, value: String) {
@@ -67,6 +93,7 @@ nonisolated enum KeychainStore {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             kSecValueData as String: data,
         ]
         SecItemAdd(query as CFDictionary, nil)

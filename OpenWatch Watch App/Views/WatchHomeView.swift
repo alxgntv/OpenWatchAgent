@@ -15,6 +15,7 @@ private func watchCompactStamp(_ date: Date) -> String {
 /// One vertical page == one chat session. Swiping (up/down + Digital Crown) to the trailing empty page starts a new session.
 struct WatchSessionPage: View {
     @ObservedObject var model: WatchAppModel
+    @ObservedObject private var connectivity = WatchConnectivityWatchService.shared
     let session: WatchSession
     let index: Int
 
@@ -27,13 +28,15 @@ struct WatchSessionPage: View {
         return !blocked.contains(hint)
     }
 
+    // ─── Ariadne's Thread [AT-0034] ─────────────────────
+    // What: Hide navigation bar title on Watch main (live) screen.
+    // Why:  Title and top badge wasted vertical space; content should start at the top.
+    // Date: 2026-06-07
+    // Related: [AT-0002] WatchAppModel horizontalIndex main screen
+    // ─────────────────────────────────────────────────────
     var body: some View {
         ScrollView {
             VStack(spacing: 8) {
-                // watchOS truncates navigationTitle to "New" — show full agent label in-content on the main live page.
-                if session.isEmpty {
-                    newSessionAgentBadge
-                }
                 speakButton
                 muteButton
                 // Only pairing / permission / mic errors — send & record progress live inside the Speak button.
@@ -48,33 +51,21 @@ struct WatchSessionPage: View {
             .padding(.horizontal, 4)
             .frame(maxWidth: .infinity)
         }
-        .navigationTitle(navigationBarTitle)
-    }
-
-    /// Top badge on the Watch main (live) screen for an empty session (compact — ~half prior size).
-    private var newSessionAgentBadge: some View {
-        HStack(spacing: 3) {
-            Text(model.selectedAgentEmojiSymbol())
-                .font(.system(size: 11))
-            Text("New Session · \(model.selectedAgentTitleName())")
-                .font(.system(size: 9, weight: .semibold))
-                .multilineTextAlignment(.leading)
-                .lineLimit(2)
-                .minimumScaleFactor(0.7)
+        .toolbar(.hidden, for: .navigationBar)
+        .onAppear {
+            guard index == model.currentIndex, model.horizontalIndex == 2 else { return }
+            FlowLog.function(step: 1, side: .watch, flow: "main-screen", name: "WatchSessionPage.onAppear")
+            FlowLog.finished(step: 1, side: .watch, flow: "main-screen", detail: "sessionIndex=\(index)")
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 1)
-    }
-
-    /// System nav bar: empty on new session (custom badge above); dated stamp when history exists.
-    private var navigationBarTitle: String {
-        guard let latest = session.latestJob else { return "" }
-        return "Session \(index) · \(watchCompactStamp(latest.createdAt))"
     }
 
     /// Recording is global (one recorder) and always belongs to the visible session, so it only shows on the current page.
     private var isRecordingHere: Bool {
         model.isRecording && index == model.currentIndex
+    }
+
+    private var isWaitingForIPhoneInternet: Bool {
+        !connectivity.hasIPhoneInternetBridge && !isRecordingHere && session.activeJob == nil
     }
 
     @ViewBuilder
@@ -124,6 +115,9 @@ struct WatchSessionPage: View {
                     Text(job.statusDetail ?? "Working…")
                         .font(.caption2)
                         .multilineTextAlignment(.center)
+                } else if isWaitingForIPhoneInternet {
+                    Image(systemName: "wifi.slash").font(.title2)
+                    Text("Waiting Interent").font(.caption2)
                 } else {
                     Image(systemName: "mic.fill").font(.title2)
                     Text("Speak").font(.caption2)
@@ -131,8 +125,8 @@ struct WatchSessionPage: View {
             }
         }
         .buttonStyle(.borderedProminent)
-        .tint(isRecordingHere ? .red : .blue)
-        .disabled(session.activeJob != nil && !isRecordingHere)
+        .tint(isRecordingHere ? .red : (isWaitingForIPhoneInternet ? .gray : .blue))
+        .disabled((session.activeJob != nil && !isRecordingHere) || isWaitingForIPhoneInternet)
     }
 
     /// Per-session voice mute — hidden when iPhone has disabled "Speak replies on Watch".
@@ -158,10 +152,14 @@ struct WatchSessionPage: View {
 /// talking into THIS session via Speak. Live turns started here are tracked locally so they appear immediately.
 struct GatewaySessionPage: View {
     @ObservedObject var model: WatchAppModel
+    @ObservedObject private var connectivity = WatchConnectivityWatchService.shared
     let session: WatchGatewaySession
 
     private var activeJob: VoiceJob? { model.gatewayActiveJob(for: session.id) }
     private var isRecordingHere: Bool { model.isRecordingGateway(session.id) }
+    private var isWaitingForIPhoneInternet: Bool {
+        !connectivity.hasIPhoneInternetBridge && !isRecordingHere && activeJob == nil
+    }
 
     var body: some View {
         ScrollView {
@@ -216,6 +214,9 @@ struct GatewaySessionPage: View {
                     Text(job.statusDetail ?? "Working…")
                         .font(.caption2)
                         .multilineTextAlignment(.center)
+                } else if isWaitingForIPhoneInternet {
+                    Image(systemName: "wifi.slash").font(.title2)
+                    Text("Waiting Interent").font(.caption2)
                 } else {
                     Image(systemName: "mic.fill").font(.title2)
                     Text("Speak").font(.caption2)
@@ -223,8 +224,8 @@ struct GatewaySessionPage: View {
             }
         }
         .buttonStyle(.borderedProminent)
-        .tint(isRecordingHere ? .red : .blue)
-        .disabled(activeJob != nil && !isRecordingHere)
+        .tint(isRecordingHere ? .red : (isWaitingForIPhoneInternet ? .gray : .blue))
+        .disabled((activeJob != nil && !isRecordingHere) || isWaitingForIPhoneInternet)
     }
 
     @ViewBuilder

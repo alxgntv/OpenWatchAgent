@@ -1,13 +1,23 @@
 import Foundation
 
+struct GatewayJobDiagnostics: Sendable, Equatable {
+    let failureSource: String
+    let elapsedSinceSend: Double?
+    let elapsedSinceLastWSFrame: Double?
+    let elapsedSinceWorking: Double?
+    let runId: String?
+    let wsCloseCode: String?
+    let backendErrorCode: String?
+}
+
 enum GatewayJobError: LocalizedError {
     case notPaired
     case missingOperatorToken
     case invalidWebSocketURL
     case challengeTimeout
     case connectFailed(String)
-    case runFailed(String)
-    case timedOut
+    case runFailed(String, GatewayJobDiagnostics? = nil)
+    case timedOut(GatewayJobDiagnostics? = nil)
 
     var errorDescription: String? {
         switch self {
@@ -21,11 +31,25 @@ enum GatewayJobError: LocalizedError {
             return "Gateway did not send a connect challenge."
         case .connectFailed(let reason):
             return "Gateway connect failed: \(reason)"
-        case .runFailed(let reason):
+        case .runFailed(let reason, _):
             return "Agent run failed: \(reason)"
         case .timedOut:
             return "Agent did not respond in time."
         }
+    }
+
+    var diagnostics: GatewayJobDiagnostics? {
+        switch self {
+        case .runFailed(_, let diagnostics), .timedOut(let diagnostics):
+            return diagnostics
+        case .notPaired, .missingOperatorToken, .invalidWebSocketURL, .challengeTimeout, .connectFailed:
+            return nil
+        }
+    }
+
+    var isTimedOut: Bool {
+        if case .timedOut = self { return true }
+        return false
     }
 }
 
@@ -75,8 +99,15 @@ struct ChatHistoryMessage: Identifiable, Sendable, Equatable {
     let id: String
     let role: String            // "user" / "assistant" / …
     let text: String
+    let createdAt: Date?
 
-    var isUser: Bool { role.lowercased() == "user" }
+    nonisolated var isUser: Bool { role.lowercased() == "user" }
+}
+
+struct SubmittedAudioJob: Sendable, Equatable {
+    let chatSendId: String
+    let acceptedAt: Date
+    let historyBaselineAssistantCount: Int
 }
 
 actor GatewayJobClient {
@@ -140,8 +171,11 @@ actor GatewayJobClient {
         mimeType: String,
         sessionKey: String,
         idempotencyKey: String,
+        jobId: UUID? = nil,
         onProgress: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws -> String {
+        let jobLogId = iphoneJobLogId(jobId: jobId, fallback: idempotencyKey)
+        await FlowLog.progress(step: 5, side: .iphone, flow: "audio-send-server", detail: "opening gateway websocket sessionKey=\(sessionKey) bytes=\(audioData.count) fileName=\(fileName) mimeType=\(mimeType)")
         AppLog.info("Submitting Watch audio attachment via chat.send sessionKey=\(sessionKey) bytes=\(audioData.count) fileName=\(fileName) mimeType=\(mimeType)")
         let task = try await openOperatorSocket()
         defer {
@@ -149,6 +183,53 @@ actor GatewayJobClient {
         }
 
         try await sendSessionMessagesSubscribe(on: task, sessionKey: sessionKey)
+
+        let chatSendId = UUID().uuidString
+        let sendStartedAt = Date()
+        try await sendChatSend(
+            on: task,
+            chatSendId: chatSendId,
+            sessionKey: sessionKey,
+            message: "",
+            idempotencyKey: idempotencyKey,
+            attachments: [[
+                "type": "audio",
+                "fileName": fileName,
+                "mimeType": mimeType,
+                "content": audioData.base64EncodedString(),
+            ]]
+        )
+        await FlowLog.progress(step: 5, side: .iphone, flow: "audio-send-server", detail: "chat.send audio dispatched sessionKey=\(sessionKey) id=\(chatSendId)")
+        AppLog.info("chat.send audio attachment dispatched sessionKey=\(sessionKey) id=\(chatSendId)")
+        onProgress("Sent audio. Transcribing…")
+
+        let reply = try await waitForReply(on: task, sessionKey: sessionKey, chatSendId: chatSendId, jobLogId: jobLogId, sendStartedAt: sendStartedAt, onProgress: onProgress)
+        await FlowLog.progress(step: 6, side: .iphone, flow: "server-response", detail: "gateway reply received length=\(reply.count) sessionKey=\(sessionKey)")
+        AppLog.info("chat.send audio attachment reply received length=\(reply.count)")
+        return reply
+    }
+
+    // ─── Ariadne's Thread [AT-0044] ─────────────────────
+    // What: Submit Watch audio only until the gateway accepts chat.send, without waiting for the final assistant reply.
+    // Why:  Locked/background iPhone cannot be kept alive for long runs; final replies are reconciled later from history.
+    // Date: 2026-06-07
+    // Related: [AT-0025] app→AppModel.handleWatchAudioFile, [AT-0027] GatewayJobClient.runAudioAttachment
+    // ─────────────────────────────────────────────────────
+    func submitAudioAttachment(
+        audioData: Data,
+        fileName: String,
+        mimeType: String,
+        sessionKey: String,
+        idempotencyKey: String
+    ) async throws -> SubmittedAudioJob {
+        let baseline = (try? await fetchHistory(sessionKey: sessionKey).filter { !$0.isUser }.count) ?? 0
+        await FlowLog.progress(step: 5, side: .iphone, flow: "audio-send-server", detail: "opening gateway websocket for accepted-only submit sessionKey=\(sessionKey) bytes=\(audioData.count) fileName=\(fileName) baselineAssistantCount=\(baseline)")
+        AppLog.info("Submitting Watch audio until accepted sessionKey=\(sessionKey) bytes=\(audioData.count) baselineAssistantCount=\(baseline)")
+
+        let task = try await openOperatorSocket()
+        defer {
+            task.cancel(with: .goingAway, reason: nil)
+        }
 
         let chatSendId = UUID().uuidString
         try await sendChatSend(
@@ -164,12 +245,37 @@ actor GatewayJobClient {
                 "content": audioData.base64EncodedString(),
             ]]
         )
-        AppLog.info("chat.send audio attachment dispatched sessionKey=\(sessionKey) id=\(chatSendId)")
-        onProgress("Sent audio. Transcribing…")
+        try await waitForChatSendAccepted(on: task, chatSendId: chatSendId)
+        AppLog.info("chat.send audio accepted sessionKey=\(sessionKey) id=\(chatSendId)")
+        return SubmittedAudioJob(
+            chatSendId: chatSendId,
+            acceptedAt: Date(),
+            historyBaselineAssistantCount: baseline
+        )
+    }
 
-        let reply = try await waitForReply(on: task, sessionKey: sessionKey, chatSendId: chatSendId, onProgress: onProgress)
-        AppLog.info("chat.send audio attachment reply received length=\(reply.count)")
-        return reply
+    func latestAssistantReplyAfterBaseline(sessionKey: String, baselineAssistantCount: Int) async throws -> String? {
+        let messages = try await fetchHistory(sessionKey: sessionKey)
+        let assistantMessages = messages.filter { !$0.isUser }
+        guard assistantMessages.count > baselineAssistantCount else {
+            AppLog.info("No new assistant reply yet sessionKey=\(sessionKey) assistantCount=\(assistantMessages.count) baseline=\(baselineAssistantCount)")
+            return nil
+        }
+        let newMessages = assistantMessages.dropFirst(min(baselineAssistantCount, assistantMessages.count))
+        let reply = newMessages.map(\.text).joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return reply.isEmpty ? nil : reply
+    }
+
+    func probeGatewayHelloOk() async -> String {
+        do {
+            let task = try await openOperatorSocket()
+            task.cancel(with: .goingAway, reason: nil)
+            AppLog.info("Gateway probe succeeded: WSS connect.challenge -> connect -> hello-ok")
+            return "wss hello-ok"
+        } catch {
+            AppLog.error("Gateway probe failed: \(error.localizedDescription)")
+            return "error=\(error.localizedDescription)"
+        }
     }
 
     private func sendSessionMessagesSubscribe(on task: URLSessionWebSocketTask, sessionKey: String) async throws {
@@ -187,8 +293,8 @@ actor GatewayJobClient {
     /// Opens a WebSocket and completes the operator handshake (challenge → connect → hello-ok).
     /// The caller owns the returned task and must cancel it when done.
     private func openOperatorSocket() async throws -> URLSessionWebSocketTask {
-        guard KeychainStore.isPaired, let gatewayURL = KeychainStore.loadGatewayURL() else {
-            AppLog.error("openOperatorSocket blocked: not paired")
+        guard let gatewayURL = KeychainStore.loadGatewayURL() else {
+            AppLog.error("openOperatorSocket blocked: missing gateway URL")
             throw GatewayJobError.notPaired
         }
         guard let operatorToken = KeychainStore.loadOperatorToken() else {
@@ -286,15 +392,19 @@ actor GatewayJobClient {
         readSocket = nil
     }
 
-    /// Runs a read RPC on the warm socket; if the reused socket is stale/closed, reopens a fresh one and retries once.
+    /// Runs a read RPC on its own authenticated socket.
     private func readRPC(method: String, params: [String: Any]) async throws -> [String: Any] {
-        do {
-            return try await readRPCOnce(method: method, params: params, reuseExisting: true)
-        } catch {
-            AppLog.info("read RPC \(method) failed on warm socket (\(error.localizedDescription)); retrying fresh")
-            closeReadSocket()
-            return try await readRPCOnce(method: method, params: params, reuseExisting: false)
-        }
+        let task = try await openOperatorSocket()
+        defer { task.cancel(with: .goingAway, reason: nil) }
+        let reqId = UUID().uuidString
+        try await sendJSON([
+            "type": "req",
+            "id": reqId,
+            "method": method,
+            "params": params,
+        ], on: task)
+        AppLog.info("\(method) dispatched id=\(reqId) reused=false")
+        return try await awaitResult(on: task, id: reqId)
     }
 
     private func readRPCOnce(method: String, params: [String: Any], reuseExisting: Bool) async throws -> [String: Any] {
@@ -332,7 +442,7 @@ actor GatewayJobClient {
             }
             return (json["payload"] as? [String: Any]) ?? [:]
         }
-        throw GatewayJobError.timedOut
+        throw GatewayJobError.timedOut()
     }
 
     private func truncatedJSON(_ object: [String: Any]) -> String {
@@ -440,7 +550,8 @@ actor GatewayJobClient {
             let id = (row["id"] as? String) ?? (row["messageId"] as? String) ?? UUID().uuidString
             let role = (row["role"] as? String) ?? (row["author"] as? String) ?? "assistant"
             guard let text = historyText(from: row), !text.isEmpty else { return nil }
-            return ChatHistoryMessage(id: id, role: role, text: text)
+            let createdAt = parseDate(row["createdAt"]) ?? parseDate(row["timestamp"]) ?? parseDate(row["ts"]) ?? parseDate(row["time"])
+            return ChatHistoryMessage(id: id, role: role, text: text, createdAt: createdAt)
         }
     }
 
@@ -553,6 +664,24 @@ actor GatewayJobClient {
         try await sendJSON(chatFrame, on: task)
     }
 
+    private func waitForChatSendAccepted(on task: URLSessionWebSocketTask, chatSendId: String) async throws {
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { break }
+            let json = try await receiveJSON(on: task, timeoutSeconds: min(remaining, 15))
+            guard (json["type"] as? String) == "res", (json["id"] as? String) == chatSendId else { continue }
+            if (json["ok"] as? Bool) == false {
+                let error = json["error"] as? [String: Any]
+                let message = (error?["message"] as? String) ?? (error?["code"] as? String) ?? "chat.send rejected"
+                AppLog.error("chat.send audio rejected: \(message)")
+                throw GatewayJobError.runFailed(message)
+            }
+            return
+        }
+        throw GatewayJobError.timedOut()
+    }
+
     private func waitForHelloOk(on task: URLSessionWebSocketTask, connectId: String) async throws {
         let deadline = Date().addingTimeInterval(20)
         while Date() < deadline {
@@ -579,17 +708,38 @@ actor GatewayJobClient {
         on task: URLSessionWebSocketTask,
         sessionKey: String,
         chatSendId: String,
+        jobLogId: String? = nil,
+        sendStartedAt: Date = Date(),
         onProgress: @escaping @Sendable (String) -> Void
     ) async throws -> String {
         var latestText = ""
         var lastProgress = ""
         var sawAssistantDelta = false
+        var lastWSFrameAt: Date?
+        var workingAt: Date?
+        var runId: String?
 
         func emit(_ text: String) {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty, trimmed != lastProgress else { return }
             lastProgress = trimmed
+            if workingAt == nil, trimmed.localizedCaseInsensitiveContains("Working") {
+                workingAt = Date()
+            }
             onProgress(trimmed)
+        }
+
+        func diagnostics(source: String, backendErrorCode: String? = nil) -> GatewayJobDiagnostics {
+            let now = Date()
+            return GatewayJobDiagnostics(
+                failureSource: source,
+                elapsedSinceSend: now.timeIntervalSince(sendStartedAt),
+                elapsedSinceLastWSFrame: lastWSFrameAt.map { now.timeIntervalSince($0) },
+                elapsedSinceWorking: workingAt.map { now.timeIntervalSince($0) },
+                runId: runId,
+                wsCloseCode: String(describing: task.closeCode),
+                backendErrorCode: backendErrorCode
+            )
         }
 
         // No run cap: we wait as long as the agent keeps working. The only exit besides final/error is a dead socket,
@@ -599,24 +749,70 @@ actor GatewayJobClient {
             do {
                 json = try await receiveJSON(on: task, timeoutSeconds: stallTimeoutSeconds)
             } catch {
-                AppLog.error("Job WS stalled with no frames for \(stallTimeoutSeconds)s; connection lost")
-                throw GatewayJobError.timedOut
+                let source = ((error as? GatewayJobError)?.isTimedOut == true) ? "stallTimeout" : "wsReceiveError"
+                let failureDiagnostics = diagnostics(source: source, backendErrorCode: (error as? GatewayJobError)?.diagnostics?.backendErrorCode)
+                if let jobLogId {
+                    AppLog.error("[IPHONE][JOB \(jobLogId)] failed source=\(failureDiagnostics.failureSource) elapsedSinceSend=\(failureDiagnostics.elapsedSinceSend ?? -1) elapsedSinceLastWSFrame=\(failureDiagnostics.elapsedSinceLastWSFrame ?? -1) elapsedSinceWorking=\(failureDiagnostics.elapsedSinceWorking ?? -1) runId=\(failureDiagnostics.runId ?? "nil") wsCloseCode=\(failureDiagnostics.wsCloseCode ?? "nil") backendErrorCode=\(failureDiagnostics.backendErrorCode ?? "nil")")
+                }
+                AppLog.error("Job WS failed source=\(failureDiagnostics.failureSource) sessionKey=\(sessionKey) error=\(error.localizedDescription)")
+                if source == "stallTimeout" {
+                    throw GatewayJobError.timedOut(failureDiagnostics)
+                }
+                throw GatewayJobError.runFailed(error.localizedDescription, failureDiagnostics)
             }
+            lastWSFrameAt = Date()
 
             let type = json["type"] as? String
 
             // Diagnostic: log every frame so we can see exactly what OpenClaw streams (event names + payload shape).
-            AppLog.info("WSFRAME \(describeFrame(json))")
+            if let jobLogId {
+                AppLog.info("[IPHONE][JOB \(jobLogId)] ws frame received \(describeFrame(json, maxPayloadChars: 4000))")
+            } else {
+                AppLog.info("WSFRAME \(describeFrame(json))")
+            }
 
             if type == "res", (json["id"] as? String) == chatSendId, (json["ok"] as? Bool) == false {
                 let error = json["error"] as? [String: Any]
                 let message = (error?["message"] as? String) ?? (error?["code"] as? String) ?? "chat.send rejected"
+                let code = error?["code"] as? String
+                let failureDiagnostics = diagnostics(source: "chatSendRejected", backendErrorCode: code ?? message)
                 AppLog.error("chat.send rejected: \(message)")
-                throw GatewayJobError.runFailed(message)
+                throw GatewayJobError.runFailed(message, failureDiagnostics)
+            }
+
+            if type == "res", (json["id"] as? String) == chatSendId,
+               let payload = json["payload"] as? [String: Any],
+               let startedRunId = payload["runId"] as? String,
+               !startedRunId.isEmpty {
+                runId = startedRunId
+                if let jobLogId {
+                    AppLog.info("[IPHONE][JOB \(jobLogId)] backend send accepted runId=\(startedRunId) chatSendId=\(chatSendId)")
+                }
             }
 
             guard type == "event", let event = json["event"] as? String else { continue }
             let payload = json["payload"] as? [String: Any] ?? [:]
+
+            if event == "session.message",
+               eventSessionKey(payload) == nil || eventSessionKey(payload) == sessionKey,
+               let finalText = extractAssistantText(from: payload),
+               !finalText.isEmpty {
+                if let jobLogId {
+                    AppLog.info("[IPHONE][JOB \(jobLogId)] final reply parsed source=session.message length=\(finalText.count)")
+                }
+                AppLog.info("Resolved assistant reply from session.message length=\(finalText.count) sessionKey=\(sessionKey)")
+                return finalText
+            }
+
+            if event == "agent",
+               eventSessionKey(payload) == sessionKey,
+               isCompletedAgentMessage(payload) {
+                if let finalText = await latestAssistantTextFromHistory(sessionKey: sessionKey, jobLogId: jobLogId, source: "agentMessage.completed") {
+                    return finalText
+                }
+                AppLog.info("agentMessage completed without assistant text yet; continuing to wait sessionKey=\(sessionKey)")
+                continue
+            }
 
             // Live chain of what OpenClaw is doing for this session (operations, tools, transcript steps).
             if event == "session.operation" || event == "session.tool" || event == "session.message" || event == "agent" {
@@ -644,21 +840,71 @@ actor GatewayJobClient {
             case "final":
                 let finalText = extractAssistantText(from: payload) ?? latestText
                 guard !finalText.isEmpty else {
-                    throw GatewayJobError.runFailed("Agent returned an empty response.")
+                    if let historyText = await latestAssistantTextFromHistory(sessionKey: sessionKey, jobLogId: jobLogId, source: "chat.final.empty") {
+                        return historyText
+                    }
+                    AppLog.info("chat final frame had no assistant text; continuing to wait sessionKey=\(sessionKey)")
+                    continue
+                }
+                if let jobLogId {
+                    AppLog.info("[IPHONE][JOB \(jobLogId)] final reply parsed source=chat.final length=\(finalText.count)")
                 }
                 return finalText
             case "error":
                 let message = (payload["errorMessage"] as? String) ?? "Agent run failed."
+                let code = (payload["errorCode"] as? String) ?? (payload["code"] as? String)
+                let failureDiagnostics = diagnostics(source: "backendError", backendErrorCode: code ?? message)
                 AppLog.error("chat run error: \(message)")
-                throw GatewayJobError.runFailed(message)
+                throw GatewayJobError.runFailed(message, failureDiagnostics)
             default:
                 continue
             }
         }
     }
 
+    // ─── Ariadne's Thread [AT-0063] ─────────────────────
+    // What: Treat empty completion frames as non-terminal and recover text from chat.history before failing.
+    // Why:  OpenClaw can emit done/final frames before the assistant text is visible in that frame.
+    // Date: 2026-06-08
+    // Related: [AT-0027] GatewayJobClient.runAudioAttachment, [AT-0061] AppModel.recoverWatchAudioReplyFromHistory
+    // ─────────────────────────────────────────────────────
+    private func latestAssistantTextFromHistory(sessionKey: String, jobLogId: String?, source: String) async -> String? {
+        do {
+            let messages = try await fetchHistory(sessionKey: sessionKey)
+            guard let finalText = messages.last(where: { !$0.isUser })?.text.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !finalText.isEmpty else {
+                if let jobLogId {
+                    AppLog.info("[IPHONE][JOB \(jobLogId)] final reply not ready source=\(source) historyAssistantText=no")
+                }
+                return nil
+            }
+            if let jobLogId {
+                AppLog.info("[IPHONE][JOB \(jobLogId)] final reply parsed source=\(source).chat.history length=\(finalText.count)")
+            }
+            AppLog.info("Resolved assistant reply from chat.history source=\(source) length=\(finalText.count) sessionKey=\(sessionKey)")
+            return finalText
+        } catch {
+            if let jobLogId {
+                AppLog.error("[IPHONE][JOB \(jobLogId)] history recovery failed source=\(source) error=\(error.localizedDescription)")
+            }
+            AppLog.error("chat.history recovery failed source=\(source) sessionKey=\(sessionKey): \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    // ─── Ariadne's Thread [AT-0057] ─────────────────────
+    // What: Keep iPhone relay diagnostics tied to the originating Watch job id.
+    // Why:  Watch logs already prove file delivery; backend relay debugging needs searchable per-job iPhone logs.
+    // Date: 2026-06-07
+    // Related: [AT-0027] GatewayJobClient.runAudioAttachment, [AT-0025] app→AppModel.handleWatchAudioFile
+    // ─────────────────────────────────────────────────────
+    private func iphoneJobLogId(jobId: UUID?, fallback: String) -> String {
+        let raw = jobId?.uuidString ?? fallback
+        return String(raw.prefix(3))
+    }
+
     /// Compact one-line description of a frame for diagnostics: type, event/id, and a truncated JSON of the payload.
-    private func describeFrame(_ json: [String: Any]) -> String {
+    private func describeFrame(_ json: [String: Any], maxPayloadChars: Int = 600) -> String {
         let type = (json["type"] as? String) ?? "?"
         let event = (json["event"] as? String) ?? ""
         let id = (json["id"] as? String) ?? ""
@@ -666,7 +912,7 @@ actor GatewayJobClient {
         if let payload = json["payload"],
            let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
            let raw = String(data: data, encoding: .utf8) {
-            payloadString = raw.count > 600 ? String(raw.prefix(600)) + "…" : raw
+            payloadString = raw.count > maxPayloadChars ? String(raw.prefix(maxPayloadChars)) + "…" : raw
         }
         return "type=\(type) event=\(event) id=\(id) payload=\(payloadString)"
     }
@@ -675,6 +921,13 @@ actor GatewayJobClient {
         if let key = payload["sessionKey"] as? String { return key }
         if let session = payload["session"] as? [String: Any], let key = session["key"] as? String { return key }
         return nil
+    }
+
+    private func isCompletedAgentMessage(_ payload: [String: Any]) -> Bool {
+        guard let data = payload["data"] as? [String: Any] else { return false }
+        let type = (data["type"] as? String) ?? (data["kind"] as? String)
+        let phase = (data["phase"] as? String) ?? (data["status"] as? String)
+        return type == "agentMessage" && phase == "completed"
     }
 
     /// Builds a short, human-readable status line from a streamed session/agent event.
@@ -707,8 +960,16 @@ actor GatewayJobClient {
     }
 
     private func extractAssistantText(from payload: [String: Any]) -> String? {
-        guard let message = payload["message"] as? [String: Any],
-              let content = message["content"] as? [[String: Any]] else {
+        let source = (payload["message"] as? [String: Any]) ?? payload
+        let role = (source["role"] as? String) ?? (source["author"] as? String)
+        if let role, role.lowercased() != "assistant" { return nil }
+        if let text = source["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return text
+        }
+        if let contentText = source["content"] as? String, !contentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return contentText
+        }
+        guard let content = source["content"] as? [[String: Any]] else {
             return nil
         }
         let parts = content.compactMap { block -> String? in
@@ -769,7 +1030,7 @@ actor GatewayJobClient {
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
-                throw GatewayJobError.timedOut
+                throw GatewayJobError.timedOut()
             }
             let result = try await group.next()!
             group.cancelAll()

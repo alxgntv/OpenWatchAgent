@@ -20,6 +20,8 @@ nonisolated public enum WatchMessageKind: String, Codable, Sendable {
     case agents
     /// Watch → iPhone: user picked an agent on the Watch (`text` carries the agent id).
     case selectAgent
+    /// iPhone → Watch: authenticated gateway WSS probe result.
+    case gatewayProbe
 }
 
 /// Aggregate usage derived from the gateway's `sessions.list`, mirrored to the Watch's Usage page.
@@ -180,6 +182,14 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
     /// When true, the iPhone explicitly disconnected (Disconnect button). The Watch may clear its sticky pairing cache.
     /// Any other envelope must not unpair the Watch even if pairing.phase is needsSetupCode.
     public let revokeGatewayPairing: Bool?
+    /// iPhone proof that the gateway WSS endpoint completed connect.challenge -> connect -> hello-ok.
+    public let gatewayReachable: Bool?
+    /// Human-readable gateway probe proof/error detail for Watch logs and button gating.
+    public let gatewayProbeDetail: String?
+    /// iPhone → Watch: gateway operator token for direct Watch WSS. nil means unchanged.
+    public let gatewayOperatorToken: String?
+    /// iPhone → Watch: operator scopes for direct Watch WSS. nil means unchanged.
+    public let gatewayOperatorScopes: [String]?
     public init(
         kind: WatchMessageKind,
         jobId: UUID? = nil,
@@ -196,7 +206,11 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         usage: WatchUsage? = nil,
         gatewayAgents: [WatchGatewayAgent]? = nil,
         selectedAgentId: String? = nil,
-        revokeGatewayPairing: Bool? = nil
+        revokeGatewayPairing: Bool? = nil,
+        gatewayReachable: Bool? = nil,
+        gatewayProbeDetail: String? = nil,
+        gatewayOperatorToken: String? = nil,
+        gatewayOperatorScopes: [String]? = nil
     ) {
         self.kind = kind
         self.jobId = jobId
@@ -214,5 +228,9 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         self.gatewayAgents = gatewayAgents
         self.selectedAgentId = selectedAgentId
         self.revokeGatewayPairing = revokeGatewayPairing
+        self.gatewayReachable = gatewayReachable
+        self.gatewayProbeDetail = gatewayProbeDetail
+        self.gatewayOperatorToken = gatewayOperatorToken
+        self.gatewayOperatorScopes = gatewayOperatorScopes
     }
 }

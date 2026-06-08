@@ -1,7 +1,9 @@
+import Combine
 import SwiftUI
 
 struct ContentView: View {
     @StateObject private var model = WatchAppModel.shared
+    private let jobWatchdogTimer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationStack {
@@ -24,10 +26,16 @@ struct ContentView: View {
             }
         }
         .onAppear {
+            FlowLog.started(step: 1, side: .watch, flow: "main-screen")
+            FlowLog.function(step: 1, side: .watch, flow: "main-screen", name: "ContentView.onAppear")
             // Always open on the main (live) screen.
             model.horizontalIndex = 2
+            WatchConnectivityWatchService.shared.logStep2IPhoneConnect(reason: "app-launched")
             WatchConnectivityWatchService.shared.requestSync()
             AppLog.info("OpenWatch Watch app launched")
+        }
+        .onReceive(jobWatchdogTimer) { _ in
+            model.tickJobStatusWatchdog()
         }
     }
 
