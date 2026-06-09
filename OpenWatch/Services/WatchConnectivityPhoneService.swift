@@ -147,11 +147,45 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         AppLog.info("Queued job update to Watch via transferUserInfo jobId=\(job.id) status=\(job.status.rawValue) (background-safe)")
     }
 
-    /// Pushes the real gateway session index (with recent history) so the Watch can show horizontal session pages.
+    // ─── Ariadne's Thread [AT-0104] ─────────────────────
+    // What: Publish typed Watch deltas for agents, session index, and session messages.
+    // Why:  Watch UI needs rows and messages delivered as separate reducer events, not one gatewaySessions container.
+    // Date: 2026-06-08
+    // Related: [AT-0097] shared→WatchSessionIndexDelta, [AT-0099] watch→WatchAppModel.reduceTransportEnvelope
+    // ─────────────────────────────────────────────────────
+    func publishSessionIndexDelta(_ delta: WatchSessionIndexDelta, force: Bool = false) {
+        guard session.activationState == .activated else { return }
+        guard force || !delta.sessions.isEmpty else {
+            AppLog.info("Skipped Watch sessionIndexDelta: empty")
+            return
+        }
+        let envelope = WatchEnvelope(kind: .sessionIndexDelta, sessionIndexDelta: delta)
+        pushToWatch(envelope, preferImmediate: true)
+        AppLog.info("Pushed sessionIndexDelta to Watch rows=\(delta.sessions.count) selectedAgentId=\(delta.selectedAgentId ?? "nil")")
+    }
+
+    func publishSessionMessagesDelta(_ delta: WatchSessionMessagesDelta, force: Bool = false) {
+        guard session.activationState == .activated else { return }
+        guard force || !delta.messages.isEmpty else {
+            AppLog.info("Skipped Watch sessionMessagesDelta: empty sessionKey=\(delta.sessionKey)")
+            return
+        }
+        let envelope = WatchEnvelope(kind: .sessionMessagesDelta, sessionMessagesDelta: delta)
+        pushToWatch(envelope, preferImmediate: true)
+        AppLog.info("Pushed sessionMessagesDelta to Watch sessionKey=\(delta.sessionKey) messages=\(delta.messages.count)")
+    }
+
+    /// Legacy adapter: splits any gateway session container into typed session index and message deltas.
     func publishGatewaySessions(_ sessions: [WatchGatewaySession], replace: Bool = true, force: Bool = false) {
         guard session.activationState == .activated else { return }
         let sessionsToSend: [WatchGatewaySession]
-        if replace {
+        // ─── Ariadne's Thread [AT-0077] ─────────────────────
+        // What: Let forced gatewaySessions deltas bypass the delivered-session filter.
+        // Why:  A Watch screen request must receive message deltas even if the iPhone delivery cache thinks the session was already sent.
+        // Date: 2026-06-08
+        // Related: [AT-0074] app→AppModel.publishMissingGatewaySessionsToWatch
+        // ─────────────────────────────────────────────────────
+        if replace || force {
             sessionsToSend = sessions
         } else {
             sessionsToSend = sessions.filter { deliveredGatewaySessionSnapshots[$0.id] != $0 }
@@ -160,17 +194,32 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
             AppLog.info("Skipped Watch gatewaySessions snapshot: no changed or missing sessions")
             return
         }
-        let envelope = WatchEnvelope(kind: .gatewaySessions, gatewaySessions: sessionsToSend, replaceGatewaySessions: replace)
-        pushToWatch(envelope, preferImmediate: true)
-        queueSnapshotToWatch(envelope, label: "gatewaySessions")
+        let rows = sessionsToSend.map { WatchSessionRow(session: $0) }
+        publishSessionIndexDelta(WatchSessionIndexDelta(selectedAgentId: nil, sessions: rows), force: force || replace)
+        for item in sessionsToSend where !item.messages.isEmpty {
+            publishSessionMessagesDelta(
+                WatchSessionMessagesDelta(sessionKey: item.id, messages: item.messages),
+                force: force
+            )
+        }
+        // ─── Ariadne's Thread [AT-0090] ─────────────────────
+        // What: Keep gatewaySessions off transferUserInfo, including deltas.
+        // Why:  Queued session payloads can arrive during startup while Watch SwiftUI lists are mounted; sessions are requested only from the opened screen.
+        // Date: 2026-06-08
+        // Related: [AT-0086] WatchConnectivityPhoneService.pushToWatch, [AT-0072] watch→WatchConnectivityWatchService.didReceiveUserInfo
+        // ─────────────────────────────────────────────────────
+        AppLog.info("Skipped queued legacy gatewaySessions snapshot; typed Watch screen requests own sessions/messages")
         if replace {
-            deliveredGatewaySessionSnapshots = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
+            deliveredGatewaySessionSnapshots = [:]
+            for session in sessions {
+                deliveredGatewaySessionSnapshots[session.id] = session
+            }
         } else {
             for item in sessionsToSend {
                 deliveredGatewaySessionSnapshots[item.id] = item
             }
         }
-        AppLog.info("Pushed \(sessionsToSend.count) gateway sessions to Watch replace=\(replace) sourceCount=\(sessions.count)")
+        AppLog.info("Adapted \(sessionsToSend.count) gateway sessions to typed Watch deltas replace=\(replace) sourceCount=\(sessions.count)")
     }
 
     /// Pushes aggregate usage (session count, tokens, model) to the Watch's Usage page.
@@ -188,18 +237,27 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
     }
 
     /// Pushes configured gateway agents and the active selection to the Watch's Agents page.
-    func publishAgents(_ agents: [WatchGatewayAgent], selectedAgentId: String, force: Bool = false) {
+    func publishAgents(_ agents: [WatchGatewayAgent], selectedAgentId: String, force: Bool = false, fullSnapshot: Bool = false) {
         guard session.activationState == .activated else { return }
         guard force || deliveredAgentsSnapshot != agents || deliveredSelectedAgentId != selectedAgentId else {
             AppLog.info("Skipped Watch agents snapshot: unchanged")
             return
         }
-        let envelope = WatchEnvelope(kind: .agents, gatewayAgents: agents, selectedAgentId: selectedAgentId)
+        let envelope = WatchEnvelope(
+            kind: .agentIndexDelta,
+            agentIndexDelta: WatchAgentIndexDelta(agents: agents, selectedAgentId: selectedAgentId, isFullSnapshot: fullSnapshot ? true : nil)
+        )
         pushToWatch(envelope, preferImmediate: true)
-        queueSnapshotToWatch(envelope, label: "agents")
+        // ─── Ariadne's Thread [AT-0091] ─────────────────────
+        // What: Queue Watch agent deltas through transferUserInfo after switching to cache-first merge.
+        // Why:  Missing-agent and selected-agent replies must survive reachability gaps; Watch now merges by id instead of replacing the live list.
+        // Date: 2026-06-08
+        // Related: [AT-0085] watch→WatchAppModel.mergeGatewayAgentDelta, [AT-0089] app→AppModel.cacheWatchAgentsPayload
+        // ─────────────────────────────────────────────────────
+        queueSnapshotToWatch(envelope, label: "agentsDelta")
         deliveredAgentsSnapshot = agents
         deliveredSelectedAgentId = selectedAgentId
-        AppLog.info("Pushed \(agents.count) agents to Watch selectedAgentId=\(selectedAgentId)")
+        AppLog.info("Pushed agentIndexDelta to Watch agents=\(agents.count) selectedAgentId=\(selectedAgentId) fullSnapshot=\(fullSnapshot)")
     }
 
     func resetSessionMessageAgentUsageDeliveryCache() {
@@ -283,7 +341,14 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
             gatewayReachable: envelope.gatewayReachable,
             gatewayProbeDetail: envelope.gatewayProbeDetail,
             gatewayOperatorToken: envelope.gatewayOperatorToken ?? cachedGatewayOperatorTokenForWatch,
-            gatewayOperatorScopes: envelope.gatewayOperatorScopes ?? cachedGatewayOperatorScopesForWatch
+            gatewayOperatorScopes: envelope.gatewayOperatorScopes ?? cachedGatewayOperatorScopesForWatch,
+            agentIndexDelta: envelope.agentIndexDelta,
+            sessionIndexDelta: envelope.sessionIndexDelta,
+            sessionMessagesDelta: envelope.sessionMessagesDelta,
+            requestedSessionKey: envelope.requestedSessionKey,
+            knownGatewayAgentIds: envelope.knownGatewayAgentIds,
+            knownGatewaySessionIds: envelope.knownGatewaySessionIds,
+            knownGatewayMessageIdsBySession: envelope.knownGatewayMessageIdsBySession
         )
         if enriched.pairing == nil, cachedPairingForWatch == nil {
             AppLog.info("Watch context enrich kind=\(envelope.kind.rawValue) has no cached pairing yet")
@@ -295,15 +360,26 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
 
     private func pushToWatch(_ envelope: WatchEnvelope, preferImmediate: Bool) {
         let enriched = enrichWatchEnvelope(envelope)
-        guard let context = WatchConnectivityCodec.applicationContext(from: enriched) else { return }
-        do {
-            try session.updateApplicationContext(context)
-            AppLog.info("Pushed application context to Watch kind=\(enriched.kind.rawValue) pairingPhase=\(enriched.pairing?.phase.rawValue ?? "nil")")
-        } catch {
-            AppLog.error("applicationContext update failed: \(error.localizedDescription)")
+        guard let context = WatchConnectivityCodec.applicationContext(from: enriched),
+              let data = context[WatchConnectivityCodec.payloadKey] as? Data else { return }
+        // ─── Ariadne's Thread [AT-0086] ─────────────────────
+        // What: Exclude agents and gateway sessions from Watch applicationContext updates.
+        // Why:  These payloads are bound to Watch SwiftUI lists and must arrive as Watch-requested deltas, not full live replacements.
+        // Date: 2026-06-08
+        // Related: [AT-0085] watch→WatchAppModel.mergeGatewayAgentDelta, [AT-0075] watch→WatchAppModel.replaceGatewaySessionsPreservingMessages
+        // ─────────────────────────────────────────────────────
+        if enriched.kind == .gatewaySessions || enriched.kind == .agents || enriched.kind == .agentIndexDelta || enriched.kind == .sessionIndexDelta || enriched.kind == .sessionMessagesDelta {
+            AppLog.info("Skipped application context for \(enriched.kind.rawValue) bytes=\(data.count); using immediate missing-data delta sync only")
+        } else {
+            do {
+                try session.updateApplicationContext(context)
+                AppLog.info("Pushed application context to Watch kind=\(enriched.kind.rawValue) pairingPhase=\(enriched.pairing?.phase.rawValue ?? "nil")")
+            } catch {
+                AppLog.error("applicationContext update failed: \(error.localizedDescription)")
+            }
         }
 
-        guard preferImmediate, session.isReachable, let data = context[WatchConnectivityCodec.payloadKey] as? Data else { return }
+        guard preferImmediate, session.isReachable else { return }
         session.sendMessageData(data, replyHandler: nil) { error in
             AppLog.error("WCSession send to Watch failed: \(error.localizedDescription)")
         }

@@ -9,11 +9,13 @@ OpenWatch uses an async iPhone relay flow for Watch voice requests when the iPho
 3. The iPhone receives the file and submits it to the backend.
 4. The backend accepts the audio job and returns a `serverJobId`.
 5. The iPhone sends the Watch a `jobUpdated` message with `status=running`, `statusDetail=Processing...`, and `gatewayRunId=serverJobId`.
-6. The Watch stores the active job and polls the iPhone every 5 seconds for up to 120 seconds.
+6. The Watch stores the active job and polls the iPhone every 5 seconds for up to 300 seconds.
 7. Each Watch poll uses `requestSync`; the iPhone performs a short backend status check instead of keeping one long WSS open.
 8. If the backend is still processing, the iPhone keeps the job in `Processing...`.
 9. If the backend is done, the iPhone sends `status=done` with the final reply to the Watch.
 10. The Watch displays the reply to the user.
+11. If 300 seconds is not enough, the Watch turns the Speak button into `Retry`.
+12. Pressing `Retry` sends a one-job `requestSync` to the iPhone for the same `jobId` / `serverJobId`.
 
 ## Rule
 
@@ -27,3 +29,4 @@ The iPhone does not hold a long-lived WSS connection while waiting for the agent
 - `running` + `Processing...`: backend accepted the job and is still working.
 - `done`: final reply is available and shown on Watch.
 - `failed`: submit or backend status check failed.
+- `failed` + `Retry`: automatic polling expired; the user can manually force another iPhone status check for the same job.

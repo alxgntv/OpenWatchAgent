@@ -11,6 +11,7 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
 
     private let session = WCSession.default
     private var pendingSyncAfterActivation = false
+    private var pendingAgentNavigationModelAfterActivation = false
     private var independentWSSProbeStarted = false
     private var pendingIPhoneRelayProbeRequestId: String?
 
@@ -193,6 +194,86 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
         }
     }
 
+    // ─── Ariadne's Thread [AT-0084] ─────────────────────
+    // What: Send Watch-known agent, session, and message ids with missing-data requests.
+    // Why:  iPhone must compute gateway deltas against the Watch cache instead of pushing full live lists.
+    // Date: 2026-06-08
+    // Related: [AT-0083] shared→WatchEnvelope.knownGatewayAgentIds, [AT-0069] WatchAppModel.requestMissingGatewaySessionsForSessionScreen
+    // ─────────────────────────────────────────────────────
+    // ─── Ariadne's Thread [AT-0100] ─────────────────────
+    // What: Send screen-driven typed Watch session index and message requests.
+    // Why:  The Watch reducer must receive session rows and session messages through separate payloads.
+    // Date: 2026-06-08
+    // Related: [AT-0099] WatchAppModel.reduceSessionsPageAppeared, [AT-0097] shared→WatchMessageKind
+    // ─────────────────────────────────────────────────────
+    func requestSessionIndexDelta(knownAgentIds: [String], knownSessionIds: [String], selectedAgentId: String) {
+        let envelope = WatchEnvelope(
+            kind: .requestSessionIndexDelta,
+            pairing: WatchAppModel.shared.pairing,
+            selectedAgentId: selectedAgentId,
+            knownGatewayAgentIds: knownAgentIds,
+            knownGatewaySessionIds: knownSessionIds
+        )
+        sendCommand(envelope)
+        AppLog.info("Watch requested sessionIndexDelta knownAgents=\(knownAgentIds.count) knownSessions=\(knownSessionIds.count) selectedAgentId=\(selectedAgentId)")
+    }
+
+    func requestAgentNavigationModel(knownAgentIds: [String]) {
+        guard session.activationState == .activated else {
+            pendingAgentNavigationModelAfterActivation = true
+            AppLog.info("Watch navigation model request deferred until WCSession activates knownAgents=\(knownAgentIds.count)")
+            return
+        }
+        pendingAgentNavigationModelAfterActivation = false
+        let envelope = WatchEnvelope(
+            kind: .requestAgentIndexDelta,
+            pairing: WatchAppModel.shared.pairing,
+            selectedAgentId: WatchAppModel.shared.selectedAgentIdForSync,
+            knownGatewayAgentIds: knownAgentIds
+        )
+        sendCommand(envelope)
+        AppLog.info("Watch requested agent navigation model knownAgents=\(knownAgentIds.count)")
+    }
+
+    func requestSessionMessagesDelta(
+        sessionKey: String,
+        knownAgentIds: [String],
+        knownSessionIds: [String],
+        knownMessageIds: [String],
+        selectedAgentId: String
+    ) {
+        let envelope = WatchEnvelope(
+            kind: .requestSessionMessagesDelta,
+            pairing: WatchAppModel.shared.pairing,
+            selectedAgentId: selectedAgentId,
+            requestedSessionKey: sessionKey,
+            knownGatewayAgentIds: knownAgentIds,
+            knownGatewaySessionIds: knownSessionIds,
+            knownGatewayMessageIdsBySession: [sessionKey: knownMessageIds]
+        )
+        sendCommand(envelope)
+        AppLog.info("Watch requested sessionMessagesDelta sessionKey=\(sessionKey) knownMessages=\(knownMessageIds.count) knownSessions=\(knownSessionIds.count) selectedAgentId=\(selectedAgentId)")
+    }
+
+    func requestMissingGatewaySessions(
+        knownAgentIds: [String],
+        knownIds: [String],
+        knownMessageIdsBySession: [String: [String]],
+        selectedAgentId: String
+    ) {
+        if let sessionKey = knownMessageIdsBySession.keys.first {
+            requestSessionMessagesDelta(
+                sessionKey: sessionKey,
+                knownAgentIds: knownAgentIds,
+                knownSessionIds: knownIds,
+                knownMessageIds: knownMessageIdsBySession[sessionKey] ?? [],
+                selectedAgentId: selectedAgentId
+            )
+        } else {
+            requestSessionIndexDelta(knownAgentIds: knownAgentIds, knownSessionIds: knownIds, selectedAgentId: selectedAgentId)
+        }
+    }
+
     // ─── Ariadne's Thread [AT-0024] ─────────────────────
     // What: Transfer a completed Watch audio file to the iPhone.
     // Why:  iPhone relay is the primary supported path for WSS/backend work; direct Watch WSS is only a fallback.
@@ -268,7 +349,9 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
         let envelope = WatchEnvelope(
             kind: .requestSync,
             pairing: WatchAppModel.shared.pairing,
-            jobs: activeJobs.isEmpty ? nil : activeJobs
+            jobs: activeJobs.isEmpty ? nil : activeJobs,
+            selectedAgentId: WatchAppModel.shared.selectedAgentIdForSync,
+            knownGatewayAgentIds: WatchAppModel.shared.knownGatewayAgentIdsForSync
         )
         guard let userInfo = WatchConnectivityCodec.userInfo(from: envelope) else {
             AppLog.error("Watch requestSync encode failed")
@@ -281,6 +364,33 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
                 Task { @MainActor in AppLog.error("Watch requestSync sendMessageData failed: \(error.localizedDescription); queued transferUserInfo already pending") }
             }
             AppLog.info("Sent requestSync to iPhone (immediate)")
+        }
+    }
+
+    // ─── Ariadne's Thread [AT-0068] ─────────────────────
+    // What: Send a one-job status poll to iPhone for Retry.
+    // Why:  After automatic polling expires, Retry must check the same serverJobId instead of starting a new recording.
+    // Date: 2026-06-08
+    // Related: [AT-0067] WatchAppModel.retryJob, [AT-0066] app→AppModel.handleWatchMessage
+    // ─────────────────────────────────────────────────────
+    func requestJobStatus(_ job: VoiceJob) {
+        guard session.activationState == .activated else {
+            pendingSyncAfterActivation = true
+            AppLog.info("Watch job status retry deferred until WCSession activates jobId=\(job.id)")
+            return
+        }
+        let envelope = WatchEnvelope(kind: .requestSync, jobId: job.id, pairing: WatchAppModel.shared.pairing, jobs: [job])
+        guard let userInfo = WatchConnectivityCodec.userInfo(from: envelope) else {
+            AppLog.error("Watch job status retry encode failed jobId=\(job.id)")
+            return
+        }
+        session.transferUserInfo(userInfo)
+        AppLog.info("Queued job status retry to iPhone jobId=\(job.id) serverJobId=\(job.gatewayRunId ?? "nil")")
+        if session.isReachable, let data = WatchConnectivityCodec.payloadData(from: userInfo) {
+            session.sendMessageData(data, replyHandler: nil) { error in
+                Task { @MainActor in AppLog.error("Watch job status retry sendMessageData failed jobId=\(job.id): \(error.localizedDescription); queued transferUserInfo already pending") }
+            }
+            AppLog.info("Sent job status retry to iPhone jobId=\(job.id) serverJobId=\(job.gatewayRunId ?? "nil")")
         }
     }
 
@@ -304,7 +414,7 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
             return
         }
         AppLog.info("Applying cached application context on Watch bytes=\(data.count)")
-        WatchAppModel.shared.applyEnvelope(data)
+        enqueueTransportPayload(data, source: "applicationContext-cold-start")
     }
 
     private static func applicationContextContainsPairingRevoke(_ data: Data) -> Bool {
@@ -319,6 +429,19 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
 
     fileprivate func applyLatestApplicationContextOnActivation() {
         applyLatestApplicationContextIfNeeded()
+    }
+
+    private func enqueueTransportPayload(_ data: Data, source: String, ignoreLegacyGatewaySessions: Bool = false) {
+        guard let envelope = try? JSONDecoder().decode(WatchEnvelope.self, from: data) else {
+            AppLog.error("Watch failed to decode transport payload source=\(source) bytes=\(data.count)")
+            return
+        }
+        if ignoreLegacyGatewaySessions, envelope.kind == .gatewaySessions {
+            AppLog.info("Watch skipped queued legacy gatewaySessions source=\(source) bytes=\(data.count); typed screen requests will reload rows/messages")
+            return
+        }
+        AppLog.info("Watch decoded transport payload kind=\(envelope.kind.rawValue) source=\(source) bytes=\(data.count)")
+        WatchAppModel.shared.send(.transportEnvelope(envelope, source: source))
     }
 }
 
@@ -407,10 +530,13 @@ extension WatchConnectivityWatchService: WCSessionDelegate {
                 service.logConnectivitySnapshot(reason: "wc-activated")
                 if activationState == .activated {
                     service.applyLatestApplicationContextOnActivation()
+                    if service.pendingAgentNavigationModelAfterActivation {
+                        service.requestAgentNavigationModel(knownAgentIds: WatchAppModel.shared.knownGatewayAgentIdsForSync)
+                    }
                     if service.pendingSyncAfterActivation {
                         AppLog.info("Watch running deferred requestSync after activation")
+                        service.requestSync()
                     }
-                    service.requestSync()
                 }
             }
         }
@@ -423,7 +549,6 @@ extension WatchConnectivityWatchService: WCSessionDelegate {
             service.logConnectivitySnapshot(reason: "iphone-reachability-changed")
             if session.isReachable {
                 service.flushPendingIPhoneRelayProbeIfReachable()
-                service.requestSync()
             }
         }
     }
@@ -432,14 +557,14 @@ extension WatchConnectivityWatchService: WCSessionDelegate {
         Task { @MainActor in
             AppLog.info("Watch caught iPhone message (live link) bytes=\(messageData.count)")
             WatchConnectivityWatchService.shared.logConnectivitySnapshot(reason: "iphone-live-message")
-            WatchAppModel.shared.applyEnvelope(messageData)
+            WatchConnectivityWatchService.shared.enqueueTransportPayload(messageData, source: "sendMessageData")
         }
     }
 
     nonisolated func session(_ session: WCSession, didReceiveApplicationContext applicationContext: [String: Any]) {
         Task { @MainActor in
             guard let data = WatchConnectivityCodec.payloadData(from: applicationContext) else { return }
-            WatchAppModel.shared.applyEnvelope(data)
+            WatchConnectivityWatchService.shared.enqueueTransportPayload(data, source: "applicationContext")
         }
     }
 
@@ -455,7 +580,7 @@ extension WatchConnectivityWatchService: WCSessionDelegate {
             guard let data = WatchConnectivityCodec.payloadData(from: userInfo) else { return }
             AppLog.info("Watch caught iPhone message (queued transferUserInfo) bytes=\(data.count)")
             WatchConnectivityWatchService.shared.logConnectivitySnapshot(reason: "iphone-queued-message")
-            WatchAppModel.shared.applyEnvelope(data)
+            WatchConnectivityWatchService.shared.enqueueTransportPayload(data, source: "transferUserInfo", ignoreLegacyGatewaySessions: true)
         }
     }
 
@@ -776,8 +901,7 @@ actor WatchGatewayDirectClient {
             if event == "agent", eventSessionKey(payload) == sessionKey, isCompletedAgentMessage(payload) {
                 let messages = try await fetchHistory(sessionKey: sessionKey)
                 if let finalText = messages.last(where: { row in
-                    let role = (row["role"] as? String) ?? (row["author"] as? String)
-                    return role != "user"
+                    (row["role"] as? String) == "assistant" && historyText(from: row) != nil
                 }).flatMap({ historyText(from: $0) })?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !finalText.isEmpty {
                     return finalText
@@ -973,30 +1097,33 @@ actor WatchGatewayDirectClient {
         }
     }
 
+    // ─── Ariadne's Thread [AT-0118] ─────────────────────
+    // What: Accept only assistant text-block payloads from direct Watch OpenClaw history/events.
+    // Why:  Tool calls/results and user messages are not bot replies and must not reach Watch UI state.
+    // Date: 2026-06-09
+    // Related: app→GatewayJobClient.parseHistory, WatchConnectivityWatchService.waitForReply
+    // ─────────────────────────────────────────────────────
     private func extractAssistantText(from payload: [String: Any]) -> String? {
         let source = (payload["message"] as? [String: Any]) ?? payload
-        let role = (source["role"] as? String) ?? (source["author"] as? String)
-        if let role, role.lowercased() != "assistant" { return nil }
+        guard (source["role"] as? String) == "assistant" else { return nil }
         return historyText(from: source)
     }
 
     private func historyText(from row: [String: Any]) -> String? {
-        if let text = row["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return text
+        if let message = row["message"] as? [String: Any] { return historyText(from: message) }
+        guard (row["role"] as? String) == "assistant",
+              let blocks = row["content"] as? [[String: Any]] else {
+            return nil
         }
-        if let content = row["content"] as? String, !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return content
-        }
-        if let blocks = (row["content"] as? [[String: Any]]) ?? (row["parts"] as? [[String: Any]]) {
-            let parts = blocks.compactMap { block -> String? in
-                if let t = block["text"] as? String { return t }
-                if (block["type"] as? String) == "text" { return block["value"] as? String }
+        let parts = blocks.compactMap { block -> String? in
+            guard (block["type"] as? String) == "text",
+                  let text = block["text"] as? String else {
                 return nil
             }
-            let joined = parts.joined()
-            return joined.isEmpty ? nil : joined
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : text
         }
-        if let message = row["message"] as? [String: Any] { return historyText(from: message) }
-        return nil
+        let joined = parts.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return joined.isEmpty ? nil : joined
     }
 }

@@ -91,13 +91,12 @@ final class AppModel: ObservableObject {
     private var watchAgentsPayload: [WatchGatewayAgent] = []
     /// Tracks the in-flight Watch enrichment so a new refresh supersedes an older one.
     private var watchEnrichTask: Task<Void, Never>?
-    /// How many recent messages per session we mirror onto the Watch.
-    private let watchHistoryLimit = 20
     /// Already enriched sessions keyed by sessionKey. Used to avoid refetching/resending the same session messages.
     private var watchEnrichedSessionCache: [String: WatchGatewaySession] = [:]
     private var pendingAudioJobs: [PendingAudioJob] = []
     private var pendingResumeTask: Task<Void, Never>?
     private let pendingAudioJobsKey = "openwatch.pendingAudioJobs.v1"
+    private let watchMessageTextLimit = 500
 
     // ─── Ariadne's Thread [AT-0045] ─────────────────────
     // What: Persist accepted Watch audio jobs until a later reconcile fetches their final gateway reply.
@@ -253,10 +252,9 @@ final class AppModel: ObservableObject {
         selectedAgentId = agentId
         UserDefaults.standard.set(agentId, forKey: "selectedAgentId")
         currentSessionKey = defaultSessionKey(forAgentId: agentId)
-        pushAgentsToWatch()
+        cacheWatchAgentsPayload()
+        publishSelectedAgentToWatch()
         let rows = gatewaySessions(forAgentId: agentId)
-        pushSessionListToWatch(rows: gatewaySessions)
-        startWatchEnrichment(rows: rows)
         AppLog.info("Selected agent id=\(agentId) currentSessionKey=\(currentSessionKey) sessions=\(rows.count)")
     }
 
@@ -289,8 +287,13 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Maps gateway agents to the Watch transport type and pushes them to the Watch Agents page.
-    private func pushAgentsToWatch() {
+    // ─── Ariadne's Thread [AT-0089] ─────────────────────
+    // What: Cache iPhone-side Watch agent payloads without pushing full lists to Watch.
+    // Why:  Watch owns its visible cache and requests missing agents by known ids; iPhone may only push selectedAgentId directly.
+    // Date: 2026-06-08
+    // Related: [AT-0087] AppModel.publishMissingGatewayAgentsToWatch, [AT-0085] watch→WatchAppModel.mergeGatewayAgentDelta
+    // ─────────────────────────────────────────────────────
+    private func cacheWatchAgentsPayload() {
         let agents = sortedAgentsForDisplay.map {
             WatchGatewayAgent(
                 id: $0.id,
@@ -302,7 +305,70 @@ final class AppModel: ObservableObject {
             )
         }
         watchAgentsPayload = agents
-        watchBridge.publishAgents(agents, selectedAgentId: selectedAgentId)
+        AppLog.info("Cached Watch agents payload count=\(agents.count) selectedAgentId=\(selectedAgentId); waiting for Watch missing-agent request")
+    }
+
+    private func publishSelectedAgentToWatch() {
+        watchBridge.publishAgents([], selectedAgentId: selectedAgentId, force: true)
+        AppLog.info("Pushed selectedAgentId only to Watch selectedAgentId=\(selectedAgentId)")
+    }
+
+    // ─── Ariadne's Thread [AT-0087] ─────────────────────
+    // What: Publish only gateway agents missing from the Watch cache.
+    // Why:  Watch owns its visible agents list and sends known agent ids so iPhone can return deltas only.
+    // Date: 2026-06-08
+    // Related: [AT-0083] shared→WatchEnvelope.knownGatewayAgentIds, [AT-0085] watch→WatchAppModel.mergeGatewayAgentDelta
+    // ─────────────────────────────────────────────────────
+    private func publishMissingGatewayAgentsToWatch(knownIds: Set<String>) async {
+        guard isPaired else { return }
+        do {
+            let agentsResult = try await jobClient.listAgents()
+            gatewayAgents = agentsResult.agents
+            let agents = sortedAgentsForDisplay.map {
+                WatchGatewayAgent(
+                    id: $0.id,
+                    name: $0.name,
+                    emoji: $0.emoji,
+                    subtitle: $0.subtitle,
+                    modelLabel: $0.modelLabel,
+                    isDefault: $0.isDefault
+                )
+            }
+            watchAgentsPayload = agents
+            let missing = agents.filter { !knownIds.contains($0.id) }
+            watchBridge.publishAgents(missing, selectedAgentId: selectedAgentId, force: true)
+            AppLog.info("Watch missing agents sent delta=\(missing.count) knownAgents=\(knownIds.count) totalAgents=\(agents.count) selectedAgentId=\(selectedAgentId)")
+        } catch {
+            let missing = watchAgentsPayload.filter { !knownIds.contains($0.id) }
+            if !missing.isEmpty {
+                watchBridge.publishAgents(missing, selectedAgentId: selectedAgentId, force: true)
+            }
+            AppLog.error("Watch missing agents request failed knownAgents=\(knownIds.count); cachedDelta=\(missing.count): \(error.localizedDescription)")
+        }
+    }
+
+    private func publishAgentNavigationModelToWatch() async {
+        guard isPaired else { return }
+        do {
+            let agentsResult = try await jobClient.listAgents()
+            gatewayAgents = agentsResult.agents
+            let agents = sortedAgentsForDisplay.map {
+                WatchGatewayAgent(
+                    id: $0.id,
+                    name: $0.name,
+                    emoji: $0.emoji,
+                    subtitle: $0.subtitle,
+                    modelLabel: $0.modelLabel,
+                    isDefault: $0.isDefault
+                )
+            }
+            watchAgentsPayload = agents
+            watchBridge.publishAgents(agents, selectedAgentId: selectedAgentId, force: true, fullSnapshot: true)
+            AppLog.info("Watch agent navigation model sent fullSnapshot agents=\(agents.count) selectedAgentId=\(selectedAgentId)")
+        } catch {
+            watchBridge.publishAgents(watchAgentsPayload, selectedAgentId: selectedAgentId, force: true, fullSnapshot: true)
+            AppLog.error("Watch agent navigation model request failed; cachedAgents=\(watchAgentsPayload.count): \(error.localizedDescription)")
+        }
     }
 
     /// Loads agents + session index from the gateway. Called on home appear and on pull-to-refresh.
@@ -318,7 +384,7 @@ final class AppModel: ObservableObject {
             let agentsResult = try await jobClient.listAgents()
             gatewayAgents = agentsResult.agents
             reconcileSelectedAgent(defaultId: agentsResult.defaultAgentId)
-            pushAgentsToWatch()
+            cacheWatchAgentsPayload()
             AppLog.info("Loaded \(agentsResult.agents.count) gateway agents defaultId=\(agentsResult.defaultAgentId)")
         } catch {
             AppLog.error("agents.list failed: \(error.localizedDescription)")
@@ -328,9 +394,7 @@ final class AppModel: ObservableObject {
             let (rows, usage) = try await jobClient.listSessionsAndUsage()
             gatewaySessions = rows
             AppLog.info("Loaded \(rows.count) gateway sessions; usage totalTokens=\(usage.totalTokens) sessions=\(usage.sessionCount)")
-            pushSessionListToWatch(rows: gatewaySessions)
             pushUsageToWatch(usage)
-            startWatchEnrichment(rows: gatewaySessions(forAgentId: selectedAgentId))
         } catch {
             handleRefreshSessionsError(error, showErrors: showErrors)
         }
@@ -443,7 +507,10 @@ final class AppModel: ObservableObject {
             AppLog.info("Watch gateway sessions publish skipped: empty delta")
             return
         }
-        let previous = Dictionary(uniqueKeysWithValues: watchGatewaySessions.map { ($0.id, $0) })
+        var previous: [String: WatchGatewaySession] = [:]
+        for session in watchGatewaySessions {
+            previous[session.id] = session
+        }
         var mergedById = previous
         for session in incoming {
             mergedById[session.id] = session
@@ -452,7 +519,7 @@ final class AppModel: ObservableObject {
             }
         }
         let ordered = gatewaySessions.map { row in
-            mergedById[row.id] ?? cachedEnrichedWatchSession(for: row) ?? bareWatchGatewaySession(from: row)
+            mergedById[row.id] ?? bareWatchGatewaySession(from: row)
         }
         let shouldReplace = replaceIfEmpty && watchGatewaySessions.isEmpty
         let delta = shouldReplace ? ordered : ordered.filter { previous[$0.id] != $0 }
@@ -468,7 +535,7 @@ final class AppModel: ObservableObject {
     /// Pushes the bare session list (no messages yet) to the Watch so pages render immediately.
     private func pushSessionListToWatch(rows: [GatewaySessionRow]) {
         let list = rows.map { row in
-            cachedEnrichedWatchSession(for: row) ?? bareWatchGatewaySession(from: row)
+            bareWatchGatewaySession(from: row)
         }
         if rows.isEmpty {
             watchGatewaySessions = []
@@ -482,7 +549,6 @@ final class AppModel: ObservableObject {
     /// Fetches recent history for each gateway session and re-pushes the enriched list to the Watch.
     private func startWatchEnrichment(rows: [GatewaySessionRow]) {
         watchEnrichTask?.cancel()
-        let limit = watchHistoryLimit
         watchEnrichTask = Task { [weak self] in
             guard let self else { return }
             var built: [WatchGatewaySession] = []
@@ -495,8 +561,8 @@ final class AppModel: ObservableObject {
                 var recent: [WatchHistoryMessage] = []
                 do {
                     let messages = try await self.jobClient.fetchHistory(sessionKey: row.id)
-                    recent = messages.suffix(limit).map {
-                        WatchHistoryMessage(id: $0.id, isUser: $0.isUser, text: String($0.text.prefix(500)))
+                    recent = messages.map {
+                        WatchHistoryMessage(id: $0.id, isUser: $0.isUser, text: String($0.text.prefix(self.watchMessageTextLimit)))
                     }
                 } catch {
                     AppLog.error("Watch enrich history failed sessionKey=\(row.id): \(error.localizedDescription)")
@@ -508,6 +574,115 @@ final class AppModel: ObservableObject {
                 self.mergeAndPublishWatchGatewaySessions(built, replaceIfEmpty: false)
                 AppLog.info("Pushed \(built.count) changed gateway sessions with recent history to Watch")
             }
+        }
+    }
+
+    // ─── Ariadne's Thread [AT-0105] ─────────────────────
+    // What: Answer Watch screen requests with separate session index and session messages deltas.
+    // Why:  Session detail message updates must never publish or mutate the Watch sessions list rows.
+    // Date: 2026-06-08
+    // Related: [AT-0104] app→WatchConnectivityPhoneService.publishSessionMessagesDelta, [AT-0099] watch→WatchAppModel.applySessionMessagesDelta
+    // ─────────────────────────────────────────────────────
+    private func publishMissingGatewaySessionsToWatch(knownIds: Set<String>, knownMessageIdsBySession: [String: [String]], requestedAgentId: String?) async {
+        guard isPaired else { return }
+        let targetAgentId = (requestedAgentId?.isEmpty == false ? requestedAgentId : selectedAgentId) ?? selectedAgentId
+        do {
+            let (rows, _) = try await jobClient.listSessionsAndUsage()
+            gatewaySessions = rows
+            // ─── Ariadne's Thread [AT-0113] ─────────────────────
+            // What: Scope Watch missing-session responses to the requested agent.
+            // Why:  Pull-to-refresh on Watch Sessions must not import rows from other agents.
+            // Date: 2026-06-09
+            // Related: [AT-0110] watch→WatchAppModel.refreshSessionsForCurrentAgent
+            // ─────────────────────────────────────────────────────
+            let agentRows = rows.filter { (agentId(fromSessionKey: $0.id) ?? "main") == targetAgentId }
+            // ─── Ariadne's Thread [AT-0074] ─────────────────────
+            // What: Load message deltas only for session ids explicitly requested by Watch.
+            // Why:  The Sessions list opens often; fetching every cached session history at once overloaded watchOS during merge/cache.
+            // Date: 2026-06-08
+            // Related: [AT-0069] watch→WatchAppModel.requestMissingGatewaySessionsForSessionScreen, [AT-0079] watch→WatchAppModel.requestMissingGatewayMessagesForSession
+            // ─────────────────────────────────────────────────────
+            let missingRows = agentRows.filter { !knownIds.contains($0.id) }
+
+            let bare = missingRows.map { row in
+                cachedEnrichedWatchSession(for: row) ?? bareWatchGatewaySession(from: row)
+            }
+            if !bare.isEmpty {
+                watchBridge.publishSessionIndexDelta(
+                    WatchSessionIndexDelta(
+                        selectedAgentId: targetAgentId,
+                        sessions: bare.map { WatchSessionRow(session: $0) }
+                    ),
+                    force: true
+                )
+                AppLog.info("Watch missing sessions sent bare delta count=\(bare.count) knownCount=\(knownIds.count) agentId=\(targetAgentId)")
+            }
+
+            var sentEnrichedCount = 0
+            let requestedMessageSessionIds = Set(knownMessageIdsBySession.keys)
+            let requestedMessageRows = agentRows.filter { requestedMessageSessionIds.contains($0.id) }
+            for row in requestedMessageRows {
+                let knownMessageIds = Set(knownMessageIdsBySession[row.id] ?? [])
+                if let cached = cachedEnrichedWatchSession(for: row) {
+                    let missingMessages = cached.messages.filter { !knownMessageIds.contains($0.id) }
+                    watchBridge.publishSessionMessagesDelta(
+                        WatchSessionMessagesDelta(sessionKey: row.id, messages: missingMessages),
+                        force: true
+                    )
+                    sentEnrichedCount += 1
+                    AppLog.info("Watch missing session messages sent cached delta sessionKey=\(row.id) messages=\(missingMessages.count)")
+                    continue
+                }
+                do {
+                    let messages = try await jobClient.fetchHistory(sessionKey: row.id)
+                    let allMessages = messages.map {
+                        WatchHistoryMessage(id: $0.id, isUser: $0.isUser, text: String($0.text.prefix(watchMessageTextLimit)))
+                    }
+                    watchEnrichedSessionCache[row.id] = WatchGatewaySession(id: row.id, title: row.title, preview: row.preview, updatedAt: row.updatedAt, messages: allMessages)
+                    let missingMessages = messages
+                        .filter { !knownMessageIds.contains($0.id) }
+                        .map {
+                            WatchHistoryMessage(id: $0.id, isUser: $0.isUser, text: String($0.text.prefix(watchMessageTextLimit)))
+                        }
+                    watchBridge.publishSessionMessagesDelta(
+                        WatchSessionMessagesDelta(sessionKey: row.id, messages: missingMessages),
+                        force: true
+                    )
+                    sentEnrichedCount += 1
+                    AppLog.info("Watch missing session messages sent fetched delta sessionKey=\(row.id) messages=\(missingMessages.count)")
+                } catch {
+                    AppLog.error("Watch missing session history failed sessionKey=\(row.id): \(error.localizedDescription)")
+                }
+            }
+            guard sentEnrichedCount > 0 || !bare.isEmpty else {
+                if let requestedSessionKey = knownMessageIdsBySession.keys.first {
+                    watchBridge.publishSessionMessagesDelta(
+                        WatchSessionMessagesDelta(sessionKey: requestedSessionKey, messages: []),
+                        force: true
+                    )
+                } else {
+                    watchBridge.publishSessionIndexDelta(
+                        WatchSessionIndexDelta(selectedAgentId: targetAgentId, sessions: []),
+                        force: true
+                    )
+                }
+                AppLog.info("Watch missing sessions/messages request: nothing missing knownSessions=\(knownIds.count) knownMessageSessions=\(knownMessageIdsBySession.count) agentId=\(targetAgentId) agentTotal=\(agentRows.count) total=\(rows.count)")
+                return
+            }
+            AppLog.info("Watch missing sessions/messages sent enriched deltas count=\(sentEnrichedCount) bareCount=\(bare.count) agentId=\(targetAgentId) agentTotal=\(agentRows.count) total=\(rows.count)")
+        } catch {
+            if let requestedSessionKey = knownMessageIdsBySession.keys.first {
+                watchBridge.publishSessionMessagesDelta(
+                    WatchSessionMessagesDelta(sessionKey: requestedSessionKey, messages: []),
+                    force: true
+                )
+            } else {
+                watchBridge.publishSessionIndexDelta(
+                    WatchSessionIndexDelta(selectedAgentId: targetAgentId, sessions: []),
+                    force: true
+                )
+            }
+            AppLog.error("Watch missing sessions request failed knownCount=\(knownIds.count) agentId=\(targetAgentId): \(error.localizedDescription)")
         }
     }
 
@@ -605,7 +780,7 @@ final class AppModel: ObservableObject {
             AppLog.error("Failed to decode watch envelope")
             return
         }
-        let commandKey = "\(envelope.kind.rawValue)-\(envelope.jobId?.uuidString ?? "")"
+        let commandKey = watchCommandKey(for: envelope)
         if let lastWatchCommandKey,
            lastWatchCommandKey == commandKey,
            let lastWatchCommandAt,
@@ -638,8 +813,35 @@ final class AppModel: ObservableObject {
             }
             AppLog.info("Watch selected agent id=\(agentId)")
             selectAgent(agentId)
-            pushSessionListToWatch(rows: gatewaySessions)
-            startWatchEnrichment(rows: gatewaySessions(forAgentId: agentId))
+        case .requestGatewaySessions:
+            await publishMissingGatewayAgentsToWatch(knownIds: Set(envelope.knownGatewayAgentIds ?? []))
+            await publishMissingGatewaySessionsToWatch(
+                knownIds: Set(envelope.knownGatewaySessionIds ?? []),
+                knownMessageIdsBySession: envelope.knownGatewayMessageIdsBySession ?? [:],
+                requestedAgentId: envelope.selectedAgentId
+            )
+        case .requestAgentIndexDelta:
+            await publishAgentNavigationModelToWatch()
+        case .requestSessionIndexDelta:
+            await publishMissingGatewayAgentsToWatch(knownIds: Set(envelope.knownGatewayAgentIds ?? []))
+            await publishMissingGatewaySessionsToWatch(
+                knownIds: Set(envelope.knownGatewaySessionIds ?? []),
+                knownMessageIdsBySession: [:],
+                requestedAgentId: envelope.selectedAgentId
+            )
+        case .requestSessionMessagesDelta:
+            let requestedKey = envelope.requestedSessionKey
+                ?? envelope.knownGatewayMessageIdsBySession?.keys.first
+            guard let requestedKey, !requestedKey.isEmpty else {
+                AppLog.error("requestSessionMessagesDelta ignored: missing sessionKey")
+                return
+            }
+            let knownMessageIds = envelope.knownGatewayMessageIdsBySession?[requestedKey] ?? []
+            await publishMissingGatewaySessionsToWatch(
+                knownIds: Set(envelope.knownGatewaySessionIds ?? []),
+                knownMessageIdsBySession: [requestedKey: knownMessageIds],
+                requestedAgentId: envelope.selectedAgentId
+            )
         case .requestSync:
             restoreGatewayURLFromWatchRequest(envelope.pairing)
             let activeWatchJobs = envelope.jobs ?? []
@@ -658,29 +860,42 @@ final class AppModel: ObservableObject {
                 return
             }
             Task { await publishGatewayProbeToWatch(reason: "watch-request-sync") }
-            // Mirror gateway sessions + usage too: re-push the cached values if we have them, otherwise fetch now.
-            if !watchGatewaySessions.isEmpty {
-                // ─── Ariadne's Thread [AT-0031] ─────────────────────
-                // What: Force resend sessions, messages, agents, and usage on explicit Watch sync.
-                // Why:  The iPhone delivery cache only knows what it attempted to send; Watch may have missed it while unreachable.
-                // Date: 2026-06-06
-                // Related: [AT-0029] app→AppModel mergeAndPublishWatchGatewaySessions, [AT-0028] app→WatchConnectivityPhoneService queueSnapshotToWatch
-                // ─────────────────────────────────────────────────────
-                watchBridge.resetSessionMessageAgentUsageDeliveryCache()
-                watchBridge.publishGatewaySessions(watchGatewaySessions, replace: true, force: true)
-                republishCachedUsageToWatch(force: true)
-                if !watchAgentsPayload.isEmpty {
-                    watchBridge.publishAgents(watchAgentsPayload, selectedAgentId: selectedAgentId, force: true)
-                }
-                if watchUsage == nil || watchAgentsPayload.isEmpty {
-                    AppLog.info("Watch sync missing agents/usage cache; refreshing gateway metadata usagePresent=\(watchUsage != nil) agents=\(watchAgentsPayload.count)")
-                    Task { await refreshSessions(showErrors: false) }
-                }
-            } else if isPaired {
-                Task { await refreshSessions() }
+            await publishMissingGatewayAgentsToWatch(knownIds: Set(envelope.knownGatewayAgentIds ?? []))
+            if envelope.knownGatewaySessionIds != nil || envelope.knownGatewayMessageIdsBySession != nil {
+                await publishMissingGatewaySessionsToWatch(
+                    knownIds: Set(envelope.knownGatewaySessionIds ?? []),
+                    knownMessageIdsBySession: envelope.knownGatewayMessageIdsBySession ?? [:],
+                    requestedAgentId: envelope.selectedAgentId
+                )
+            } else {
+                AppLog.info("Watch requestSync skipped sessions/messages delta; session data is screen-driven")
             }
+            republishCachedUsageToWatch(force: true)
         default:
             break
+        }
+    }
+
+    // ─── Ariadne's Thread [AT-0088] ─────────────────────
+    // What: Include Watch cache fingerprints in request deduplication keys.
+    // Why:  Session-list and per-session message delta requests share one kind but must not cancel each other.
+    // Date: 2026-06-08
+    // Related: [AT-0084] watch→WatchConnectivityWatchService.requestMissingGatewaySessions, [AT-0079] watch→WatchAppModel.requestMissingGatewayMessagesForSession
+    // ─────────────────────────────────────────────────────
+    private func watchCommandKey(for envelope: WatchEnvelope) -> String {
+        switch envelope.kind {
+        case .requestGatewaySessions, .requestAgentIndexDelta, .requestSessionIndexDelta, .requestSessionMessagesDelta, .requestSync:
+            let knownAgents = envelope.knownGatewayAgentIds?.count ?? 0
+            let knownSessions = envelope.knownGatewaySessionIds?.count ?? 0
+            let messageFingerprint = (envelope.knownGatewayMessageIdsBySession ?? [:])
+                .keys
+                .sorted()
+                .map { key in "\(key):\((envelope.knownGatewayMessageIdsBySession ?? [:])[key]?.count ?? 0)" }
+                .joined(separator: "|")
+            let jobs = (envelope.jobs ?? []).map { $0.id.uuidString }.sorted().joined(separator: ",")
+            return "\(envelope.kind.rawValue)-agents=\(knownAgents)-sessions=\(knownSessions)-messages=\(messageFingerprint)-requested=\(envelope.requestedSessionKey ?? "")-jobs=\(jobs)-selected=\(envelope.selectedAgentId ?? "")"
+        default:
+            return "\(envelope.kind.rawValue)-\(envelope.jobId?.uuidString ?? "")"
         }
     }
 
@@ -1110,16 +1325,12 @@ final class AppModel: ObservableObject {
         AppLog.info("Republishing state to Watch reason=\(reason) phase=\(pairing.phase.rawValue)")
         syncWatch()
         guard isPaired else { return }
-        if !watchGatewaySessions.isEmpty {
-            watchBridge.publishGatewaySessions(watchGatewaySessions)
-            republishCachedUsageToWatch()
-            if !watchAgentsPayload.isEmpty {
-                watchBridge.publishAgents(watchAgentsPayload, selectedAgentId: selectedAgentId)
-            }
-            AppLog.info("Republish included gateway sessions=\(watchGatewaySessions.count) agents=\(watchAgentsPayload.count)")
-        } else {
+        republishCachedUsageToWatch()
+        if watchGatewaySessions.isEmpty {
             AppLog.info("Republish: no cached gateway sessions; refreshing from gateway")
             Task { await refreshSessions() }
+        } else {
+            AppLog.info("Republish skipped full agents/sessions; Watch will request missing data known to its cache")
         }
     }
 

@@ -94,10 +94,10 @@ struct GatewayUsage: Sendable, Equatable {
     let model: String?
 }
 
-/// One transcript message as reported by the gateway's `chat.history`.
+/// One real assistant text message as reported by the gateway's `chat.history`.
 struct ChatHistoryMessage: Identifiable, Sendable, Equatable {
     let id: String
-    let role: String            // "user" / "assistant" / …
+    let role: String
     let text: String
     let createdAt: Date?
 
@@ -540,6 +540,12 @@ actor GatewayJobClient {
         return 0
     }
 
+    // ─── Ariadne's Thread [AT-0117] ─────────────────────
+    // What: Keep only assistant text-block messages from OpenClaw chat.history.
+    // Why:  Tool calls/results and user messages are transport noise for OpenWatch and must not be stored or mirrored.
+    // Date: 2026-06-09
+    // Related: app→GatewayJobClient.fetchHistory, shared→WatchHistoryMessage
+    // ─────────────────────────────────────────────────────
     private func parseHistory(_ payload: [String: Any]) -> [ChatHistoryMessage] {
         let rows = (payload["messages"] as? [[String: Any]])
             ?? (payload["items"] as? [[String: Any]])
@@ -547,29 +553,36 @@ actor GatewayJobClient {
             ?? (payload["entries"] as? [[String: Any]])
             ?? []
         return rows.compactMap { row -> ChatHistoryMessage? in
-            let id = (row["id"] as? String) ?? (row["messageId"] as? String) ?? UUID().uuidString
-            let role = (row["role"] as? String) ?? (row["author"] as? String) ?? "assistant"
-            guard let text = historyText(from: row), !text.isEmpty else { return nil }
-            let createdAt = parseDate(row["createdAt"]) ?? parseDate(row["timestamp"]) ?? parseDate(row["ts"]) ?? parseDate(row["time"])
-            return ChatHistoryMessage(id: id, role: role, text: text, createdAt: createdAt)
+            assistantTextMessage(from: row)
         }
     }
 
-    /// Extracts displayable text from a transcript row: plain `text`, plain `content` string, or a content-block array.
-    private func historyText(from row: [String: Any]) -> String? {
-        if let text = row["text"] as? String { return text }
-        if let content = row["content"] as? String { return content }
-        if let blocks = (row["content"] as? [[String: Any]]) ?? (row["parts"] as? [[String: Any]]) {
-            let parts = blocks.compactMap { block -> String? in
-                if let t = block["text"] as? String { return t }
-                if (block["type"] as? String) == "text" { return block["value"] as? String }
+    private func assistantTextMessage(from row: [String: Any]) -> ChatHistoryMessage? {
+        if let message = row["message"] as? [String: Any] {
+            return assistantTextMessage(from: message)
+        }
+        guard (row["role"] as? String) == "assistant",
+              let text = assistantTextBlocks(from: row),
+              !text.isEmpty else {
+            return nil
+        }
+        let id = (row["id"] as? String) ?? (row["messageId"] as? String) ?? UUID().uuidString
+        let createdAt = parseDate(row["createdAt"]) ?? parseDate(row["timestamp"]) ?? parseDate(row["ts"]) ?? parseDate(row["time"])
+        return ChatHistoryMessage(id: id, role: "assistant", text: text, createdAt: createdAt)
+    }
+
+    private func assistantTextBlocks(from row: [String: Any]) -> String? {
+        guard let blocks = row["content"] as? [[String: Any]] else { return nil }
+        let parts = blocks.compactMap { block -> String? in
+            guard (block["type"] as? String) == "text",
+                  let text = block["text"] as? String else {
                 return nil
             }
-            let joined = parts.joined()
-            return joined.isEmpty ? nil : joined
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : text
         }
-        if let message = row["message"] as? [String: Any] { return historyText(from: message) }
-        return nil
+        let joined = parts.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return joined.isEmpty ? nil : joined
     }
 
     private func parseDate(_ value: Any?) -> Date? {

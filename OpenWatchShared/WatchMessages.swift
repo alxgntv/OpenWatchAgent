@@ -12,7 +12,7 @@ nonisolated public enum WatchMessageKind: String, Codable, Sendable {
     case submitTranscript
     /// Either direction: start a brand-new chat session (a fresh sessionKey). Voice keeps going to the current session otherwise.
     case newSession
-    /// iPhone → Watch: the real gateway session index (with recent history) for the Watch's horizontal session pages.
+    /// Legacy iPhone → Watch gateway session payload. Watch UI no longer uses this as an active sync path.
     case gatewaySessions
     /// iPhone → Watch: aggregate usage (session count, tokens, model) for the Watch's Usage page.
     case usage
@@ -22,6 +22,20 @@ nonisolated public enum WatchMessageKind: String, Codable, Sendable {
     case selectAgent
     /// iPhone → Watch: authenticated gateway WSS probe result.
     case gatewayProbe
+    /// Watch → iPhone: request only gateway sessions that are missing on Watch.
+    case requestGatewaySessions
+    /// Watch → iPhone: request the full local navigation model for agent selection.
+    case requestAgentIndexDelta
+    /// iPhone → Watch: configured gateway agent index delta.
+    case agentIndexDelta
+    /// iPhone → Watch: gateway session index delta without messages.
+    case sessionIndexDelta
+    /// iPhone → Watch: messages for one gateway session.
+    case sessionMessagesDelta
+    /// Watch → iPhone: request missing session index rows for the selected agent.
+    case requestSessionIndexDelta
+    /// Watch → iPhone: request missing messages for one session.
+    case requestSessionMessagesDelta
 }
 
 /// Aggregate usage derived from the gateway's `sessions.list`, mirrored to the Watch's Usage page.
@@ -118,6 +132,65 @@ nonisolated public struct WatchGatewaySession: Codable, Sendable, Identifiable, 
     }
 }
 
+public typealias WatchAgentRow = WatchGatewayAgent
+public typealias WatchMessageRow = WatchHistoryMessage
+
+// ─── Ariadne's Thread [AT-0097] ─────────────────────
+// What: Split Watch sync payloads into agent index, session index, and session messages deltas.
+// Why:  Watch SwiftUI lists must receive stable row snapshots, while session messages update only detail state.
+// Date: 2026-06-08
+// Related: [AT-0094] watch→WatchAppModel.gatewayMessagesBySessionKey, [AT-0096] watch→WatchAppModel.mergeGatewayMessages
+// ─────────────────────────────────────────────────────
+nonisolated public struct WatchSessionRow: Codable, Sendable, Identifiable, Equatable {
+    public let id: String
+    public let title: String
+    public let preview: String?
+    public let updatedAt: Date?
+
+    public init(id: String, title: String, preview: String?, updatedAt: Date?) {
+        self.id = id
+        self.title = title
+        self.preview = preview
+        self.updatedAt = updatedAt
+    }
+
+    public init(session: WatchGatewaySession) {
+        self.init(id: session.id, title: session.title, preview: session.preview, updatedAt: session.updatedAt)
+    }
+}
+
+nonisolated public struct WatchAgentIndexDelta: Codable, Sendable, Equatable {
+    public let agents: [WatchAgentRow]
+    public let selectedAgentId: String?
+    public let isFullSnapshot: Bool?
+
+    public init(agents: [WatchAgentRow], selectedAgentId: String?, isFullSnapshot: Bool? = nil) {
+        self.agents = agents
+        self.selectedAgentId = selectedAgentId
+        self.isFullSnapshot = isFullSnapshot
+    }
+}
+
+nonisolated public struct WatchSessionIndexDelta: Codable, Sendable, Equatable {
+    public let selectedAgentId: String?
+    public let sessions: [WatchSessionRow]
+
+    public init(selectedAgentId: String?, sessions: [WatchSessionRow]) {
+        self.selectedAgentId = selectedAgentId
+        self.sessions = sessions
+    }
+}
+
+nonisolated public struct WatchSessionMessagesDelta: Codable, Sendable, Equatable {
+    public let sessionKey: String
+    public let messages: [WatchMessageRow]
+
+    public init(sessionKey: String, messages: [WatchMessageRow]) {
+        self.sessionKey = sessionKey
+        self.messages = messages
+    }
+}
+
 // ─── Ariadne's Thread [AT-0007] ─────────────────────
 // What: Add Watch record-button haptic options to the shared envelope model.
 // Why:  The iPhone settings screen controls which native Watch haptic plays when recording starts/stops.
@@ -190,6 +263,26 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
     public let gatewayOperatorToken: String?
     /// iPhone → Watch: operator scopes for direct Watch WSS. nil means unchanged.
     public let gatewayOperatorScopes: [String]?
+    /// iPhone → Watch: configured gateway agent index delta. nil means unchanged.
+    public let agentIndexDelta: WatchAgentIndexDelta?
+    /// iPhone → Watch: gateway session index delta without messages. nil means unchanged.
+    public let sessionIndexDelta: WatchSessionIndexDelta?
+    /// iPhone → Watch: messages for one gateway session. nil means unchanged.
+    public let sessionMessagesDelta: WatchSessionMessagesDelta?
+    /// Watch → iPhone: one session whose messages should be returned.
+    public let requestedSessionKey: String?
+    // ─── Ariadne's Thread [AT-0083] ─────────────────────
+    // What: Add Watch-known gateway agent ids to the sync envelope.
+    // Why:  iPhone must return only agents missing from the Watch cache instead of sending a full live replacement.
+    // Date: 2026-06-08
+    // Related: [AT-0070] watch→WatchConnectivityWatchService.requestMissingGatewaySessions, [AT-0071] app→AppModel.publishMissingGatewaySessionsToWatch
+    // ─────────────────────────────────────────────────────
+    /// Watch → iPhone: gateway agent ids already stored on Watch.
+    public let knownGatewayAgentIds: [String]?
+    /// Watch → iPhone: gateway session ids already stored on Watch.
+    public let knownGatewaySessionIds: [String]?
+    /// Watch → iPhone: message ids already stored per gateway session on Watch.
+    public let knownGatewayMessageIdsBySession: [String: [String]]?
     public init(
         kind: WatchMessageKind,
         jobId: UUID? = nil,
@@ -210,7 +303,14 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         gatewayReachable: Bool? = nil,
         gatewayProbeDetail: String? = nil,
         gatewayOperatorToken: String? = nil,
-        gatewayOperatorScopes: [String]? = nil
+        gatewayOperatorScopes: [String]? = nil,
+        agentIndexDelta: WatchAgentIndexDelta? = nil,
+        sessionIndexDelta: WatchSessionIndexDelta? = nil,
+        sessionMessagesDelta: WatchSessionMessagesDelta? = nil,
+        requestedSessionKey: String? = nil,
+        knownGatewayAgentIds: [String]? = nil,
+        knownGatewaySessionIds: [String]? = nil,
+        knownGatewayMessageIdsBySession: [String: [String]]? = nil
     ) {
         self.kind = kind
         self.jobId = jobId
@@ -232,5 +332,12 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         self.gatewayProbeDetail = gatewayProbeDetail
         self.gatewayOperatorToken = gatewayOperatorToken
         self.gatewayOperatorScopes = gatewayOperatorScopes
+        self.agentIndexDelta = agentIndexDelta
+        self.sessionIndexDelta = sessionIndexDelta
+        self.sessionMessagesDelta = sessionMessagesDelta
+        self.requestedSessionKey = requestedSessionKey
+        self.knownGatewayAgentIds = knownGatewayAgentIds
+        self.knownGatewaySessionIds = knownGatewaySessionIds
+        self.knownGatewayMessageIdsBySession = knownGatewayMessageIdsBySession
     }
 }

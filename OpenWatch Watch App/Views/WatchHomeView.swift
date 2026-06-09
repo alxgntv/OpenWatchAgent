@@ -64,14 +64,18 @@ struct WatchSessionPage: View {
         model.isRecording && index == model.currentIndex
     }
 
+    private var retryJob: VoiceJob? {
+        session.retryJob
+    }
+
     private var isWaitingForIPhoneInternet: Bool {
-        !connectivity.hasIPhoneInternetBridge && !isRecordingHere && session.activeJob == nil
+        !connectivity.hasIPhoneInternetBridge && !isRecordingHere && session.activeJob == nil && retryJob == nil
     }
 
     @ViewBuilder
     private var history: some View {
         if session.jobs.isEmpty {
-            Text("Tap Speak to talk to your agent.")
+            Text("Speak with your \(model.selectedAgentEmojiSymbol()) \(model.selectedAgentTitleName())")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -103,12 +107,19 @@ struct WatchSessionPage: View {
 
     private var speakButton: some View {
         Button {
-            model.toggleRecord()
+            if let retryJob {
+                model.retryJob(retryJob)
+            } else {
+                model.toggleRecord()
+            }
         } label: {
             VStack(spacing: 4) {
                 if isRecordingHere {
                     Image(systemName: "stop.fill").font(.title2)
                     Text("Stop & Send").font(.caption2)
+                } else if retryJob != nil {
+                    Image(systemName: "arrow.clockwise").font(.title2)
+                    Text("Retry").font(.caption2)
                 } else if let job = session.activeJob {
                     // Already sent to work in this session: spinner replaces the mic and the live status is the label.
                     ProgressView()
@@ -153,12 +164,27 @@ struct WatchSessionPage: View {
 struct GatewaySessionPage: View {
     @ObservedObject var model: WatchAppModel
     @ObservedObject private var connectivity = WatchConnectivityWatchService.shared
-    let session: WatchGatewaySession
+    let sessionKey: String
 
-    private var activeJob: VoiceJob? { model.gatewayActiveJob(for: session.id) }
-    private var isRecordingHere: Bool { model.isRecordingGateway(session.id) }
+    // ─── Ariadne's Thread [AT-0116] ─────────────────────
+    // What: Make each Watch session detail refreshable and show a loading state for missing texts.
+    // Why:  Opened sessions must support native pull-to-refresh and avoid showing empty copy while messages are loading.
+    // Date: 2026-06-09
+    // Related: [AT-0115] WatchAppModel.refreshSessionMessages, [AT-0094] WatchAppModel.gatewayMessagesBySessionKey
+    // ─────────────────────────────────────────────────────
+    private var detailState: SessionDetailState {
+        model.sessionDetailState(for: sessionKey)
+    }
+
+    private var sessionMessages: [WatchHistoryMessage] {
+        detailState.messages
+    }
+
+    private var activeJob: VoiceJob? { model.gatewayActiveJob(for: sessionKey) }
+    private var retryJob: VoiceJob? { model.gatewayRetryJob(for: sessionKey) }
+    private var isRecordingHere: Bool { model.isRecordingGateway(sessionKey) }
     private var isWaitingForIPhoneInternet: Bool {
-        !connectivity.hasIPhoneInternetBridge && !isRecordingHere && activeJob == nil
+        !connectivity.hasIPhoneInternetBridge && !isRecordingHere && activeJob == nil && retryJob == nil
     }
 
     var body: some View {
@@ -172,6 +198,12 @@ struct GatewaySessionPage: View {
             .frame(maxWidth: .infinity)
         }
         .navigationTitle(titleText)
+        .refreshable {
+            await model.refreshSessionMessages(sessionKey: sessionKey)
+        }
+        .onAppear {
+            model.send(.sessionDetailAppeared(sessionKey: sessionKey))
+        }
     }
 
     /// Per-session voice mute for this gateway page — hidden when iPhone has disabled global TTS.
@@ -179,36 +211,43 @@ struct GatewaySessionPage: View {
     private var muteButton: some View {
         if model.globalTtsEnabled {
             Button {
-                model.toggleGatewayMute(sessionKey: session.id)
+                model.toggleGatewayMute(sessionKey: sessionKey)
             } label: {
                 Label(
-                    model.isGatewayMuted(session.id) ? "Voice Off" : "Voice On",
-                    systemImage: model.isGatewayMuted(session.id) ? "speaker.slash.fill" : "speaker.wave.2.fill"
+                    model.isGatewayMuted(sessionKey) ? "Voice Off" : "Voice On",
+                    systemImage: model.isGatewayMuted(sessionKey) ? "speaker.slash.fill" : "speaker.wave.2.fill"
                 )
                 .font(.caption2)
             }
             .buttonStyle(.bordered)
-            .tint(model.isGatewayMuted(session.id) ? .gray : .blue)
+            .tint(model.isGatewayMuted(sessionKey) ? .gray : .blue)
         }
     }
 
     /// Small-text title: "Session · <date>" of last activity, kept short. Falls back to a plain label without a date.
     private var titleText: String {
-        if let updatedAt = session.updatedAt {
+        if let updatedAt = detailState.updatedAt {
             return "Session · \(watchCompactStamp(updatedAt))"
         }
-        if !session.title.isEmpty, session.title != session.id { return session.title }
+        if !detailState.title.isEmpty, detailState.title != sessionKey { return detailState.title }
         return "Session"
     }
 
     private var speakButton: some View {
         Button {
-            model.toggleGatewayRecord(sessionKey: session.id)
+            if let retryJob {
+                model.retryJob(retryJob)
+            } else {
+                model.toggleGatewayRecord(sessionKey: sessionKey)
+            }
         } label: {
             VStack(spacing: 4) {
                 if isRecordingHere {
                     Image(systemName: "stop.fill").font(.title2)
                     Text("Stop & Send").font(.caption2)
+                } else if retryJob != nil {
+                    Image(systemName: "arrow.clockwise").font(.title2)
+                    Text("Retry").font(.caption2)
                 } else if let job = activeJob {
                     ProgressView()
                     Text(job.statusDetail ?? "Working…")
@@ -230,9 +269,21 @@ struct GatewaySessionPage: View {
 
     @ViewBuilder
     private var history: some View {
-        let turns = model.gatewayTurns(for: session.id)
-        if turns.isEmpty, session.messages.isEmpty {
-            Text("Tap Speak to continue this session.")
+        let state = detailState
+        let turns = state.liveJobs
+        let messages = sessionMessages
+        if state.isLoading, turns.isEmpty, messages.isEmpty {
+            VStack(spacing: 8) {
+                ProgressView()
+                    .scaleEffect(0.7)
+                Text("Loading messages…")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .frame(maxWidth: .infinity, minHeight: 80)
+        } else if turns.isEmpty, messages.isEmpty {
+            Text("Speak with your \(model.selectedAgentEmojiSymbol()) \(model.selectedAgentTitleName())")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -253,7 +304,7 @@ struct GatewaySessionPage: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 // Recent server history (oldest-first slice) reversed so the newest message is on top.
-                ForEach(Array(session.messages.reversed())) { message in
+                ForEach(Array(messages.reversed())) { message in
                     Text(message.text)
                         .font(message.isUser ? .caption2 : .footnote)
                         .foregroundStyle(message.isUser ? Color.secondary : Color.primary)
@@ -264,103 +315,146 @@ struct GatewaySessionPage: View {
     }
 }
 
+// ─── Ariadne's Thread [AT-0112] ─────────────────────
+// What: Rebuild the Watch Sessions page as a refreshable scroll view with tappable cards.
+// Why:  Pulling down on Sessions must natively request missing iPhone-backed sessions for the current agent.
+// Date: 2026-06-09
+// Related: [AT-0110] WatchAppModel.refreshSessionsForCurrentAgent, [AT-0097] shared→WatchSessionIndexDelta
+// ─────────────────────────────────────────────────────
 /// Sessions page (one screen right of the live stack): a single vertical list of every gateway session for the
 /// active agent. Scrolls down (Digital Crown) instead of paging sideways. Tapping a row opens that session.
 struct GatewaySessionsListPage: View {
     @ObservedObject var model: WatchAppModel
 
     var body: some View {
-        let sessions = model.filteredGatewaySessions
-        return Group {
-            if sessions.isEmpty {
-                ScrollView {
-                    Text("No sessions yet.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 24)
-                }
-            } else {
-                List {
+        let state = model.sessionListState
+        let sessions = state.rows
+        return ScrollView {
+            LazyVStack(alignment: .leading, spacing: 8) {
+                if sessions.isEmpty {
+                    VStack(spacing: 8) {
+                        if state.isLoading {
+                            ProgressView()
+                                .scaleEffect(0.7)
+                        }
+                        Text(state.isLoading ? "Loading sessions…" : "No sessions yet.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 120)
+                } else {
                     ForEach(sessions) { session in
                         NavigationLink {
-                            GatewaySessionPage(model: model, session: session)
+                            GatewaySessionPage(model: model, sessionKey: session.id)
                         } label: {
                             GatewaySessionListRow(session: session)
                         }
+                        .buttonStyle(.plain)
                     }
                 }
             }
+            .padding(.horizontal, 4)
+            .padding(.top, 4)
         }
         .navigationTitle("Sessions")
+        .refreshable {
+            await model.refreshSessionsForCurrentAgent()
+        }
+        .onAppear {
+            model.send(.sessionsPageAppeared(agentId: state.selectedAgentId))
+        }
     }
 }
 
-/// Compact row for the gateway sessions list: title/preview plus a short last-activity stamp.
+/// Compact card for the gateway sessions list: newest text first plus a short last-activity stamp.
 struct GatewaySessionListRow: View {
-    let session: WatchGatewaySession
+    let session: SessionListRowState
 
-    private var rowTitle: String {
+    private var rowPrimaryText: String {
+        if let preview = session.preview?.trimmingCharacters(in: .whitespacesAndNewlines), !preview.isEmpty { return preview }
         if !session.title.isEmpty, session.title != session.id { return session.title }
         return "Session"
     }
 
-    private var rowSubtitle: String? {
-        if let preview = session.preview, !preview.isEmpty { return preview }
-        if let last = session.messages.last?.text, !last.isEmpty { return last }
+    private var rowSecondaryText: String? {
+        let title = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, title != session.id, title != rowPrimaryText else { return nil }
+        return title
+    }
+
+    private var activityText: String? {
+        if let updatedAt = session.updatedAt {
+            return watchCompactStamp(updatedAt)
+        }
         return nil
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(rowTitle)
-                .font(.footnote)
-                .lineLimit(1)
-            if let subtitle = rowSubtitle {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Text(rowPrimaryText)
+                    .font(.footnote)
+                    .lineLimit(1)
+                if session.hasActiveJob {
+                    ProgressView()
+                        .scaleEffect(0.55)
+                }
+            }
+            if let subtitle = rowSecondaryText {
                 Text(subtitle)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-            if let updatedAt = session.updatedAt {
-                Text(watchCompactStamp(updatedAt))
+            if let activityText {
+                Text(activityText)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 8)
+        .padding(.horizontal, 10)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 
+// ─── Ariadne's Thread [AT-0102] ─────────────────────
+// What: Render agents from AgentsListState and send tap events instead of selecting directly.
+// Why:  Selecting an agent must not mutate agent rows inside a watchOS List tap transaction.
+// Date: 2026-06-08
+// Related: [AT-0099] app→WatchAppModel.reduceAgentTapped, [AT-0098] app→AgentsListState
+// ─────────────────────────────────────────────────────
 /// Agents page (one screen left of the live stack): standard watchOS list rows.
 struct AgentsPage: View {
     @ObservedObject var model: WatchAppModel
+    @Binding var selection: String?
 
     var body: some View {
-        List {
-            ForEach(model.sortedAgentsForDisplay) { agent in
-                Button {
-                    AppLog.info("Watch agent row tapped id=\(agent.id)")
-                    model.selectAgent(agent.id)
-                } label: {
-                    WatchAgentListRow(
-                        agent: agent,
-                        isSelected: model.selectedAgentId == agent.id,
-                        sessionCount: model.sessionCount(forAgentId: agent.id)
-                    )
-                }
+        let state = model.agentsListState
+        List(state.rows, selection: $selection) { agent in
+            WatchAgentListRow(
+                agent: agent,
+                isSelected: selection == agent.id
+            )
+            .tag(agent.id)
+            .onAppear {
+                AppLog.info("Watch agent row rendered id=\(agent.id)")
             }
         }
         .navigationTitle("Agents")
+        .onAppear {
+            model.send(.agentsPageAppeared)
+        }
     }
 }
 
 /// Default-style agent row for the Watch Agents list.
 struct WatchAgentListRow: View {
-    let agent: WatchGatewayAgent
+    let agent: AgentListRowState
     let isSelected: Bool
-    let sessionCount: Int
 
     private var displayName: String {
         agent.id == "main" ? "Main Actor" : agent.name
@@ -388,8 +482,8 @@ struct WatchAgentListRow: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
-                } else if sessionCount > 0 {
-                    Text("\(sessionCount) session\(sessionCount == 1 ? "" : "s")")
+                } else if agent.sessionCount > 0 {
+                    Text("\(agent.sessionCount) session\(agent.sessionCount == 1 ? "" : "s")")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
