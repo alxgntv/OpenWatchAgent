@@ -95,6 +95,7 @@ final class AppModel: ObservableObject {
     private var watchEnrichedSessionCache: [String: WatchGatewaySession] = [:]
     private var pendingAudioJobs: [PendingAudioJob] = []
     private var pendingResumeTask: Task<Void, Never>?
+    private var didRequestGatewayAgentsThisLaunch = false
     private let pendingAudioJobsKey = "openwatch.pendingAudioJobs.v1"
     private let watchMessageTextLimit = 500
 
@@ -289,9 +290,9 @@ final class AppModel: ObservableObject {
 
     // ─── Ariadne's Thread [AT-0089] ─────────────────────
     // What: Cache iPhone-side Watch agent payloads without pushing full lists to Watch.
-    // Why:  Watch owns its visible cache and requests missing agents by known ids; iPhone may only push selectedAgentId directly.
+    // Why:  Watch receives the agent navigation model once at launch and keeps it as local navigation data.
     // Date: 2026-06-08
-    // Related: [AT-0087] AppModel.publishMissingGatewayAgentsToWatch, [AT-0085] watch→WatchAppModel.mergeGatewayAgentDelta
+    // Related: [AT-0122] AppModel.loadGatewayAgentsOnceForLaunch, [AT-0085] watch→WatchAppModel.mergeGatewayAgentDelta
     // ─────────────────────────────────────────────────────
     private func cacheWatchAgentsPayload() {
         let agents = sortedAgentsForDisplay.map {
@@ -305,7 +306,7 @@ final class AppModel: ObservableObject {
             )
         }
         watchAgentsPayload = agents
-        AppLog.info("Cached Watch agents payload count=\(agents.count) selectedAgentId=\(selectedAgentId); waiting for Watch missing-agent request")
+        AppLog.info("Cached Watch agents payload count=\(agents.count) selectedAgentId=\(selectedAgentId)")
     }
 
     private func publishSelectedAgentToWatch() {
@@ -313,83 +314,44 @@ final class AppModel: ObservableObject {
         AppLog.info("Pushed selectedAgentId only to Watch selectedAgentId=\(selectedAgentId)")
     }
 
-    // ─── Ariadne's Thread [AT-0087] ─────────────────────
-    // What: Publish only gateway agents missing from the Watch cache.
-    // Why:  Watch owns its visible agents list and sends known agent ids so iPhone can return deltas only.
-    // Date: 2026-06-08
-    // Related: [AT-0083] shared→WatchEnvelope.knownGatewayAgentIds, [AT-0085] watch→WatchAppModel.mergeGatewayAgentDelta
+    // ─── Ariadne's Thread [AT-0122] ─────────────────────
+    // What: Load and publish the gateway agent navigation model once from the iPhone startup flow.
+    // Why:  Agents are static navigation data for this app launch; the Watch must receive it from startup sync, not by page-driven reload requests.
+    // Date: 2026-06-09
+    // Related: [AT-0124] watch→WatchAppModel.publishAgentNavigationState, AppModel.refreshSessions
     // ─────────────────────────────────────────────────────
-    private func publishMissingGatewayAgentsToWatch(knownIds: Set<String>) async {
-        guard isPaired else { return }
-        do {
-            let agentsResult = try await jobClient.listAgents()
-            gatewayAgents = agentsResult.agents
-            let agents = sortedAgentsForDisplay.map {
-                WatchGatewayAgent(
-                    id: $0.id,
-                    name: $0.name,
-                    emoji: $0.emoji,
-                    subtitle: $0.subtitle,
-                    modelLabel: $0.modelLabel,
-                    isDefault: $0.isDefault
-                )
-            }
-            watchAgentsPayload = agents
-            let missing = agents.filter { !knownIds.contains($0.id) }
-            watchBridge.publishAgents(missing, selectedAgentId: selectedAgentId, force: true)
-            AppLog.info("Watch missing agents sent delta=\(missing.count) knownAgents=\(knownIds.count) totalAgents=\(agents.count) selectedAgentId=\(selectedAgentId)")
-        } catch {
-            let missing = watchAgentsPayload.filter { !knownIds.contains($0.id) }
-            if !missing.isEmpty {
-                watchBridge.publishAgents(missing, selectedAgentId: selectedAgentId, force: true)
-            }
-            AppLog.error("Watch missing agents request failed knownAgents=\(knownIds.count); cachedDelta=\(missing.count): \(error.localizedDescription)")
+    private func loadGatewayAgentsOnceForLaunch(source: String) async {
+        guard !didRequestGatewayAgentsThisLaunch else {
+            AppLog.info("Skipped gateway agents load source=\(source); already requested once this launch agents=\(gatewayAgents.count)")
+            return
         }
-    }
-
-    private func publishAgentNavigationModelToWatch() async {
-        guard isPaired else { return }
-        do {
-            let agentsResult = try await jobClient.listAgents()
-            gatewayAgents = agentsResult.agents
-            let agents = sortedAgentsForDisplay.map {
-                WatchGatewayAgent(
-                    id: $0.id,
-                    name: $0.name,
-                    emoji: $0.emoji,
-                    subtitle: $0.subtitle,
-                    modelLabel: $0.modelLabel,
-                    isDefault: $0.isDefault
-                )
-            }
-            watchAgentsPayload = agents
-            watchBridge.publishAgents(agents, selectedAgentId: selectedAgentId, force: true, fullSnapshot: true)
-            AppLog.info("Watch agent navigation model sent fullSnapshot agents=\(agents.count) selectedAgentId=\(selectedAgentId)")
-        } catch {
-            watchBridge.publishAgents(watchAgentsPayload, selectedAgentId: selectedAgentId, force: true, fullSnapshot: true)
-            AppLog.error("Watch agent navigation model request failed; cachedAgents=\(watchAgentsPayload.count): \(error.localizedDescription)")
-        }
-    }
-
-    /// Loads agents + session index from the gateway. Called on home appear and on pull-to-refresh.
-    func refreshSessions(showErrors: Bool = true) async {
-        guard isPaired else { return }
-        sessionsLoading = true
-        agentsLoading = true
-        defer {
-            sessionsLoading = false
-            agentsLoading = false
-        }
+        didRequestGatewayAgentsThisLaunch = true
         do {
             let agentsResult = try await jobClient.listAgents()
             gatewayAgents = agentsResult.agents
             reconcileSelectedAgent(defaultId: agentsResult.defaultAgentId)
             cacheWatchAgentsPayload()
-            AppLog.info("Loaded \(agentsResult.agents.count) gateway agents defaultId=\(agentsResult.defaultAgentId)")
+            if isPaired {
+                watchBridge.publishAgents(watchAgentsPayload, selectedAgentId: selectedAgentId, force: true, fullSnapshot: true)
+                AppLog.info("Watch startup agent navigation model sent agents=\(watchAgentsPayload.count) selectedAgentId=\(selectedAgentId)")
+            }
+            AppLog.info("Loaded \(agentsResult.agents.count) gateway agents source=\(source) defaultId=\(agentsResult.defaultAgentId)")
         } catch {
-            AppLog.error("agents.list failed: \(error.localizedDescription)")
-            // Keep previous gatewayAgents; UI falls back to Main Actor when empty.
+            AppLog.error("agents.list failed source=\(source): \(error.localizedDescription)")
         }
+    }
+
+    /// Loads the one-time agent index plus session index from the gateway. Later refreshes load only sessions/usage.
+    func refreshSessions(showErrors: Bool = true) async {
+        guard isPaired else { return }
+        sessionsLoading = true
+        let shouldShowAgentsLoading = !didRequestGatewayAgentsThisLaunch
+        if shouldShowAgentsLoading { agentsLoading = true }
+        defer {
+            sessionsLoading = false
+            if shouldShowAgentsLoading { agentsLoading = false }
+        }
+        await loadGatewayAgentsOnceForLaunch(source: "refreshSessions")
         do {
             let (rows, usage) = try await jobClient.listSessionsAndUsage()
             gatewaySessions = rows
@@ -814,16 +776,14 @@ final class AppModel: ObservableObject {
             AppLog.info("Watch selected agent id=\(agentId)")
             selectAgent(agentId)
         case .requestGatewaySessions:
-            await publishMissingGatewayAgentsToWatch(knownIds: Set(envelope.knownGatewayAgentIds ?? []))
             await publishMissingGatewaySessionsToWatch(
                 knownIds: Set(envelope.knownGatewaySessionIds ?? []),
                 knownMessageIdsBySession: envelope.knownGatewayMessageIdsBySession ?? [:],
                 requestedAgentId: envelope.selectedAgentId
             )
         case .requestAgentIndexDelta:
-            await publishAgentNavigationModelToWatch()
+            AppLog.info("Ignored Watch requestAgentIndexDelta; agent navigation model is startup-owned on iPhone")
         case .requestSessionIndexDelta:
-            await publishMissingGatewayAgentsToWatch(knownIds: Set(envelope.knownGatewayAgentIds ?? []))
             await publishMissingGatewaySessionsToWatch(
                 knownIds: Set(envelope.knownGatewaySessionIds ?? []),
                 knownMessageIdsBySession: [:],
@@ -860,7 +820,6 @@ final class AppModel: ObservableObject {
                 return
             }
             Task { await publishGatewayProbeToWatch(reason: "watch-request-sync") }
-            await publishMissingGatewayAgentsToWatch(knownIds: Set(envelope.knownGatewayAgentIds ?? []))
             if envelope.knownGatewaySessionIds != nil || envelope.knownGatewayMessageIdsBySession != nil {
                 await publishMissingGatewaySessionsToWatch(
                     knownIds: Set(envelope.knownGatewaySessionIds ?? []),

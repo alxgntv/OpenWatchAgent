@@ -164,6 +164,7 @@ struct WatchSessionPage: View {
 struct GatewaySessionPage: View {
     @ObservedObject var model: WatchAppModel
     @ObservedObject private var connectivity = WatchConnectivityWatchService.shared
+    @State private var selectedBotMessageId: String?
     let sessionKey: String
 
     // ─── Ariadne's Thread [AT-0116] ─────────────────────
@@ -293,7 +294,13 @@ struct GatewaySessionPage: View {
                 ForEach(turns) { job in
                     VStack(alignment: .leading, spacing: 2) {
                         if let result = job.resultText {
-                            Text(result).font(.footnote)
+                            BotMessageCard(
+                                id: job.id.uuidString,
+                                text: result,
+                                isSelected: selectedBotMessageId == job.id.uuidString,
+                                onSelect: { toggleSelectedBotMessage(job.id.uuidString) },
+                                onSpeak: { model.speakMessageText(result) }
+                            )
                         } else if let error = job.errorMessage {
                             Text(error).font(.caption2).foregroundStyle(.red)
                         }
@@ -305,12 +312,64 @@ struct GatewaySessionPage: View {
                 }
                 // Recent server history (oldest-first slice) reversed so the newest message is on top.
                 ForEach(Array(messages.reversed())) { message in
-                    Text(message.text)
-                        .font(message.isUser ? .caption2 : .footnote)
-                        .foregroundStyle(message.isUser ? Color.secondary : Color.primary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    BotMessageCard(
+                        id: message.id,
+                        text: message.text,
+                        isSelected: selectedBotMessageId == message.id,
+                        onSelect: { toggleSelectedBotMessage(message.id) },
+                        onSpeak: { model.speakMessageText(message.text) }
+                    )
                 }
             }
+        }
+    }
+
+    private func toggleSelectedBotMessage(_ id: String) {
+        selectedBotMessageId = selectedBotMessageId == id ? nil : id
+        AppLog.info("Watch bot message card selected id=\(id) selected=\(selectedBotMessageId == id)")
+    }
+}
+
+// ─── Ariadne's Thread [AT-0120] ─────────────────────
+// What: Render each assistant message as a tappable Watch card with inline speech replay.
+// Why:  The user needs every bot message to be individually replayable without speaking the whole session.
+// Date: 2026-06-09
+// Related: [AT-0119] WatchAppModel.speakMessageText, [AT-0116] GatewaySessionPage.history
+// ─────────────────────────────────────────────────────
+struct BotMessageCard: View {
+    let id: String
+    let text: String
+    let isSelected: Bool
+    let onSelect: () -> Void
+    let onSpeak: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if isSelected {
+                Button {
+                    onSpeak()
+                } label: {
+                    Label("Speak", systemImage: "speaker.wave.2.fill")
+                        .font(.caption2)
+                }
+                .buttonStyle(.bordered)
+            }
+            Text(text)
+                .font(.footnote)
+                .foregroundStyle(.primary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(isSelected ? Color.blue.opacity(0.7) : Color.clear, lineWidth: 1)
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .onTapGesture {
+            onSelect()
         }
     }
 }
@@ -421,33 +480,32 @@ struct GatewaySessionListRow: View {
     }
 }
 
-// ─── Ariadne's Thread [AT-0102] ─────────────────────
-// What: Render agents from AgentsListState and send tap events instead of selecting directly.
-// Why:  Selecting an agent must not mutate agent rows inside a watchOS List tap transaction.
-// Date: 2026-06-08
-// Related: [AT-0099] app→WatchAppModel.reduceAgentTapped, [AT-0098] app→AgentsListState
+// ─── Ariadne's Thread [AT-0123] ─────────────────────
+// What: Render the Agents screen with native watchOS List button rows.
+// Why:  The stable main-branch implementation uses List-owned row transactions for agent taps inside the horizontal TabView.
+// Date: 2026-06-09
+// Related: [AT-0124] WatchAppModel.publishAgentNavigationState
 // ─────────────────────────────────────────────────────
-/// Agents page (one screen left of the live stack): standard watchOS list rows.
+/// Agents page (one screen left of the live stack): local navigation rows loaded once at app launch.
 struct AgentsPage: View {
     @ObservedObject var model: WatchAppModel
-    @Binding var selection: String?
 
     var body: some View {
         let state = model.agentsListState
-        List(state.rows, selection: $selection) { agent in
-            WatchAgentListRow(
-                agent: agent,
-                isSelected: selection == agent.id
-            )
-            .tag(agent.id)
-            .onAppear {
-                AppLog.info("Watch agent row rendered id=\(agent.id)")
+        List {
+            ForEach(state.rows) { agent in
+                Button {
+                    AppLog.info("Watch selected agent row tapped id=\(agent.id)")
+                    model.selectAgent(agent.id)
+                } label: {
+                    WatchAgentListRow(
+                        agent: agent,
+                        isSelected: model.mainAgentIdForUI == agent.id
+                    )
+                }
             }
         }
         .navigationTitle("Agents")
-        .onAppear {
-            model.send(.agentsPageAppeared)
-        }
     }
 }
 
@@ -482,10 +540,6 @@ struct WatchAgentListRow: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
-                } else if agent.sessionCount > 0 {
-                    Text("\(agent.sessionCount) session\(agent.sessionCount == 1 ? "" : "s")")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
                 }
             }
             Spacer(minLength: 0)

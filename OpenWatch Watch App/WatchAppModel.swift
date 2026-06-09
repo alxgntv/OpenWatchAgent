@@ -43,12 +43,10 @@ struct AgentListRowState: Identifiable, Equatable {
     let subtitle: String?
     let modelLabel: String?
     let isDefault: Bool
-    let sessionCount: Int
 }
 
 struct AgentsListState: Equatable {
     var rows: [AgentListRowState] = []
-    var selectedAgentId: String = "main"
 }
 
 struct SessionListRowState: Identifiable, Hashable {
@@ -85,7 +83,6 @@ private struct WatchStore {
 
 enum WatchEvent {
     case transportEnvelope(WatchEnvelope, source: String)
-    case agentsPageAppeared
     case sessionsPageAppeared(agentId: String)
     case sessionDetailAppeared(sessionKey: String)
     case horizontalPageChanged(Int)
@@ -113,7 +110,7 @@ final class WatchAppModel: ObservableObject {
     private let sessionSwitchTapGuardInterval: TimeInterval = 0.4
     /// Selected HORIZONTAL page: 0 = Usage, 1 = Agents, 2 = live stack (main), 3...N = gateway sessions.
     /// Defaults to 2 so the app always opens on the main screen.
-    var horizontalIndex: Int = 2 {
+    @Published var horizontalIndex: Int = 2 {
         didSet {
             guard oldValue != horizontalIndex else { return }
             AppLog.info("Watch horizontal page switched \(oldValue) -> \(horizontalIndex)")
@@ -170,6 +167,7 @@ final class WatchAppModel: ObservableObject {
     private var jobPollingStartedAt: [UUID: Date] = [:]
     private var lastGatewaySessionsFingerprint: String?
     private var pendingAgentTapId: String?
+    private var agentNavigationStateFrozen = false
     // ─── Ariadne's Thread [AT-0109] ─────────────────────
     // What: Keep Main-screen agent selection separate from WatchStore.selectedAgentId.
     // Why:  Checkpoint logs showed signal 6 immediately after mutating WatchStore.selectedAgentId during Agents -> Main navigation.
@@ -204,6 +202,12 @@ final class WatchAppModel: ObservableObject {
     }
     private static let cachedMessageTextLimit = 500
 
+    // ─── Ariadne's Thread [AT-0125] ─────────────────────
+    // What: Compact the Watch gateway session cache to session index rows only.
+    // Why:  watchOS rejects UserDefaults writes once cached transcript messages push the preferences domain over 1 MB.
+    // Date: 2026-06-09
+    // Related: [AT-0094] WatchAppModel.gatewayMessagesBySessionKey, [AT-0093] WatchAppModel.saveSelectedGatewayAgentId
+    // ─────────────────────────────────────────────────────
     private init() {
         sessions = [WatchSession(sessionKey: "agent:main:main")]
         let cachedGatewaySessions = Self.loadCachedGatewaySessions()
@@ -243,8 +247,6 @@ final class WatchAppModel: ObservableObject {
         switch event {
         case .transportEnvelope(let envelope, let source):
             return "transportEnvelope kind=\(envelope.kind.rawValue) source=\(source)"
-        case .agentsPageAppeared:
-            return "agentsPageAppeared"
         case .sessionsPageAppeared(let agentId):
             return "sessionsPageAppeared agentId=\(agentId)"
         case .sessionDetailAppeared(let sessionKey):
@@ -259,8 +261,6 @@ final class WatchAppModel: ObservableObject {
         switch event {
         case .transportEnvelope(let envelope, let source):
             reduceTransportEnvelope(envelope, source: source)
-        case .agentsPageAppeared:
-            publishAgentSnapshots(source: "agentsPageAppeared")
         case .sessionsPageAppeared(let agentId):
             reduceSessionsPageAppeared(agentId: agentId)
         case .sessionDetailAppeared(let sessionKey):
@@ -353,8 +353,10 @@ final class WatchAppModel: ObservableObject {
     func setMainAgentIdForNextRecording(_ agentId: String) {
         pendingAgentTapId = nil
         mainAgentId = agentId
+        selectedAgentId = agentId
+        horizontalIndex = 2
         UserDefaults.standard.set(mainAgentId, forKey: PairingLocalCache.selectedAgentIdKey)
-        AppLog.info("Watch set main agent id for next recording agentId=\(agentId) without publishing UI state or requesting iPhone session data")
+        AppLog.info("Watch set main agent id for next recording agentId=\(agentId) and returned to live page without requesting iPhone session data")
     }
 
     private func commitPendingAgentTapIfNeeded(source: String) {
@@ -521,7 +523,11 @@ final class WatchAppModel: ObservableObject {
         } else {
             AppLog.info("Watch skipped identical gateway agent cache save count=\(currentAgents.count) source=\(source)")
         }
-        publishAgentSnapshots(source: "agentIndexDelta-\(source)")
+        if agentNavigationStateFrozen {
+            AppLog.info("Watch cached agentIndexDelta without republishing frozen navigation state agents=\(currentAgents.count) source=\(source)")
+        } else {
+            publishAgentNavigationState(source: "agentIndexDelta-\(source)")
+        }
         AppLog.info("Watch reducer applied agentIndexDelta agents=\(normalized.count) selectedAgentId=\(delta.selectedAgentId ?? "nil") source=\(source)")
     }
 
@@ -538,6 +544,12 @@ final class WatchAppModel: ObservableObject {
         }
         guard horizontalIndex == 3, pendingSessionIndexRequestAgentId != nil else {
             AppLog.info("Watch skipped sessionIndexDelta outside Sessions page rows=\(delta.sessions.count) page=\(horizontalIndex) pendingRequest=\(pendingSessionIndexRequestAgentId ?? "nil") source=\(source)")
+            return
+        }
+        guard !delta.sessions.isEmpty else {
+            pendingSessionIndexRequestAgentId = nil
+            sessionListState.isLoading = false
+            AppLog.info("Watch skipped empty sessionIndexDelta without cache save rows=0 existingRows=\(sessionListState.rows.count) source=\(source)")
             return
         }
         let beforeRows = sessionListState.rows.map(\.id)
@@ -608,12 +620,11 @@ final class WatchAppModel: ObservableObject {
     // Related: [AT-0099] WatchAppModel.reduceAgentTapped, [AT-0101] WatchHomeView.GatewaySessionsListPage
     // ─────────────────────────────────────────────────────
     private func rebuildWatchSnapshots(updateSessionList: Bool = true, updateDetails: Bool = true) {
-        syncLegacyAgentIndexFromStore()
+        publishAgentNavigationState(source: "rebuildWatchSnapshots")
         if updateSessionList {
             syncLegacySessionIndexFromStore()
         }
         shellState = WatchShellState(selectedHorizontalPage: horizontalIndex, isPaired: isPaired)
-        agentsListState = buildAgentsListState()
         if updateSessionList {
             sessionListState = buildSessionListState(isLoading: sessionListState.isLoading)
         }
@@ -627,13 +638,13 @@ final class WatchAppModel: ObservableObject {
         AppLog.info("Watch snapshots rebuilt agents=\(agentsListState.rows.count) sessions=\(sessionListState.rows.count) selectedAgentId=\(watchStore.selectedAgentId)")
     }
 
-    // ─── Ariadne's Thread [AT-0107] ─────────────────────
-    // What: Publish agent snapshots only from user-visible agent UI events.
-    // Why:  Remote agentIndexDelta can arrive while the main TabView is mounting; publishing Agents list state there still crashes watchOS with signal 6.
-    // Date: 2026-06-08
-    // Related: [AT-0099] WatchAppModel.applyAgentIndexDelta, [AT-0102] WatchHomeView.AgentsPage
+    // ─── Ariadne's Thread [AT-0124] ─────────────────────
+    // What: Freeze the Watch agent navigation state after the first non-empty startup snapshot.
+    // Why:  The Agents screen is static navigation for this launch; later iPhone agent snapshots update cache only and must not rewrite visible paging rows.
+    // Date: 2026-06-09
+    // Related: [AT-0123] WatchHomeView.AgentsPage, [AT-0122] app→AppModel.loadGatewayAgentsOnceForLaunch
     // ─────────────────────────────────────────────────────
-    private func publishAgentSnapshots(source: String) {
+    private func publishAgentNavigationState(source: String) {
         let nextAgents = watchStore.agentOrder.compactMap { watchStore.agentsById[$0] }
         if gatewayAgents != nextAgents {
             gatewayAgents = nextAgents
@@ -642,9 +653,13 @@ final class WatchAppModel: ObservableObject {
         let nextState = buildAgentsListState()
         if agentsListState != nextState {
             agentsListState = nextState
-            AppLog.info("Watch published AgentsListState rows=\(nextState.rows.count) selectedAgentId=\(nextState.selectedAgentId) source=\(source)")
+            AppLog.info("Watch published AgentsListState rows=\(nextState.rows.count) source=\(source)")
         } else {
             AppLog.info("Watch skipped identical AgentsListState publish source=\(source)")
+        }
+        if !watchStore.agentOrder.isEmpty, !agentNavigationStateFrozen {
+            agentNavigationStateFrozen = true
+            AppLog.info("Watch froze agent navigation state rows=\(nextState.rows.count) source=\(source)")
         }
     }
 
@@ -656,11 +671,10 @@ final class WatchAppModel: ObservableObject {
                 emoji: agent.emoji,
                 subtitle: agent.subtitle,
                 modelLabel: agent.modelLabel,
-                isDefault: agent.isDefault,
-                sessionCount: watchStore.sessionOrderByAgentId[agent.id]?.count ?? 0
+                isDefault: agent.isDefault
             )
         }
-        return AgentsListState(rows: rows, selectedAgentId: mainAgentId)
+        return AgentsListState(rows: rows)
     }
 
     // ─── Ariadne's Thread [AT-0111] ─────────────────────
@@ -745,10 +759,6 @@ final class WatchAppModel: ObservableObject {
         return rows
     }
 
-    private func syncLegacyAgentIndexFromStore() {
-        gatewayAgents = watchStore.agentOrder.compactMap { watchStore.agentsById[$0] }
-    }
-
     private func syncLegacySessionIndexFromStore() {
         let orderedIds = watchStore.sessionOrderByAgentId
             .keys
@@ -765,6 +775,9 @@ final class WatchAppModel: ObservableObject {
         do {
             let cached = try JSONDecoder().decode([WatchGatewaySession].self, from: data)
             let normalized = normalizeGatewaySessions(cached)
+            if normalized.contains(where: { !$0.messages.isEmpty }) {
+                saveCachedGatewaySessionIndexOnly(Self.gatewaySessionIndex(from: normalized), source: "loadCachedGatewaySessions")
+            }
             AppLog.info("Watch loaded cached gateway sessions count=\(normalized.count) rawCount=\(cached.count)")
             return normalized
         } catch {
@@ -786,15 +799,30 @@ final class WatchAppModel: ObservableObject {
                     title: row.title,
                     preview: row.preview,
                     updatedAt: row.updatedAt,
-                    messages: watchStore.messagesBySessionKey[row.id] ?? []
+                    messages: []
                 )
             }
             let data = try JSONEncoder().encode(sessions)
-            UserDefaults.standard.set(data, forKey: PairingLocalCache.gatewaySessionsKey)
-            AppLog.info("Watch saved cached gateway store sessions=\(sessions.count) messageSessions=\(watchStore.messagesBySessionKey.count)")
+            Self.replaceCachedGatewaySessionsData(data)
+            AppLog.info("Watch saved cached gateway store sessionIndexOnly sessions=\(sessions.count) inMemoryMessageSessions=\(watchStore.messagesBySessionKey.count)")
         } catch {
             AppLog.error("Watch cached gateway sessions encode failed: \(error.localizedDescription)")
         }
+    }
+
+    private static func saveCachedGatewaySessionIndexOnly(_ sessions: [WatchGatewaySession], source: String) {
+        do {
+            let data = try JSONEncoder().encode(sessions)
+            replaceCachedGatewaySessionsData(data)
+            AppLog.info("Watch compacted cached gateway sessions sessionIndexOnly sessions=\(sessions.count) bytes=\(data.count) source=\(source)")
+        } catch {
+            AppLog.error("Watch compact cached gateway sessions encode failed source=\(source): \(error.localizedDescription)")
+        }
+    }
+
+    private static func replaceCachedGatewaySessionsData(_ data: Data) {
+        UserDefaults.standard.removeObject(forKey: PairingLocalCache.gatewaySessionsKey)
+        UserDefaults.standard.set(data, forKey: PairingLocalCache.gatewaySessionsKey)
     }
 
     // ─── Ariadne's Thread [AT-0078] ─────────────────────
@@ -1115,6 +1143,7 @@ final class WatchAppModel: ObservableObject {
         gatewayAgents = []
         selectedAgentId = "main"
         mainAgentId = "main"
+        agentNavigationStateFrozen = false
         WatchGatewayCredentialStore.clear()
         sessions = [WatchSession(sessionKey: "agent:main:main")]
         currentIndex = 0
@@ -1184,11 +1213,6 @@ final class WatchAppModel: ObservableObject {
         return id.isEmpty ? "main" : id
     }
 
-    /// Session count for an agent (shown on the Agents page).
-    func sessionCount(forAgentId agentId: String) -> Int {
-        gatewaySessions.filter { sessionAgentId(from: $0.id) == agentId }.count
-    }
-
     func hasActiveGatewayJob(for sessionKey: String) -> Bool {
         gatewayActiveJob(for: sessionKey) != nil
     }
@@ -1237,9 +1261,18 @@ final class WatchAppModel: ObservableObject {
     // Date: 2026-06-05
     // Related: WatchAppModel.finishRecordingAndSend, WatchAppModel.ensureTopNewSessionPageAfterSend
     // ─────────────────────────────────────────────────────
-    /// User picked an agent on the Watch — keep it local until the main Speak flow creates that agent session.
+    /// User picked an agent on the Watch — open a fresh live session for that agent and sync selection to the iPhone.
     func selectAgent(_ agentId: String) {
-        setMainAgentIdForNextRecording(agentId)
+        pendingAgentTapId = nil
+        mainAgentId = agentId
+        selectedAgentId = agentId
+        sessions = [WatchSession(sessionKey: newSessionKey(for: agentId))]
+        currentIndex = 0
+        horizontalIndex = 2
+        statusHint = nil
+        UserDefaults.standard.set(mainAgentId, forKey: PairingLocalCache.selectedAgentIdKey)
+        AppLog.info("Watch selectAgent id=\(agentId); started fresh live session key=\(sessions[0].sessionKey); sending to iPhone")
+        bridge.sendCommand(WatchEnvelope(kind: .selectAgent, text: agentId))
     }
 
     private func applySelectedAgentFromIPhone(_ agentId: String) {
@@ -1460,7 +1493,7 @@ final class WatchAppModel: ObservableObject {
         // What: Move selected-agent live session creation from Agents List tap to Speak.
         // Why:  Mutating the live TabView session array during an Agents List tap crashes watchOS with signal 6.
         // Date: 2026-06-08
-        // Related: [AT-0099] WatchAppModel.reduceAgentTapped, [AT-0107] WatchAppModel.publishAgentSnapshots
+        // Related: [AT-0123] WatchHomeView.AgentsPage, [AT-0124] WatchAppModel.publishAgentNavigationState
         // ─────────────────────────────────────────────────────
         let selectedAgentForRecording = pendingAgentTapId ?? mainAgentId
         if sessionAgentId(from: sessions[currentIndex].sessionKey) != selectedAgentForRecording {
@@ -2112,6 +2145,19 @@ final class WatchAppModel: ObservableObject {
             FlowLog.result(step: 7, side: .watch, flow: "display-reply", success: false, detail: "nothing to display status=\(job.status.rawValue)")
         }
         FlowLog.finished(step: 7, side: .watch, flow: "display-reply")
+    }
+
+    // ─── Ariadne's Thread [AT-0119] ─────────────────────
+    // What: Expose manual Watch TTS playback for a single bot message.
+    // Why:  Session message cards need to replay exactly the tapped assistant text on demand.
+    // Date: 2026-06-09
+    // Related: [AT-0062] WatchAppModel.speakOnce, [AT-0120] WatchHomeView.BotMessageCard
+    // ─────────────────────────────────────────────────────
+    func speakMessageText(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        SpeechPlaybackService.shared.speak(trimmed, language: globalTtsLanguage, rateMultiplier: globalTtsRate)
+        AppLog.info("Watch TTS manual message playback length=\(trimmed.count)")
     }
 
     /// Speaks the reply exactly once per job, letting it read to the end without restarting.

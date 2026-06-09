@@ -11,7 +11,6 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
 
     private let session = WCSession.default
     private var pendingSyncAfterActivation = false
-    private var pendingAgentNavigationModelAfterActivation = false
     private var independentWSSProbeStarted = false
     private var pendingIPhoneRelayProbeRequestId: String?
 
@@ -216,23 +215,6 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
         )
         sendCommand(envelope)
         AppLog.info("Watch requested sessionIndexDelta knownAgents=\(knownAgentIds.count) knownSessions=\(knownSessionIds.count) selectedAgentId=\(selectedAgentId)")
-    }
-
-    func requestAgentNavigationModel(knownAgentIds: [String]) {
-        guard session.activationState == .activated else {
-            pendingAgentNavigationModelAfterActivation = true
-            AppLog.info("Watch navigation model request deferred until WCSession activates knownAgents=\(knownAgentIds.count)")
-            return
-        }
-        pendingAgentNavigationModelAfterActivation = false
-        let envelope = WatchEnvelope(
-            kind: .requestAgentIndexDelta,
-            pairing: WatchAppModel.shared.pairing,
-            selectedAgentId: WatchAppModel.shared.selectedAgentIdForSync,
-            knownGatewayAgentIds: knownAgentIds
-        )
-        sendCommand(envelope)
-        AppLog.info("Watch requested agent navigation model knownAgents=\(knownAgentIds.count)")
     }
 
     func requestSessionMessagesDelta(
@@ -530,9 +512,6 @@ extension WatchConnectivityWatchService: WCSessionDelegate {
                 service.logConnectivitySnapshot(reason: "wc-activated")
                 if activationState == .activated {
                     service.applyLatestApplicationContextOnActivation()
-                    if service.pendingAgentNavigationModelAfterActivation {
-                        service.requestAgentNavigationModel(knownAgentIds: WatchAppModel.shared.knownGatewayAgentIdsForSync)
-                    }
                     if service.pendingSyncAfterActivation {
                         AppLog.info("Watch running deferred requestSync after activation")
                         service.requestSync()

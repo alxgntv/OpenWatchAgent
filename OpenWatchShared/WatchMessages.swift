@@ -24,7 +24,7 @@ nonisolated public enum WatchMessageKind: String, Codable, Sendable {
     case gatewayProbe
     /// Watch → iPhone: request only gateway sessions that are missing on Watch.
     case requestGatewaySessions
-    /// Watch → iPhone: request the full local navigation model for agent selection.
+    /// Legacy Watch → iPhone request for the agent navigation model. Current flow is iPhone startup-owned.
     case requestAgentIndexDelta
     /// iPhone → Watch: configured gateway agent index delta.
     case agentIndexDelta
