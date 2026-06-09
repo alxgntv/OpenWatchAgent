@@ -9,6 +9,13 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
 
     @Published private(set) var hasIPhoneInternetBridge = false
 
+    /// True when the Watch can hand off a recorded voice note: iPhone relay, direct Watch internet, or proven iPhone WSS bridge.
+    var canSendVoice: Bool {
+        if hasIPhoneInternetBridge { return true }
+        if WatchNetworkPathMonitor.shared.internetAvailable { return true }
+        return session.activationState == .activated && session.isCompanionAppInstalled
+    }
+
     private let session = WCSession.default
     private var pendingSyncAfterActivation = false
     private var independentWSSProbeStarted = false

@@ -21,7 +21,7 @@ struct WatchSession: Identifiable, Equatable {
 
     var isEmpty: Bool { jobs.isEmpty }
     var latestJob: VoiceJob? { jobs.first }
-    var activeJob: VoiceJob? { jobs.first { !$0.status.isTerminal && $0.status != .idle } }
+    var activeJob: VoiceJob? { jobs.first { !$0.status.isTerminal && $0.status != .idle && $0.status != .listening } }
     var retryJob: VoiceJob? { jobs.first { $0.status == .failed && $0.statusDetail == "Retry" } }
 }
 
@@ -1820,7 +1820,11 @@ final class WatchAppModel: ObservableObject {
 
     /// The in-flight turn for a gateway page, if any (drives the spinner + status inside the Speak button).
     func gatewayActiveJob(for sessionKey: String) -> VoiceJob? {
-        gatewayJobs[sessionKey]?.first { !$0.status.isTerminal && $0.status != .idle }
+        gatewayJobs[sessionKey]?.first { job in
+            guard !job.status.isTerminal && job.status != .idle else { return false }
+            if job.status == .listening { return isRecordingGateway(sessionKey) }
+            return true
+        }
     }
 
     func gatewayRetryJob(for sessionKey: String) -> VoiceJob? {
@@ -1874,12 +1878,20 @@ final class WatchAppModel: ObservableObject {
         beginFileRecording(session: WatchSession(sessionKey: sessionKey), gatewayKey: sessionKey)
     }
 
+    // ─── Ariadne's Thread [AT-0126] ─────────────────────
+    // What: Send saved audio after stopping gateway-session recording (same as live sessions).
+    // Why:  finishGatewayRecordingAndSend only stopped the file recorder and discarded the audio, leaving the Speak button stuck.
+    // Date: 2026-06-09
+    // Related: [AT-0037] WatchAppModel.finishRecordingAndSend, [AT-0026] WatchAppModel.beginFileRecording
+    // ─────────────────────────────────────────────────────
     private func finishGatewayRecordingAndSend() async {
         if recorder.isRecording {
-            _ = finishFileRecording()
+            guard let savedAudio = finishFileRecording() else { return }
+            sendSavedAudioFileToIPhoneBot(savedAudio)
             return
         }
         statusHint = "Recording failed"
+        recordingJobId = nil
         gatewayRecordingKey = nil
         objectWillChange.send()
         AppLog.error("Watch gateway finishRecording blocked: file recorder is not active")

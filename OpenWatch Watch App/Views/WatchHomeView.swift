@@ -69,7 +69,7 @@ struct WatchSessionPage: View {
     }
 
     private var isWaitingForIPhoneInternet: Bool {
-        !connectivity.hasIPhoneInternetBridge && !isRecordingHere && session.activeJob == nil && retryJob == nil
+        !connectivity.canSendVoice && !isRecordingHere && session.activeJob == nil && retryJob == nil
     }
 
     @ViewBuilder
@@ -185,7 +185,7 @@ struct GatewaySessionPage: View {
     private var retryJob: VoiceJob? { model.gatewayRetryJob(for: sessionKey) }
     private var isRecordingHere: Bool { model.isRecordingGateway(sessionKey) }
     private var isWaitingForIPhoneInternet: Bool {
-        !connectivity.hasIPhoneInternetBridge && !isRecordingHere && activeJob == nil && retryJob == nil
+        !connectivity.canSendVoice && !isRecordingHere && activeJob == nil && retryJob == nil
     }
 
     var body: some View {
