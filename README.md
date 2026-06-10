@@ -1,46 +1,86 @@
-# OpenWatch
+# Open Watch Platform
 
-Apple Watch + iPhone companion for voice commands to an **OpenClaw** agent (Coordinator / `main` by default).
+Open Watch Platform is an open-source watch-first interface for your personal AI agents. It lets you talk to an agent from your wrist, send a voice command, receive a response, and hear it in your headphones without opening a computer or holding a phone.
 
-## Docs (source of truth)
+The goal is simple: anyone with a watch that has internet access should be able to reach their own AI agents anywhere. The agent can be OpenClaw, Nanoclaw, Hermes, or any other personal agent stack. The watch is just the natural access point.
 
-| Doc | Contents |
-|-----|----------|
-| [docs/PRODUCT.md](docs/PRODUCT.md) | UX, job model, screens, iPhone vs Watch split |
-| [docs/PAIRING.md](docs/PAIRING.md) | **Native OpenClaw pairing** via **setup code** (`openclaw qr --setup-code-only`) |
+If you want your AI assistant to feel always available, mobile, and close to you instead of trapped inside a desktop or phone chat window, this is it.
+
+Current implementation: Apple Watch + iPhone companion for voice commands to an **OpenClaw** agent.
+
+Docs: [Product](docs/PRODUCT.md) · [Pairing](docs/PAIRING.md)
+
+New install? Start here: [Pairing](docs/PAIRING.md)
+
+Preferred setup: run your own agent gateway, generate a setup code, pair the iPhone app, approve the device, then speak to your agent from Apple Watch. Open Watch Platform is designed so the community can extend it to more watches, more platforms, and more agent backends.
+
+## Why
+
+Most AI-agent workflows still assume that you are sitting at a computer or holding a phone. You open Telegram, WhatsApp, Slack, or another interface, press and hold a recording button, speak, wait, and read or listen to the reply.
+
+That works at a desk. It does not work well on a bike, during training, on a walk, in a sauna, while traveling, or in any situation where your hands are busy and pulling out a phone is unsafe, awkward, or just too much friction.
+
+Open Watch Platform turns the watch into the shortest path to your agent. Raise your wrist, tap one button, speak, send, and hear the response in AirPods or other headphones.
+
+## Philosophy
+
+An AI agent should not be a tool you have to go to. It should be a helper that is available when you need it, where you already are.
+
+Open Watch Platform exists to make access to personal AI agents more natural, mobile, and independent from any single device. The project is open source so the community can improve it, adapt it, and expand it to any platform where a person may want a direct voice link to their agent.
+
+The original idea came from a simple moment: riding a bike to training while an OpenClaw agent was working on a project. The agent kept sending updates, but interacting with it through a phone chat while cycling was unsafe and inconvenient. The watch was already on the wrist. The missing piece was obvious: tap, speak, send, listen.
+
+## Supported Agents
+
+Open Watch Platform is intended to work with any personal AI-agent backend.
+
+Current focus:
+
+- OpenClaw
+
+Planned by design:
+
+- Nanoclaw
+- Hermes
+- Any gateway or agent API the community wants to connect
 
 ## Status
 
 - **iPhone:** setup code pairing, approval screen, home + job list, speech on phone.
-- **Watch:** tap Listen → tap Send, job list/detail, TTS on done.
-- **Bridge:** WatchConnectivity — watch commands use `transferUserInfo` (iPhone in background / locked OK after first permissions).
+- **Watch:** tap Listen, tap Send, job list/detail, TTS on done.
+- **Bridge:** WatchConnectivity, so watch commands can reach the iPhone companion.
 - **Jobs:** placeholder response until OpenClaw agent RPC is wired (`GatewayJobClient`).
-- Open `OpenWatch.xcodeproj` in **Xcode 16+** (stable). Scheme **OpenWatch** → destination **your iPhone** (iOS 18+, not “iOS 26.5 Not Installed”). If Xcode 26 beta asks to download iOS 26.5 — cancel; use stable Xcode or install **iOS 18** platform in Xcode → Settings → Platforms.
-
-## Run on a real iPhone (signing)
-
-1. **Xcode → Settings → Accounts** — sign in with your Apple ID (same as on the iPhone).
-2. Select target **OpenWatch** → **Signing & Capabilities** → enable **Automatically manage signing** → **Team** = your Personal Team (or paid team).
-3. Repeat for **OpenWatch Watch App** — **same Team**.
-4. Bundle IDs in repo: `com.alexeyignatov.OpenWatch` (iPhone) and `com.alexeyignatov.OpenWatch.watchkitapp` (Watch). If registration still fails, pick another unique prefix and update both targets + `WKCompanionAppBundleIdentifier` on the Watch target.
-5. **Product → Run** on a connected iPhone (scheme **OpenWatch**, not Watch App only).
-6. **Apple Watch:** do not rely on **INSTALL** in the iPhone **Watch** app until Xcode has installed once. Select your **Apple Watch** as the Run destination (or run **OpenWatch** on iPhone with the watch paired and unlocked) so the watch app is signed and embedded. Enable **Developer Mode** on the watch (Settings → Privacy & Security). Minimum **watchOS 10** (project deployment target).
-
-### Watch: “Could not install at this time”
-
-The **INSTALL** button in the iPhone **Watch** app often fails for **development** builds. Use Xcode instead:
-
-1. Delete **OpenWatch** on iPhone and on the watch (if present).
-2. **Product → Clean Build Folder**.
-3. Scheme **OpenWatch** → destination **your Apple Watch** (not only iPhone) → **Run**.  
-   Or scheme **OpenWatch Watch App** → destination **Apple Watch** → **Run** (installs the watch app directly).
-4. Do **not** use **INSTALL** in AVAILABLE APPS until step 3 succeeded once.
-5. Same **Team** on both targets; iPhone and watch app icons must exist (1024×1024 in asset catalogs).
-6. Watch **Developer Mode** on; watch unlocked and paired.
-
-Paid **Apple Developer Program** is optional for your own device; free Apple ID works (~7-day cert, reinstall from Xcode when expired).
 
 ## Requirements
 
-- User runs their **own OpenClaw Gateway** (self-hosted). OpenWatch does not host agents.
-- Pairing: user enters **setup code** from `openclaw qr --setup-code-only`, then owner runs `openclaw devices approve`.
+- Apple Watch with watchOS 10+.
+- iPhone with iOS 18+.
+- Xcode 16+.
+- A self-hosted OpenClaw Gateway for the current implementation.
+- Pairing through a setup code from `openclaw qr --setup-code-only`, followed by `openclaw devices approve`.
+
+## Run on a real iPhone
+
+1. Open `OpenWatch.xcodeproj` in Xcode 16+.
+2. In **Xcode -> Settings -> Accounts**, sign in with your Apple ID.
+3. Select target **OpenWatch** -> **Signing & Capabilities** -> enable **Automatically manage signing** -> choose your Team.
+4. Repeat the same signing setup for **OpenWatch Watch App**.
+5. Run scheme **OpenWatch** on a connected iPhone.
+6. Run scheme **OpenWatch Watch App** on a paired Apple Watch.
+
+Bundle IDs in this repo:
+
+- iPhone: `com.alexeyignatov.OpenWatch`
+- Watch: `com.alexeyignatov.OpenWatch.watchkitapp`
+
+Paid Apple Developer Program is optional for your own device. A free Apple ID works with the usual development certificate limits.
+
+## Watch Install Notes
+
+The **INSTALL** button in the iPhone **Watch** app often fails for development builds. Use Xcode instead:
+
+1. Delete **OpenWatch** on iPhone and Apple Watch if needed.
+2. Use **Product -> Clean Build Folder**.
+3. Run scheme **OpenWatch Watch App** directly on Apple Watch.
+4. Keep the watch unlocked, paired, and near the iPhone/Mac.
+5. Make sure Developer Mode is enabled on the watch.
