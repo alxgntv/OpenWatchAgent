@@ -44,6 +44,10 @@ nonisolated public enum WatchMessageKind: String, Codable, Sendable {
     case requestSessionIndexDelta
     /// Watch → iPhone: request missing messages for one session.
     case requestSessionMessagesDelta
+    /// Watch → iPhone: request fresh usage stats for the Usage page.
+    case requestUsage
+    /// Watch → iPhone: request a full agents.list snapshot for the Agents page.
+    case requestAgents
 }
 
 /// Aggregate usage derived from the gateway's `sessions.list`, mirrored to the Watch's Usage page.

@@ -12,7 +12,7 @@ final class PhoneNetworkPathMonitor {
     static let shared = PhoneNetworkPathMonitor()
 
     private let monitor = NWPathMonitor()
-    private let queue = DispatchQueue(label: "com.alexeyignatov.OpenWatch.phone-network-monitor")
+    private let queue = DispatchQueue(label: "com.openwatchagent.phone-network-monitor")
     private(set) var lastPathSummary = "status=unknown"
     private(set) var internetAvailable = false
 

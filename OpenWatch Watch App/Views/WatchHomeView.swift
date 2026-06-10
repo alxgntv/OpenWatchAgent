@@ -573,6 +573,20 @@ struct AgentsPage: View {
                     )
                 }
             }
+            Button {
+                AppLog.info("Agents page Retry tapped cached=\(state.rows.count) refreshing=\(model.agentsRefreshing)")
+                model.refreshAgents()
+            } label: {
+                if model.agentsRefreshing {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                        Text("Refreshing…")
+                    }
+                } else {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                }
+            }
+            .disabled(model.agentsRefreshing)
         }
         .navigationTitle("Agents")
     }
@@ -638,15 +652,35 @@ struct UsagePage: View {
                     statRow("Last activity", Self.relativeActivity(usage.lastActivityAt))
                     if let model = usage.model { statRow("Model", model) }
                 } else {
-                    Text("Open the iPhone app to load usage.")
+                    Text("No usage data yet.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
+                retryButton
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 4)
         }
         .navigationTitle("Usage")
+    }
+
+    private var retryButton: some View {
+        Button {
+            AppLog.info("Usage page Retry tapped cached=\(model.usage != nil) refreshing=\(model.usageRefreshing)")
+            model.refreshUsage()
+        } label: {
+            if model.usageRefreshing {
+                HStack(spacing: 6) {
+                    ProgressView()
+                    Text("Refreshing…")
+                }
+            } else {
+                Label("Retry", systemImage: "arrow.clockwise")
+            }
+        }
+        .buttonStyle(.bordered)
+        .frame(maxWidth: .infinity)
+        .disabled(model.usageRefreshing)
     }
 
     private func statRow(_ label: String, _ value: String) -> some View {

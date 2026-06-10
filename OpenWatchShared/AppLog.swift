@@ -2,7 +2,7 @@ import Foundation
 import os
 
 nonisolated public enum AppLog {
-    private static let logger = Logger(subsystem: "com.alexeyignatov.OpenWatch", category: "OpenWatch")
+    private static let logger = Logger(subsystem: "com.openwatchagent", category: "OpenWatchAgent")
 
     public static func info(_ message: String) {
         logger.info("\(message, privacy: .public)")

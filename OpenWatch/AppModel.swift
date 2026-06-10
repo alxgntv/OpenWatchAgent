@@ -136,6 +136,8 @@ final class AppModel: ObservableObject {
     private var watchAgentsPayload: [WatchGatewayAgent] = []
     /// Tracks the in-flight Watch enrichment so a new refresh supersedes an older one.
     private var watchEnrichTask: Task<Void, Never>?
+    /// Fills iPhone session previews from chat.history when sessions.list only returns raw session keys.
+    private var sessionPreviewEnrichTask: Task<Void, Never>?
     /// Already enriched sessions keyed by sessionKey. Used to avoid refetching/resending the same session messages.
     private var watchEnrichedSessionCache: [String: WatchGatewaySession] = [:]
     private var pendingAudioJobs: [PendingAudioJob] = []
@@ -461,10 +463,80 @@ final class AppModel: ObservableObject {
             AppLog.info("Loaded \(rows.count) gateway sessions; usage totalTokens=\(usage.totalTokens) sessions=\(usage.sessionCount)")
             pushSessionListToWatch(rows: rows)
             pushUsageToWatch(usage)
+            enrichSessionPreviewsForDisplay(rows: rows)
         } catch {
             handleRefreshSessionsError(error, showErrors: showErrors)
         }
         AppLog.info("refreshSessions finished agents=\(gatewayAgents.count) sessions=\(gatewaySessions.count)")
+    }
+
+    // ─── Ariadne's Thread [AT-0148] ─────────────────────
+    // What: Backfill iPhone session card titles from the latest chat.history message when sessions.list has no preview.
+    // Why:  Gateway rows often expose only the sessionKey as title; the home list must show one readable last-message line.
+    // Date: 2026-06-10
+    // Related: [AT-0148] GatewaySessionRow.displayTitle, HomeView.SessionCardView
+    // ─────────────────────────────────────────────────────
+    private func enrichSessionPreviewsForDisplay(rows: [GatewaySessionRow]) {
+        sessionPreviewEnrichTask?.cancel()
+        sessionPreviewEnrichTask = Task { [weak self] in
+            guard let self else { return }
+            var updates: [String: String] = [:]
+            for row in rows {
+                if Task.isCancelled { return }
+                if Self.sessionRowHasReadablePreview(row) {
+                    AppLog.info("Session preview enrich skipped readable row sessionKey=\(row.id)")
+                    continue
+                }
+                if let cached = await MainActor.run(body: { self.watchEnrichedSessionCache[row.id] }),
+                   let last = cached.messages.last?.text.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !last.isEmpty {
+                    updates[row.id] = GatewaySessionRow.singleLine(last)
+                    AppLog.info("Session preview enrich used cached history sessionKey=\(row.id) length=\(updates[row.id]?.count ?? 0)")
+                    continue
+                }
+                do {
+                    let messages = try await self.jobClient.fetchHistory(sessionKey: row.id)
+                    if let last = messages.last?.text.trimmingCharacters(in: .whitespacesAndNewlines), !last.isEmpty {
+                        updates[row.id] = GatewaySessionRow.singleLine(last)
+                        AppLog.info("Session preview enrich fetched history sessionKey=\(row.id) length=\(updates[row.id]?.count ?? 0)")
+                    } else {
+                        AppLog.info("Session preview enrich found no history text sessionKey=\(row.id)")
+                    }
+                } catch {
+                    AppLog.error("Session preview enrich failed sessionKey=\(row.id): \(error.localizedDescription)")
+                }
+            }
+            if Task.isCancelled { return }
+            await MainActor.run {
+                self.applySessionPreviewUpdates(updates)
+            }
+        }
+    }
+
+    private static func sessionRowHasReadablePreview(_ row: GatewaySessionRow) -> Bool {
+        if let preview = row.preview?.trimmingCharacters(in: .whitespacesAndNewlines), !preview.isEmpty {
+            return true
+        }
+        let title = row.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !title.isEmpty && title != row.id
+    }
+
+    private func applySessionPreviewUpdates(_ updates: [String: String]) {
+        guard !updates.isEmpty else {
+            AppLog.info("Session preview enrich finished with no updates")
+            return
+        }
+        gatewaySessions = gatewaySessions.map { row in
+            guard let preview = updates[row.id] else { return row }
+            return GatewaySessionRow(
+                id: row.id,
+                title: row.title,
+                preview: preview,
+                updatedAt: row.updatedAt,
+                messageCount: row.messageCount
+            )
+        }
+        AppLog.info("Session preview enrich applied updates=\(updates.count) sessions=\(gatewaySessions.count)")
     }
 
     // ─── Ariadne's Thread [AT-0010] ─────────────────────
@@ -513,7 +585,7 @@ final class AppModel: ObservableObject {
     private func pushUsageToWatch(_ usage: GatewayUsage) {
         let watch = usageSnapshotForWatch(from: usage, agentCount: configuredAgentCount)
         watchUsage = watch
-        AppLog.info("Pushing usage to Watch sessions=\(watch.sessionCount) agents=\(watch.agentCount) totalTokens=\(watch.totalTokens)")
+        AppLog.info("Pushing usage to Watch sessions=\(watch.sessionCount) agents=\(watch.agentCount) totalTokens=\(watch.totalTokens) totalMessages=\(watch.totalMessages)")
         watchBridge.publishUsage(watch)
     }
 
@@ -529,6 +601,47 @@ final class AppModel: ObservableObject {
             model: usage.model,
             agentCount: agentCount
         )
+    }
+
+    // ─── Ariadne's Thread [AT-0150] ─────────────────────
+    // What: Refresh gateway usage for the Watch Usage page on explicit Watch requestUsage.
+    // Why:  Usage Retry must fetch live gateway stats; cold start on Watch uses its own cached snapshot.
+    // Date: 2026-06-10
+    // Related: [AT-0150] GatewayJobClient.listSessionsAndUsage, WatchAppModel.refreshUsage
+    // ─────────────────────────────────────────────────────
+    private func refreshUsageForWatch() async {
+        guard isPaired else {
+            AppLog.error("refreshUsageForWatch skipped: not paired")
+            return
+        }
+        await loadGatewayAgentsOnceForLaunch(source: "watch-request-usage")
+        do {
+            let (_, usage) = try await jobClient.listSessionsAndUsage()
+            pushUsageToWatch(usage)
+            AppLog.info("refreshUsageForWatch succeeded sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens) totalMessages=\(usage.totalMessages)")
+        } catch {
+            AppLog.error("refreshUsageForWatch failed: \(error.localizedDescription)")
+            republishCachedUsageToWatch(force: true)
+        }
+    }
+
+    // ─── Ariadne's Thread [AT-0151] ─────────────────────
+    // What: Refresh gateway agents for the Watch Agents page on explicit Watch requestAgents.
+    // Why:  Agents Retry must fetch agents.list and push a full snapshot to replace the Watch list.
+    // Date: 2026-06-10
+    // Related: [AT-0151] AppModel.loadGatewayAgents, WatchAppModel.refreshAgents
+    // ─────────────────────────────────────────────────────
+    private func refreshAgentsForWatch() async {
+        guard isPaired else {
+            AppLog.error("refreshAgentsForWatch skipped: not paired")
+            return
+        }
+        await loadGatewayAgents(source: "watch-request-agents", publishToWatch: true)
+        if watchAgentsPayload.isEmpty {
+            AppLog.error("refreshAgentsForWatch finished with empty agents payload")
+        } else {
+            AppLog.info("refreshAgentsForWatch succeeded agents=\(watchAgentsPayload.count) selectedAgentId=\(selectedAgentId)")
+        }
     }
 
     private func republishCachedUsageToWatch(force: Bool = false) {
@@ -907,6 +1020,18 @@ final class AppModel: ObservableObject {
                 knownMessageIdsBySession: [requestedKey: knownMessageIds],
                 requestedAgentId: envelope.selectedAgentId
             )
+        case .requestUsage:
+            restoreGatewayURLFromWatchRequest(envelope.pairing)
+            AppLog.info("Watch requested usage refresh keychainPaired=\(KeychainStore.isPaired) cachedUsage=\(watchUsage != nil)")
+            republishCachedUsageToWatch(force: true)
+            await refreshUsageForWatch()
+        case .requestAgents:
+            restoreGatewayURLFromWatchRequest(envelope.pairing)
+            AppLog.info("Watch requested agents refresh keychainPaired=\(KeychainStore.isPaired) cachedAgents=\(watchAgentsPayload.count)")
+            if !watchAgentsPayload.isEmpty {
+                watchBridge.publishAgents(watchAgentsPayload, selectedAgentId: selectedAgentId, force: true, fullSnapshot: true)
+            }
+            await refreshAgentsForWatch()
         case .requestSync:
             restoreGatewayURLFromWatchRequest(envelope.pairing)
             let activeWatchJobs = envelope.jobs ?? []
@@ -948,6 +1073,8 @@ final class AppModel: ObservableObject {
     // ─────────────────────────────────────────────────────
     private func watchCommandKey(for envelope: WatchEnvelope) -> String {
         switch envelope.kind {
+        case .requestUsage, .requestAgents:
+            return envelope.kind.rawValue
         case .requestGatewaySessions, .requestAgentIndexDelta, .requestSessionIndexDelta, .requestSessionMessagesDelta, .requestSync:
             let knownAgents = envelope.knownGatewayAgentIds?.count ?? 0
             let knownSessions = envelope.knownGatewaySessionIds?.count ?? 0

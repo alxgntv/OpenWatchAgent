@@ -8,7 +8,7 @@ import Foundation
 // ─────────────────────────────────────────────────────
 
 enum ComplicationActiveJobState {
-    static let appGroupID = "group.com.alexeyignatov.OpenWatch"
+    static let appGroupID = "group.com.openwatchagent"
     static let hasActiveJobKey = "complicationHasActiveJob"
     static let widgetKind = "OpenWatchComplication"
 

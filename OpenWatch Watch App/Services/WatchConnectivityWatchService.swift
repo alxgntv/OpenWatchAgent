@@ -323,6 +323,64 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
         return targetURL
     }
 
+    // ─── Ariadne's Thread [AT-0150] ─────────────────────
+    // What: Ask iPhone to refresh gateway usage for the Watch Usage page.
+    // Why:  Usage Retry must work without opening iPhone; cached usage stays on Watch between reboots.
+    // Date: 2026-06-10
+    // Related: [AT-0150] WatchAppModel.refreshUsage, AppModel.handleWatchMessage.requestUsage
+    // ─────────────────────────────────────────────────────
+    func requestUsage() {
+        guard session.activationState == .activated else {
+            AppLog.error("Watch requestUsage deferred: WCSession not activated state=\(session.activationState.rawValue)")
+            return
+        }
+        let envelope = WatchEnvelope(
+            kind: .requestUsage,
+            pairing: WatchAppModel.shared.pairing
+        )
+        guard let userInfo = WatchConnectivityCodec.userInfo(from: envelope) else {
+            AppLog.error("Watch requestUsage encode failed")
+            return
+        }
+        session.transferUserInfo(userInfo)
+        AppLog.info("Queued requestUsage to iPhone (background-safe)")
+        if session.isReachable, let data = WatchConnectivityCodec.payloadData(from: userInfo) {
+            session.sendMessageData(data, replyHandler: nil) { error in
+                Task { @MainActor in AppLog.error("Watch requestUsage sendMessageData failed: \(error.localizedDescription); queued transferUserInfo already pending") }
+            }
+            AppLog.info("Sent requestUsage to iPhone (immediate)")
+        }
+    }
+
+    // ─── Ariadne's Thread [AT-0151] ─────────────────────
+    // What: Ask iPhone to refresh the full gateway agents list for the Watch Agents page.
+    // Why:  Agents Retry must pull every configured agent from iPhone without reopening the iPhone app.
+    // Date: 2026-06-10
+    // Related: [AT-0151] WatchAppModel.refreshAgents, AppModel.handleWatchMessage.requestAgents
+    // ─────────────────────────────────────────────────────
+    func requestAgents() {
+        guard session.activationState == .activated else {
+            AppLog.error("Watch requestAgents deferred: WCSession not activated state=\(session.activationState.rawValue)")
+            return
+        }
+        let envelope = WatchEnvelope(
+            kind: .requestAgents,
+            pairing: WatchAppModel.shared.pairing
+        )
+        guard let userInfo = WatchConnectivityCodec.userInfo(from: envelope) else {
+            AppLog.error("Watch requestAgents encode failed")
+            return
+        }
+        session.transferUserInfo(userInfo)
+        AppLog.info("Queued requestAgents to iPhone (background-safe)")
+        if session.isReachable, let data = WatchConnectivityCodec.payloadData(from: userInfo) {
+            session.sendMessageData(data, replyHandler: nil) { error in
+                Task { @MainActor in AppLog.error("Watch requestAgents sendMessageData failed: \(error.localizedDescription); queued transferUserInfo already pending") }
+            }
+            AppLog.info("Sent requestAgents to iPhone (immediate)")
+        }
+    }
+
     /// Ask the iPhone to push the current pairing + jobs snapshot back to the Watch.
     /// Uses an immediate message when the phone is reachable, otherwise queues it.
     func requestSync() {
@@ -441,7 +499,7 @@ final class WatchConnectivityWatchService: NSObject, ObservableObject {
 // Related: WatchEnvelope.gatewayOperatorToken, WatchGatewayDirectClient
 // ─────────────────────────────────────────────────────
 nonisolated enum WatchGatewayCredentialStore {
-    private static let service = "com.alexeyignatov.OpenWatch.watch.gateway"
+    private static let service = "com.openwatchagent.watch.gateway"
 
     static func save(gatewayURL: String?, operatorToken: String?, operatorScopes: [String]?) {
         if let gatewayURL, !gatewayURL.isEmpty { save(key: "gatewayURL", value: gatewayURL) }

@@ -5,6 +5,7 @@ struct HomeView: View {
     @ObservedObject var model: AppModel
     @State private var showAddAgent = false
     @State private var showServerAgentGuide = false
+    @FocusState private var greetingPhraseFocused: Bool
 
     var body: some View {
         List {
@@ -82,6 +83,7 @@ struct HomeView: View {
                         set: { model.setLaunchGreetingPhrase($0) }
                     ), axis: .vertical)
                     .textInputAutocapitalization(.sentences)
+                    .focused($greetingPhraseFocused)
                 }
 
                 Picker(selection: Binding(
@@ -153,6 +155,7 @@ struct HomeView: View {
             }
         }
         .navigationTitle("OpenWatch")
+        .scrollDismissesKeyboard(.interactively)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -162,6 +165,13 @@ struct HomeView: View {
                     Image(systemName: "arrow.clockwise")
                 }
                 .disabled(model.sessionsLoading)
+            }
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") {
+                    AppLog.info("Greeting phrase keyboard dismissed")
+                    greetingPhraseFocused = false
+                }
             }
         }
         .refreshable { await model.refreshSessions() }
@@ -193,8 +203,21 @@ private struct AgentSessionsSection: View {
     @ObservedObject var model: AppModel
     let agent: GatewayAgentRow
 
+    private static let initialVisibleSessionCount = 5
+    private static let sessionLoadMoreBatchSize = 5
+
+    @State private var visibleSessionLimit = initialVisibleSessionCount
+
     private var agentSessions: [GatewaySessionRow] {
         model.gatewaySessions(forAgentId: agent.id)
+    }
+
+    private var visibleSessions: [GatewaySessionRow] {
+        Array(agentSessions.prefix(visibleSessionLimit))
+    }
+
+    private var remainingSessionCount: Int {
+        max(0, agentSessions.count - visibleSessionLimit)
     }
 
     var body: some View {
@@ -233,11 +256,28 @@ private struct AgentSessionsSection: View {
                         .foregroundStyle(.secondary)
                 }
             } else {
-                ForEach(agentSessions) { session in
+                ForEach(visibleSessions) { session in
                     NavigationLink {
                         SessionDetailView(model: model, session: session)
                     } label: {
                         SessionCardView(session: session)
+                    }
+                }
+                if remainingSessionCount > 0 {
+                    Button {
+                        let next = min(
+                            visibleSessionLimit + Self.sessionLoadMoreBatchSize,
+                            agentSessions.count
+                        )
+                        AppLog.info(
+                            "Load more sessions tapped agentId=\(agent.id) from=\(visibleSessionLimit) to=\(next) total=\(agentSessions.count)"
+                        )
+                        visibleSessionLimit = next
+                    } label: {
+                        Label(
+                            "Show \(min(remainingSessionCount, Self.sessionLoadMoreBatchSize)) more",
+                            systemImage: "chevron.down"
+                        )
                     }
                 }
             }
@@ -248,6 +288,10 @@ private struct AgentSessionsSection: View {
             if model.selectedAgentId == agent.id {
                 Text("Active for voice and new sessions.")
             }
+        }
+        .onChange(of: agent.id) { _, _ in
+            visibleSessionLimit = Self.initialVisibleSessionCount
+            AppLog.info("Agent sessions visible limit reset agentId=\(agent.id) limit=\(Self.initialVisibleSessionCount)")
         }
     }
 }
@@ -362,15 +406,9 @@ struct SessionCardView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(session.title)
+            Text(session.displayTitle)
                 .foregroundStyle(.primary)
                 .lineLimit(1)
-            if let preview = session.preview, !preview.isEmpty {
-                Text(preview)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
             HStack(spacing: 4) {
                 if let count = session.messageCount {
                     Text("\(count) message\(count == 1 ? "" : "s")")
@@ -425,7 +463,7 @@ struct SessionDetailView: View {
                 .padding(.vertical, 10)
             }
             .background(Color(.systemGroupedBackground))
-            .navigationTitle(session.title)
+            .navigationTitle(session.displayTitle)
             .navigationBarTitleDisplayMode(.inline)
             .safeAreaInset(edge: .bottom) { inputBar }
             .environment(\.openURL, OpenURLAction { url in

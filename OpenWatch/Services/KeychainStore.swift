@@ -2,7 +2,7 @@ import Foundation
 import Security
 
 nonisolated enum KeychainStore {
-    private static let service = "com.alexeyignatov.OpenWatch.gateway"
+    private static let service = "com.openwatchagent.gateway"
 
     static func saveGatewaySession(url: URL, deviceToken: String?, bootstrapToken: String?) {
         save(key: "gatewayURL", value: url.absoluteString)

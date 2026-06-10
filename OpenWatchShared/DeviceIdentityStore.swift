@@ -32,7 +32,7 @@ nonisolated public struct DeviceIdentityMaterial: Sendable, Equatable {
 /// Stored in Keychain so Xcode reinstall-over-existing keeps the same device id.
 /// Deleting the app from the phone still creates a new identity (iOS clears Keychain).
 nonisolated public enum DeviceIdentityStore {
-    private static let service = "com.alexeyignatov.OpenWatch.deviceIdentity"
+    private static let service = "com.openwatchagent.deviceIdentity"
     private static let deviceIdKey = "deviceId"
     private static let publicKeyKey = "publicKey"
     private static let privateKeyKey = "privateKey"

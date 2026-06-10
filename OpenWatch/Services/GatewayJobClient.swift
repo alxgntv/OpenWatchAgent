@@ -81,6 +81,38 @@ struct GatewaySessionRow: Identifiable, Sendable, Equatable {
     let preview: String?
     let updatedAt: Date?
     let messageCount: Int?
+
+    // ─── Ariadne's Thread [AT-0148] ─────────────────────
+    // What: Prefer one-line last-message preview for iPhone session list/detail titles.
+    // Why:  Gateway rows often use the raw sessionKey as title; UI must show readable last-message text instead.
+    // Date: 2026-06-10
+    // Related: [AT-0148] HomeView.SessionCardView, GatewayJobClient.parseSessions
+    // ─────────────────────────────────────────────────────
+    /// Single-line label for session cards: last message preview, then human title, then a neutral fallback.
+    nonisolated var displayTitle: String {
+        Self.singleLine(Self.preferredDisplayText(preview: preview, title: title, id: id))
+    }
+
+    nonisolated static func preferredDisplayText(preview: String?, title: String, id: String) -> String {
+        if let preview = preview?.trimmingCharacters(in: .whitespacesAndNewlines), !preview.isEmpty {
+            return preview
+        }
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedTitle.isEmpty, trimmedTitle != id { return trimmedTitle }
+        return "Session"
+    }
+
+    nonisolated static func singleLine(_ text: String, limit: Int = 120) -> String {
+        let collapsed = text
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        guard !collapsed.isEmpty else { return "Session" }
+        if collapsed.count <= limit { return collapsed }
+        return String(collapsed.prefix(limit)).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+    }
 }
 
 /// Aggregate usage computed from the gateway's `sessions.list` payload (per-session token fields summed).
@@ -376,7 +408,57 @@ actor GatewayJobClient {
     func listSessionsAndUsage() async throws -> (rows: [GatewaySessionRow], usage: GatewayUsage) {
         let payload = try await readRPC(method: "sessions.list", params: [:])
         AppLog.info("sessions.list raw payload=\(truncatedJSON(payload))")
-        return (parseSessions(payload), parseUsage(payload))
+        var usage = parseUsage(payload)
+        let listedMessages = usage.totalMessages
+        do {
+            let usageMessages = try await fetchSessionsUsageTotalMessages()
+            usage = GatewayUsage(
+                sessionCount: usage.sessionCount,
+                totalTokens: usage.totalTokens,
+                inputTokens: usage.inputTokens,
+                outputTokens: usage.outputTokens,
+                totalMessages: usageMessages,
+                lastActivityAt: usage.lastActivityAt,
+                model: usage.model
+            )
+            AppLog.info("Usage totalMessages from sessions.usage=\(usageMessages) sessions.listDerived=\(listedMessages)")
+        } catch {
+            AppLog.error("sessions.usage failed for totalMessages; keeping sessions.list derived=\(listedMessages): \(error.localizedDescription)")
+        }
+        return (parseSessions(payload), usage)
+    }
+
+    // ─── Ariadne's Thread [AT-0149] ─────────────────────
+    // What: Load aggregate message totals from gateway `sessions.usage` when `sessions.list` rows omit messageCount.
+    // Why:  OpenClaw lightweight session rows no longer expose per-session messageCount; Usage page needs aggregates.messages.total.
+    // Date: 2026-06-10
+    // Related: [AT-0149] parseUsage, AppModel.pushUsageToWatch, WatchHomeView.UsagePage
+    // ─────────────────────────────────────────────────────
+    private func fetchSessionsUsageTotalMessages() async throws -> Int {
+        let payload = try await readRPC(method: "sessions.usage", params: [
+            "agentScope": "all",
+            "range": "all",
+        ])
+        AppLog.info("sessions.usage raw payload=\(truncatedJSON(payload))")
+        return parseSessionsUsageTotalMessages(payload)
+    }
+
+    private func parseSessionsUsageTotalMessages(_ payload: [String: Any]) -> Int {
+        if let aggregates = payload["aggregates"] as? [String: Any],
+           let messages = aggregates["messages"] as? [String: Any] {
+            let total = intValue(messages["total"])
+            AppLog.info("Parsed sessions.usage aggregates.messages.total=\(total)")
+            return total
+        }
+        let rows = (payload["sessions"] as? [[String: Any]]) ?? []
+        var sum = 0
+        for row in rows {
+            guard let usage = row["usage"] as? [String: Any],
+                  let messageCounts = usage["messageCounts"] as? [String: Any] else { continue }
+            sum += intValue(messageCounts["total"])
+        }
+        AppLog.info("Parsed sessions.usage per-session messageCounts.total sum=\(sum) rows=\(rows.count)")
+        return sum
     }
 
     /// Fetches the real transcript for one session (`chat.history`). Parsed defensively + raw payload logged.
@@ -482,6 +564,53 @@ actor GatewayJobClient {
         return GatewayAgentsListResult(defaultAgentId: defaultId, agents: agents)
     }
 
+    // ─── Ariadne's Thread [AT-0148] ─────────────────────
+    // What: Parse last-message preview text defensively from sessions.list rows.
+    // Why:  OpenClaw may expose preview/lastMessage as strings or nested message objects; iPhone needs one readable line.
+    // Date: 2026-06-10
+    // Related: [AT-0148] GatewaySessionRow.displayTitle, AppModel.enrichSessionPreviewsForDisplay
+    // ─────────────────────────────────────────────────────
+    private func sessionPreview(from row: [String: Any]) -> String? {
+        let stringKeys = [
+            "preview", "lastMessage", "summary", "snippet",
+            "lastUserMessage", "lastAssistantMessage", "lastReply", "lastText",
+        ]
+        for key in stringKeys {
+            if let text = row[key] as? String {
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+            }
+        }
+        let objectKeys = ["lastMessage", "message", "lastReply"]
+        for key in objectKeys {
+            if let object = row[key] as? [String: Any],
+               let text = messageText(from: object) {
+                return text
+            }
+        }
+        return nil
+    }
+
+    private func messageText(from row: [String: Any]) -> String? {
+        let stringKeys = ["text", "preview", "summary", "content", "body", "message"]
+        for key in stringKeys {
+            if let text = row[key] as? String {
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+            }
+        }
+        if let blocks = row["content"] as? [[String: Any]] {
+            let parts = blocks.compactMap { block -> String? in
+                guard let text = block["text"] as? String else { return nil }
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+            let joined = parts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !joined.isEmpty { return joined }
+        }
+        return nil
+    }
+
     private func parseSessions(_ payload: [String: Any]) -> [GatewaySessionRow] {
         let rows = (payload["sessions"] as? [[String: Any]])
             ?? (payload["rows"] as? [[String: Any]])
@@ -493,10 +622,10 @@ actor GatewayJobClient {
                 return nil
             }
             let title = (row["title"] as? String) ?? (row["label"] as? String) ?? (row["name"] as? String) ?? key
-            let preview = (row["preview"] as? String) ?? (row["lastMessage"] as? String) ?? (row["summary"] as? String)
+            let preview = sessionPreview(from: row)
             let updated = parseDate(row["updatedAt"]) ?? parseDate(row["lastActivityAt"]) ?? parseDate(row["lastMessageAt"]) ?? parseDate(row["mtimeMs"]) ?? parseDate(row["ts"])
-            let count = (row["messageCount"] as? Int) ?? (row["count"] as? Int) ?? (row["messages"] as? Int)
-            return GatewaySessionRow(id: key, title: title, preview: preview, updatedAt: updated, messageCount: count)
+            let count = sessionMessageCount(from: row)
+            return GatewaySessionRow(id: key, title: title, preview: preview, updatedAt: updated, messageCount: count > 0 ? count : nil)
         }
         return parsed.sorted { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
     }
@@ -513,8 +642,7 @@ actor GatewayJobClient {
             total += intValue(row["totalTokens"])
             input += intValue(row["inputTokens"])
             output += intValue(row["outputTokens"])
-            // Per-session message count, same defensive keys as parseSessions.
-            messages += (row["messageCount"] as? Int) ?? (row["count"] as? Int) ?? (row["messages"] as? Int) ?? 0
+            messages += sessionMessageCount(from: row)
             // Most recent activity across all sessions, same defensive keys as parseSessions.
             if let updated = parseDate(row["updatedAt"]) ?? parseDate(row["lastActivityAt"]) ?? parseDate(row["lastMessageAt"]) ?? parseDate(row["mtimeMs"]) ?? parseDate(row["ts"]) {
                 if lastActivity == nil || updated > lastActivity! { lastActivity = updated }
@@ -536,7 +664,19 @@ actor GatewayJobClient {
     private func intValue(_ value: Any?) -> Int {
         if let i = value as? Int { return i }
         if let d = value as? Double { return Int(d) }
+        if let n = value as? NSNumber { return n.intValue }
         if let s = value as? String, let i = Int(s) { return i }
+        return 0
+    }
+
+    private func sessionMessageCount(from row: [String: Any]) -> Int {
+        let direct = intValue(row["messageCount"])
+        if direct > 0 { return direct }
+        if let messages = row["messages"] as? [Any] { return messages.count }
+        if let usage = row["usage"] as? [String: Any],
+           let messageCounts = usage["messageCounts"] as? [String: Any] {
+            return intValue(messageCounts["total"])
+        }
         return 0
     }
 

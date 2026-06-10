@@ -59,6 +59,7 @@ struct SetupCodeEntryView: View {
                     AppLog.info(
                         "SetupCodeEntry Connect tapped gatewayFieldEmpty=\(gatewayURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)"
                     )
+                    focusedField = nil
                     model.submitPairing(gatewayURL: gatewayURL, setupCode: setupCode)
                 } label: {
                     HStack {
@@ -75,6 +76,16 @@ struct SetupCodeEntryView: View {
             .padding()
         }
         .navigationTitle("Pairing")
+        .scrollDismissesKeyboard(.interactively)
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") {
+                    AppLog.info("SetupCodeEntry keyboard dismissed field=\(String(describing: focusedField))")
+                    focusedField = nil
+                }
+            }
+        }
         .onAppear {
             if gatewayURL.isEmpty, let last = SetupCodeDecoder.loadLastGatewayURL() {
                 gatewayURL = last

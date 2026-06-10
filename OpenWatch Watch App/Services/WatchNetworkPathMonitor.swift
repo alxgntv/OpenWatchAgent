@@ -12,7 +12,7 @@ final class WatchNetworkPathMonitor {
     static let shared = WatchNetworkPathMonitor()
 
     private let monitor = NWPathMonitor()
-    private let queue = DispatchQueue(label: "com.alexeyignatov.OpenWatch.network-monitor")
+    private let queue = DispatchQueue(label: "com.openwatchagent.network-monitor")
     private(set) var lastPathSummary = "status=unknown"
     private(set) var internetAvailable = false
 

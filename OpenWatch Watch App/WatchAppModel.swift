@@ -137,6 +137,10 @@ final class WatchAppModel: ObservableObject {
     @Published var gatewaySessionsLoading = false
     /// Aggregate usage mirrored from the iPhone — shown on the Usage page.
     @Published var usage: WatchUsage?
+    /// True while the Usage page is waiting for iPhone/gateway usage refresh.
+    @Published private(set) var usageRefreshing = false
+    /// True while the Agents page is waiting for iPhone/gateway agents refresh.
+    @Published private(set) var agentsRefreshing = false
     /// Configured agents mirrored from the iPhone — shown on the Agents page.
     @Published var gatewayAgents: [WatchGatewayAgent] = []
     /// Active agent id mirrored from the iPhone (filters gateway session pages).
@@ -209,6 +213,7 @@ final class WatchAppModel: ObservableObject {
         static let gatewaySessionsKey = "watch.gatewaySessions.v2"
         static let gatewayAgentsKey = "watch.gatewayAgents.v1"
         static let selectedAgentIdKey = "watch.selectedAgentId.v1"
+        static let usageKey = "watch.usage.v1"
     }
     private static let cachedMessageTextLimit = 500
     private static let sessionMessagesFileName = "watch.sessionMessages.v1.json"
@@ -234,6 +239,10 @@ final class WatchAppModel: ObservableObject {
         selectedAgentId = cachedAgents.selectedAgentId
         mainAgentId = cachedAgents.selectedAgentId
         hydrateWatchStore(agents: cachedAgents.agents, sessions: gatewaySessions, messages: gatewayMessagesBySessionKey, selectedAgentId: cachedAgents.selectedAgentId)
+        usage = Self.loadCachedUsage()
+        if let usage {
+            AppLog.info("Watch restored cached usage sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens) totalMessages=\(usage.totalMessages)")
+        }
         restorePairingFromLocalCache()
         rebuildWatchSnapshots()
         recorderMeterCancellable = recorder.$meterLevel
@@ -340,8 +349,7 @@ final class WatchAppModel: ObservableObject {
             reduceLegacyGatewaySessions(envelope, source: source)
         case .usage:
             if let usage = envelope.usage {
-                self.usage = usage
-                AppLog.info("Watch reducer received usage agents=\(usage.agentCount) sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens)")
+                applyUsageUpdate(usage, source: source)
             }
         case .gatewayProbe:
             WatchConnectivityWatchService.shared.applyGatewayProbe(
@@ -546,7 +554,11 @@ final class WatchAppModel: ObservableObject {
         } else {
             AppLog.info("Watch skipped identical gateway agent cache save count=\(currentAgents.count) source=\(source)")
         }
-        if agentNavigationStateFrozen {
+        agentsRefreshing = false
+        if delta.isFullSnapshot == true {
+            publishAgentNavigationState(source: "agentIndexDelta-full-\(source)")
+            AppLog.info("Watch republished full agent navigation snapshot agents=\(currentAgents.count) source=\(source)")
+        } else if agentNavigationStateFrozen {
             AppLog.info("Watch cached agentIndexDelta without republishing frozen navigation state agents=\(currentAgents.count) source=\(source)")
         } else {
             publishAgentNavigationState(source: "agentIndexDelta-\(source)")
@@ -1069,6 +1081,77 @@ final class WatchAppModel: ObservableObject {
         }
     }
 
+    // ─── Ariadne's Thread [AT-0150] ─────────────────────
+    // What: Persist usage on Watch and restore it on cold start; Retry asks iPhone for a fresh gateway snapshot.
+    // Why:  Usage page must survive reboot without re-fetching; Retry should update only when the user asks.
+    // Date: 2026-06-10
+    // Related: [AT-0150] UsagePage, AppModel.refreshUsageForWatch, WatchConnectivityWatchService.requestUsage
+    // ─────────────────────────────────────────────────────
+    private static func loadCachedUsage() -> WatchUsage? {
+        guard let data = UserDefaults.standard.data(forKey: PairingLocalCache.usageKey) else { return nil }
+        do {
+            let usage = try JSONDecoder().decode(WatchUsage.self, from: data)
+            AppLog.info("Watch loaded cached usage sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens) totalMessages=\(usage.totalMessages)")
+            return usage
+        } catch {
+            AppLog.error("Watch cached usage decode failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func saveCachedUsage(_ usage: WatchUsage) {
+        do {
+            let data = try JSONEncoder().encode(usage)
+            UserDefaults.standard.set(data, forKey: PairingLocalCache.usageKey)
+            AppLog.info("Watch saved cached usage sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens) totalMessages=\(usage.totalMessages) bytes=\(data.count)")
+        } catch {
+            AppLog.error("Watch cached usage encode failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func applyUsageUpdate(_ usage: WatchUsage, source: String) {
+        usageRefreshing = false
+        if self.usage == usage {
+            AppLog.info("Watch usage unchanged source=\(source) sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens)")
+            return
+        }
+        self.usage = usage
+        saveCachedUsage(usage)
+        AppLog.info("Watch usage updated source=\(source) agents=\(usage.agentCount) sessions=\(usage.sessionCount) totalTokens=\(usage.totalTokens) totalMessages=\(usage.totalMessages)")
+    }
+
+    func refreshUsage() {
+        usageRefreshing = true
+        AppLog.info("Watch usage refresh requested cached=\(usage != nil)")
+        WatchConnectivityWatchService.shared.requestUsage()
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            if usageRefreshing {
+                usageRefreshing = false
+                AppLog.error("Watch usage refresh timed out after 15s cached=\(usage != nil)")
+            }
+        }
+    }
+
+    // ─── Ariadne's Thread [AT-0151] ─────────────────────
+    // What: Ask iPhone for a full agents.list snapshot from the Agents page Retry button.
+    // Why:  Agents screen must force-refresh all configured agents; cached rows survive reboot until Retry.
+    // Date: 2026-06-10
+    // Related: [AT-0151] AgentsPage, AppModel.refreshAgentsForWatch, WatchConnectivityWatchService.requestAgents
+    // ─────────────────────────────────────────────────────
+    func refreshAgents() {
+        agentsRefreshing = true
+        AppLog.info("Watch agents refresh requested cached=\(gatewayAgents.count)")
+        WatchConnectivityWatchService.shared.requestAgents()
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            if agentsRefreshing {
+                agentsRefreshing = false
+                AppLog.error("Watch agents refresh timed out after 15s cached=\(gatewayAgents.count)")
+            }
+        }
+    }
+
     // ─── Ariadne's Thread [AT-0093] ─────────────────────
     // What: Persist selectedAgentId without rewriting the published gatewayAgents array.
     // Why:  Selected-agent-only deltas arrive while Agents List is mounted; touching gatewayAgents there still crashes watchOS with signal 6.
@@ -1353,9 +1436,12 @@ final class WatchAppModel: ObservableObject {
         UserDefaults.standard.removeObject(forKey: PairingLocalCache.gatewaySessionsKey)
         UserDefaults.standard.removeObject(forKey: PairingLocalCache.gatewayAgentsKey)
         UserDefaults.standard.removeObject(forKey: PairingLocalCache.selectedAgentIdKey)
+        UserDefaults.standard.removeObject(forKey: PairingLocalCache.usageKey)
         gatewayJobs = [:]
         gatewayMutedKeys = []
         usage = nil
+        usageRefreshing = false
+        agentsRefreshing = false
         gatewayAgents = []
         selectedAgentId = "main"
         mainAgentId = "main"
