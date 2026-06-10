@@ -1,35 +1,58 @@
+import AppIntents
 import WidgetKit
 import SwiftUI
 
-// Ariadne's Thread
-// What: WidgetKit complication for the OpenWatch watch app. Renders accessory families on the watch face
-//       and acts as a quick-launch entry point into the app (tapping any accessory widget opens the host app).
-// Why:  The user wants OpenWatch reachable directly from the watch face. WidgetKit (not deprecated ClockKit)
-//       is the supported path on watchOS 10+.
-// When: 2026-06-04
-// Notes: Static configuration (no shared data yet). Live data (e.g. usage) would require an App Group to read
-//        values written by the watch app; that is intentionally out of scope here to keep this self-contained.
+// ─── Ariadne's Thread [AT-0132] ─────────────────────
+// What: Interactive Smart Stack / watch-face widget with Double Tap primary action to open OpenWatch.
+// Why:  User wants Double Tap from watch face when OpenWatch widget is in Smart Stack (watchOS 11+ handGestureShortcut).
+// Date: 2026-06-10
+// Related: [AT-0131] OpenWatchShared/OpenWatchLaunchIntent, Apple doc enabling-double-tap
+// ─────────────────────────────────────────────────────
 
-/// A single timeline entry. The complication is static branding, so the entry only carries a timestamp.
+/// A single timeline entry. Carries whether a job is executing so the glyph can switch mic ↔ loader.
 struct ComplicationEntry: TimelineEntry {
     let date: Date
+    let hasActiveJob: Bool
 }
 
-/// Provides timeline entries for the complication. Static content with a periodic refresh so the system keeps it warm.
+/// Provides timeline entries for the complication. Refreshes faster while jobs are executing.
 struct ComplicationProvider: TimelineProvider {
     func placeholder(in context: Context) -> ComplicationEntry {
-        ComplicationEntry(date: Date())
+        ComplicationEntry(date: Date(), hasActiveJob: false)
     }
 
     func getSnapshot(in context: Context, completion: @escaping (ComplicationEntry) -> Void) {
-        completion(ComplicationEntry(date: Date()))
+        completion(ComplicationEntry(date: Date(), hasActiveJob: ComplicationActiveJobState.hasActiveJob))
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<ComplicationEntry>) -> Void) {
         let now = Date()
-        let next = Calendar.current.date(byAdding: .hour, value: 6, to: now) ?? now.addingTimeInterval(6 * 3600)
-        let timeline = Timeline(entries: [ComplicationEntry(date: now)], policy: .after(next))
+        let hasActiveJob = ComplicationActiveJobState.hasActiveJob
+        let entry = ComplicationEntry(date: now, hasActiveJob: hasActiveJob)
+        let refresh: Date
+        if hasActiveJob {
+            refresh = Calendar.current.date(byAdding: .minute, value: 1, to: now) ?? now.addingTimeInterval(60)
+        } else {
+            refresh = Calendar.current.date(byAdding: .hour, value: 6, to: now) ?? now.addingTimeInterval(6 * 3600)
+        }
+        let timeline = Timeline(entries: [entry], policy: .after(refresh))
         completion(timeline)
+    }
+}
+
+private struct DoubleTapPrimaryActionModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(watchOS 11.0, *) {
+            content.handGestureShortcut(.primaryAction)
+        } else {
+            content
+        }
+    }
+}
+
+private extension View {
+    func openWatchDoubleTapPrimaryAction() -> some View {
+        modifier(DoubleTapPrimaryActionModifier())
     }
 }
 
@@ -39,34 +62,74 @@ struct OpenWatchComplicationView: View {
     let entry: ComplicationProvider.Entry
 
     var body: some View {
+        Button(intent: OpenWatchLaunchIntent()) {
+            widgetContent
+        }
+        .buttonStyle(.plain)
+        .openWatchDoubleTapPrimaryAction()
+    }
+
+    // ─── Ariadne's Thread [AT-0139] ─────────────────────
+    // What: Show ProgressView on the watch face while jobs are executing; mic when idle.
+    // Why:  User wants the complication to reflect in-flight work the same way as the chat Speak button.
+    // Date: 2026-06-10
+    // Related: [AT-0139] shared→ComplicationActiveJobState, WatchAppModel.syncComplicationActiveJobState
+    // ─────────────────────────────────────────────────────
+    @ViewBuilder
+    private var statusGlyph: some View {
+        if entry.hasActiveJob {
+            ProgressView()
+        } else {
+            Image(systemName: "mic.fill")
+                .font(.system(size: 16, weight: .semibold))
+        }
+    }
+
+    @ViewBuilder
+    private var widgetContent: some View {
         switch family {
         case .accessoryCircular:
             ZStack {
                 AccessoryWidgetBackground()
-                Image(systemName: "mic.fill")
-                    .font(.system(size: 16, weight: .semibold))
+                statusGlyph
             }
         case .accessoryCorner:
-            Image(systemName: "mic.fill")
-                .font(.system(size: 18, weight: .semibold))
-                .widgetLabel("OpenWatch")
-        case .accessoryInline:
-            Label("OpenWatch", systemImage: "mic.fill")
-        case .accessoryRectangular:
-            HStack(spacing: 6) {
+            if entry.hasActiveJob {
+                ProgressView()
+                    .widgetLabel("Working")
+            } else {
                 Image(systemName: "mic.fill")
                     .font(.system(size: 18, weight: .semibold))
+                    .widgetLabel("OpenWatch")
+            }
+        case .accessoryInline:
+            if entry.hasActiveJob {
+                HStack(spacing: 4) {
+                    ProgressView()
+                    Text("OpenWatch")
+                }
+            } else {
+                Label("OpenWatch", systemImage: "mic.fill")
+            }
+        case .accessoryRectangular:
+            HStack(spacing: 6) {
+                if entry.hasActiveJob {
+                    ProgressView()
+                } else {
+                    Image(systemName: "mic.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                }
                 VStack(alignment: .leading, spacing: 1) {
                     Text("OpenWatch")
                         .font(.headline)
-                    Text("Tap to talk")
+                    Text(entry.hasActiveJob ? "Working…" : "Double Tap to open")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         default:
-            Image(systemName: "mic.fill")
+            statusGlyph
         }
     }
 }
@@ -81,7 +144,7 @@ struct OpenWatchComplication: Widget {
                 .containerBackground(.clear, for: .widget)
         }
         .configurationDisplayName("OpenWatch")
-        .description("Quick-launch OpenWatch from your watch face.")
+        .description("Open OpenWatch from Smart Stack. Double Tap when this widget is on your watch face.")
         .supportedFamilies([
             .accessoryCircular,
             .accessoryRectangular,

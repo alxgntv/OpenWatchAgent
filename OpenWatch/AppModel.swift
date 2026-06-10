@@ -29,6 +29,19 @@ final class AppModel: ObservableObject {
     @Published var hapticType: WatchHapticType = WatchHapticType(rawValue: UserDefaults.standard.string(forKey: "hapticType") ?? "") ?? .start
     /// Speech rate multiplier the Watch uses to speak replies. Persisted on iPhone and mirrored to the Watch.
     @Published var ttsRate: Double = UserDefaults.standard.object(forKey: "ttsRate") as? Double ?? 1.0
+    /// Phrase the Watch speaks when the app opens. Persisted on iPhone and mirrored to the Watch.
+    @Published var launchGreetingPhrase: String = UserDefaults.standard.string(forKey: OpenWatchVoiceSettings.launchGreetingPhraseDefaultsKey) ?? OpenWatchVoiceSettings.defaultLaunchGreetingPhrase
+    /// Language the Watch uses to speak the launch greeting.
+    @Published var launchGreetingLanguage: String = UserDefaults.standard.string(forKey: OpenWatchVoiceSettings.launchGreetingLanguageDefaultsKey) ?? OpenWatchVoiceSettings.defaultLaunchGreetingLanguage
+    /// AVSpeechSynthesisVoice identifier for the launch greeting.
+    @Published var launchGreetingVoiceIdentifier: String = UserDefaults.standard.string(forKey: OpenWatchVoiceSettings.launchGreetingVoiceIdentifierDefaultsKey) ?? ""
+
+    static let defaultLaunchGreetingPhrase = OpenWatchVoiceSettings.defaultLaunchGreetingPhrase
+
+    struct LaunchGreetingVoiceOption: Identifiable, Hashable {
+        let id: String
+        let name: String
+    }
 
     /// Selectable Watch speech rate multipliers.
     static let availableTTSRates: [Double] = [1.0, 1.10, 1.25, 1.30, 1.40, 1.50, 1.75, 2.0]
@@ -46,6 +59,38 @@ final class AppModel: ObservableObject {
             }
             .sorted { $0.name < $1.name }
     }()
+
+    /// Languages available for the launch greeting voice picker (AVSpeechSynthesizer voices).
+    static let availableLaunchGreetingLanguages: [(code: String, name: String)] = {
+        let english = Locale(identifier: "en_US")
+        let codes = Set(AVSpeechSynthesisVoice.speechVoices().map(\.language))
+        return codes
+            .map { locale in
+                let name = english.localizedString(forIdentifier: locale) ?? locale
+                return (code: locale, name: name)
+            }
+            .sorted { $0.name < $1.name }
+    }()
+
+    var launchGreetingVoiceOptions: [LaunchGreetingVoiceOption] {
+        Self.launchGreetingVoices(for: launchGreetingLanguage)
+    }
+
+    static func launchGreetingVoices(for language: String) -> [LaunchGreetingVoiceOption] {
+        AVSpeechSynthesisVoice.speechVoices()
+            .filter { voiceMatchesLanguage($0.language, selectedLanguage: language) }
+            .map { LaunchGreetingVoiceOption(id: $0.identifier, name: $0.name) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private static func voiceMatchesLanguage(_ voiceLanguage: String, selectedLanguage: String) -> Bool {
+        if normalizedLocaleIdentifier(voiceLanguage) == normalizedLocaleIdentifier(selectedLanguage) {
+            return true
+        }
+        let voicePrefix = normalizedLocaleIdentifier(voiceLanguage).split(separator: "-").first.map(String.init)
+        let selectedPrefix = normalizedLocaleIdentifier(selectedLanguage).split(separator: "-").first.map(String.init)
+        return voicePrefix == selectedPrefix
+    }
 
     private static func defaultVoiceLanguage() -> String {
         let supportedCodes = availableVoiceLanguages.map(\.code)
@@ -122,13 +167,22 @@ final class AppModel: ObservableObject {
         if KeychainStore.isPaired, let url = KeychainStore.loadGatewayURL()?.absoluteString {
             pairing = PairingSnapshot(phase: .connected, gatewayURL: url, message: "Connected.")
         }
+        if launchGreetingVoiceIdentifier.isEmpty,
+           let firstVoice = Self.launchGreetingVoices(for: launchGreetingLanguage).first {
+            launchGreetingVoiceIdentifier = firstVoice.id
+            UserDefaults.standard.set(firstVoice.id, forKey: OpenWatchVoiceSettings.launchGreetingVoiceIdentifierDefaultsKey)
+            AppLog.info("Launch greeting default voice set voiceId=\(firstVoice.id) language=\(launchGreetingLanguage)")
+        }
         watchBridge.publish(
             pairing: pairing,
             jobs: jobs,
             ttsEnabled: ttsEnabled,
             ttsLanguage: voiceLanguage,
             hapticType: hapticType.rawValue,
-            ttsRate: ttsRate
+            ttsRate: ttsRate,
+            launchGreetingPhrase: launchGreetingPhrase,
+            launchGreetingLanguage: launchGreetingLanguage,
+            launchGreetingVoiceIdentifier: launchGreetingVoiceIdentifier
         )
         _ = AppModel.availableVoiceLanguages
     }
@@ -193,6 +247,45 @@ final class AppModel: ObservableObject {
         ttsRate = rate
         UserDefaults.standard.set(rate, forKey: "ttsRate")
         AppLog.info("Watch TTS rate set=\(rate)")
+        syncWatch()
+    }
+
+    // ─── Ariadne's Thread [AT-0133] ─────────────────────
+    // What: Persist and mirror the Watch launch greeting phrase from iPhone settings.
+    // Why:  User wants an editable spoken greeting when OpenWatch opens on Apple Watch.
+    // Date: 2026-06-10
+    // Related: [AT-0134] WatchAppModel.speakLaunchGreetingIfNeeded, [AT-0131] OpenWatchLaunchIntent
+    // ─────────────────────────────────────────────────────
+    func setLaunchGreetingPhrase(_ phrase: String) {
+        launchGreetingPhrase = phrase
+        UserDefaults.standard.set(phrase, forKey: OpenWatchVoiceSettings.launchGreetingPhraseDefaultsKey)
+        AppLog.info("Launch greeting phrase set length=\(phrase.count)")
+        syncWatch()
+    }
+
+    // ─── Ariadne's Thread [AT-0138] ─────────────────────
+    // What: Persist and mirror launch greeting language + voice from iPhone settings.
+    // Why:  User wants to pick which language/voice speaks the editable launch greeting on Watch open.
+    // Date: 2026-06-10
+    // Related: [AT-0133] AppModel.setLaunchGreetingPhrase, [AT-0134] WatchAppModel.deliverLaunchFeedbackIfNeeded
+    // ─────────────────────────────────────────────────────
+    func setLaunchGreetingLanguage(_ language: String) {
+        launchGreetingLanguage = language
+        UserDefaults.standard.set(language, forKey: OpenWatchVoiceSettings.launchGreetingLanguageDefaultsKey)
+        let voices = Self.launchGreetingVoices(for: language)
+        if !voices.contains(where: { $0.id == launchGreetingVoiceIdentifier }), let first = voices.first {
+            launchGreetingVoiceIdentifier = first.id
+            UserDefaults.standard.set(first.id, forKey: OpenWatchVoiceSettings.launchGreetingVoiceIdentifierDefaultsKey)
+            AppLog.info("Launch greeting voice reset voiceId=\(first.id) for language=\(language)")
+        }
+        AppLog.info("Launch greeting language set=\(language)")
+        syncWatch()
+    }
+
+    func setLaunchGreetingVoiceIdentifier(_ voiceIdentifier: String) {
+        launchGreetingVoiceIdentifier = voiceIdentifier
+        UserDefaults.standard.set(voiceIdentifier, forKey: OpenWatchVoiceSettings.launchGreetingVoiceIdentifierDefaultsKey)
+        AppLog.info("Launch greeting voice set voiceId=\(voiceIdentifier)")
         syncWatch()
     }
 
@@ -315,51 +408,63 @@ final class AppModel: ObservableObject {
     }
 
     // ─── Ariadne's Thread [AT-0122] ─────────────────────
-    // What: Load and publish the gateway agent navigation model once from the iPhone startup flow.
-    // Why:  Agents are static navigation data for this app launch; the Watch must receive it from startup sync, not by page-driven reload requests.
+    // What: Load gateway agents on every refresh; publish the full Watch navigation snapshot only once per launch.
+    // Why:  iPhone home refresh must always refetch agents.list + sessions.list; Watch startup still needs a single full agent snapshot.
     // Date: 2026-06-09
-    // Related: [AT-0124] watch→WatchAppModel.publishAgentNavigationState, AppModel.refreshSessions
+    // Related: [AT-0124] watch→WatchAppModel.publishAgentNavigationState, [AT-0147] AppModel.refreshSessions
     // ─────────────────────────────────────────────────────
-    private func loadGatewayAgentsOnceForLaunch(source: String) async {
-        guard !didRequestGatewayAgentsThisLaunch else {
-            AppLog.info("Skipped gateway agents load source=\(source); already requested once this launch agents=\(gatewayAgents.count)")
-            return
-        }
-        didRequestGatewayAgentsThisLaunch = true
+    private func loadGatewayAgents(source: String, publishToWatch: Bool) async {
         do {
             let agentsResult = try await jobClient.listAgents()
             gatewayAgents = agentsResult.agents
             reconcileSelectedAgent(defaultId: agentsResult.defaultAgentId)
             cacheWatchAgentsPayload()
-            if isPaired {
+            if publishToWatch, isPaired {
                 watchBridge.publishAgents(watchAgentsPayload, selectedAgentId: selectedAgentId, force: true, fullSnapshot: true)
                 AppLog.info("Watch startup agent navigation model sent agents=\(watchAgentsPayload.count) selectedAgentId=\(selectedAgentId)")
             }
-            AppLog.info("Loaded \(agentsResult.agents.count) gateway agents source=\(source) defaultId=\(agentsResult.defaultAgentId)")
+            AppLog.info("Loaded \(agentsResult.agents.count) gateway agents source=\(source) defaultId=\(agentsResult.defaultAgentId) publishToWatch=\(publishToWatch)")
         } catch {
             AppLog.error("agents.list failed source=\(source): \(error.localizedDescription)")
         }
     }
 
-    /// Loads the one-time agent index plus session index from the gateway. Later refreshes load only sessions/usage.
+    private func loadGatewayAgentsOnceForLaunch(source: String) async {
+        let shouldPublishToWatch = !didRequestGatewayAgentsThisLaunch
+        await loadGatewayAgents(source: source, publishToWatch: shouldPublishToWatch)
+        if shouldPublishToWatch {
+            didRequestGatewayAgentsThisLaunch = true
+            AppLog.info("Marked gateway agents Watch snapshot sent for this launch source=\(source)")
+        }
+    }
+
+    // ─── Ariadne's Thread [AT-0147] ─────────────────────
+    // What: Restore full gateway refresh on iPhone home pull-to-refresh and toolbar button.
+    // Why:  A regression skipped agents.list after the first launch attempt and stopped pushing updated session rows to Watch.
+    // Date: 2026-06-10
+    // Related: [AT-0122] AppModel.loadGatewayAgentsOnceForLaunch, HomeView toolbar refresh button
+    // ─────────────────────────────────────────────────────
+    /// Reloads agents + sessions from the gateway. Watch agent navigation snapshot is still sent only once per launch.
     func refreshSessions(showErrors: Bool = true) async {
         guard isPaired else { return }
         sessionsLoading = true
-        let shouldShowAgentsLoading = !didRequestGatewayAgentsThisLaunch
-        if shouldShowAgentsLoading { agentsLoading = true }
+        agentsLoading = true
         defer {
             sessionsLoading = false
-            if shouldShowAgentsLoading { agentsLoading = false }
+            agentsLoading = false
         }
+        AppLog.info("refreshSessions started showErrors=\(showErrors) knownAgents=\(gatewayAgents.count) knownSessions=\(gatewaySessions.count)")
         await loadGatewayAgentsOnceForLaunch(source: "refreshSessions")
         do {
             let (rows, usage) = try await jobClient.listSessionsAndUsage()
             gatewaySessions = rows
             AppLog.info("Loaded \(rows.count) gateway sessions; usage totalTokens=\(usage.totalTokens) sessions=\(usage.sessionCount)")
+            pushSessionListToWatch(rows: rows)
             pushUsageToWatch(usage)
         } catch {
             handleRefreshSessionsError(error, showErrors: showErrors)
         }
+        AppLog.info("refreshSessions finished agents=\(gatewayAgents.count) sessions=\(gatewaySessions.count)")
     }
 
     // ─── Ariadne's Thread [AT-0010] ─────────────────────
@@ -1476,6 +1581,9 @@ final class AppModel: ObservableObject {
             ttsLanguage: voiceLanguage,
             hapticType: hapticType.rawValue,
             ttsRate: ttsRate,
+            launchGreetingPhrase: launchGreetingPhrase,
+            launchGreetingLanguage: launchGreetingLanguage,
+            launchGreetingVoiceIdentifier: launchGreetingVoiceIdentifier,
             revokeGatewayPairing: revokeGatewayPairing
         )
     }

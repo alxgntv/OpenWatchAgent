@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import SwiftUI
 import WatchKit
+import WidgetKit
 
 /// One conversation on the Watch. Each session has its own gateway sessionKey and its own message history.
 /// Swiping to the trailing empty session starts a brand-new conversation.
@@ -123,6 +124,12 @@ final class WatchAppModel: ObservableObject {
     @Published var globalTtsLanguage: String = "en-US"
     /// Speech rate multiplier used to speak replies, mirrored from the iPhone app.
     @Published var globalTtsRate: Double = 1.0
+    /// Spoken phrase when the Watch app becomes active, mirrored from the iPhone app.
+    @Published private(set) var launchGreetingPhrase: String = UserDefaults.standard.string(forKey: OpenWatchVoiceSettings.launchGreetingPhraseDefaultsKey) ?? OpenWatchVoiceSettings.defaultLaunchGreetingPhrase
+    /// Language for the launch greeting TTS, mirrored from the iPhone app.
+    @Published private(set) var launchGreetingLanguage: String = UserDefaults.standard.string(forKey: OpenWatchVoiceSettings.launchGreetingLanguageDefaultsKey) ?? OpenWatchVoiceSettings.defaultLaunchGreetingLanguage
+    /// AVSpeechSynthesisVoice identifier for the launch greeting, mirrored from the iPhone app.
+    @Published private(set) var launchGreetingVoiceIdentifier: String = UserDefaults.standard.string(forKey: OpenWatchVoiceSettings.launchGreetingVoiceIdentifierDefaultsKey) ?? ""
     /// Haptic feedback played when Watch recording starts/stops, mirrored from the iPhone app.
     @Published var hapticType: WatchHapticType = .start
     /// Real gateway session index mirrored from the iPhone — shown in the Sessions list/navigation.
@@ -141,6 +148,7 @@ final class WatchAppModel: ObservableObject {
 
     private let bridge = WatchConnectivityWatchService.shared
     private let recorder = WatchAudioRecorder()
+    private var recorderMeterCancellable: AnyCancellable?
     private var watchStore = WatchStore()
     private var pendingWatchEvents: [WatchEvent] = []
     private var isReducingWatchEvents = false
@@ -150,6 +158,8 @@ final class WatchAppModel: ObservableObject {
     private var jobSession: [UUID: UUID] = [:]
     /// Jobs whose reply has already been spoken aloud, so TTS never restarts/loops on repeated updates.
     private var spokenJobIds: Set<UUID> = []
+    private var launchFeedbackDeliveredForForegroundSession = false
+    private var pendingLaunchGreetingTask: Task<Void, Never>?
     /// The session that the in-progress recording will be attached to (captured at record start).
     private var recordingSessionId: UUID?
     /// Live turns the Watch started inside a gateway-session page, keyed by gateway sessionKey (newest-first).
@@ -201,6 +211,7 @@ final class WatchAppModel: ObservableObject {
         static let selectedAgentIdKey = "watch.selectedAgentId.v1"
     }
     private static let cachedMessageTextLimit = 500
+    private static let sessionMessagesFileName = "watch.sessionMessages.v1.json"
 
     // ─── Ariadne's Thread [AT-0125] ─────────────────────
     // What: Compact the Watch gateway session cache to session index rows only.
@@ -212,7 +223,12 @@ final class WatchAppModel: ObservableObject {
         sessions = [WatchSession(sessionKey: "agent:main:main")]
         let cachedGatewaySessions = Self.loadCachedGatewaySessions()
         gatewaySessions = Self.gatewaySessionIndex(from: cachedGatewaySessions)
-        gatewayMessagesBySessionKey = Self.gatewayMessagesBySessionKey(from: cachedGatewaySessions)
+        let fileCachedMessages = Self.loadCachedSessionMessages()
+        let legacyMessages = Self.gatewayMessagesBySessionKey(from: cachedGatewaySessions)
+        gatewayMessagesBySessionKey = Self.mergeSessionMessageCaches(file: fileCachedMessages, legacy: legacyMessages)
+        if fileCachedMessages.isEmpty, !gatewayMessagesBySessionKey.isEmpty {
+            Self.saveCachedSessionMessages(gatewayMessagesBySessionKey, source: "init-migrate-legacy")
+        }
         let cachedAgents = Self.loadCachedGatewayAgents()
         gatewayAgents = cachedAgents.agents
         selectedAgentId = cachedAgents.selectedAgentId
@@ -220,7 +236,14 @@ final class WatchAppModel: ObservableObject {
         hydrateWatchStore(agents: cachedAgents.agents, sessions: gatewaySessions, messages: gatewayMessagesBySessionKey, selectedAgentId: cachedAgents.selectedAgentId)
         restorePairingFromLocalCache()
         rebuildWatchSnapshots()
+        recorderMeterCancellable = recorder.$meterLevel
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
     }
+
+    var recordingMeterLevel: Double { recorder.meterLevel }
 
     // ─── Ariadne's Thread [AT-0099] ─────────────────────
     // What: Route Watch UI and WCSession changes through one MainActor event reducer.
@@ -283,12 +306,12 @@ final class WatchAppModel: ObservableObject {
         case .jobsSnapshot:
             if let snapshot = envelope.jobs {
                 AppLog.info("Watch reducer applying jobsSnapshot count=\(snapshot.count)")
-                for job in snapshot { upsert(job) }
+                for job in snapshot { upsert(job, source: "jobsSnapshot") }
             }
         case .jobUpdated:
             if let job = envelope.job {
                 logStep6ServerResponse(job: job)
-                upsert(job)
+                upsert(job, source: "jobUpdated")
             }
         case .startListening:
             if let agentId = envelope.text?.trimmingCharacters(in: .whitespacesAndNewlines), !agentId.isEmpty {
@@ -399,7 +422,7 @@ final class WatchAppModel: ObservableObject {
         horizontalIndex = 3
         if !sessionDetailStates.isEmpty {
             AppLog.info("Watch cleared session detail states before sessions index request count=\(sessionDetailStates.count) source=\(source)")
-            sessionDetailStates.removeAll()
+            sessionDetailStates = [:]
         }
         sessionListState = buildSessionListState(isLoading: true)
         pendingSessionIndexRequestAgentId = currentAgentId
@@ -575,6 +598,12 @@ final class WatchAppModel: ObservableObject {
         }
         watchStore.messagesBySessionKey[delta.sessionKey] = merged
         gatewayMessagesBySessionKey[delta.sessionKey] = merged
+        saveCachedSessionMessages(source: "sessionMessagesDelta")
+        maybePlayIncomingMessageHapticForMainScreen(
+            sessionKey: delta.sessionKey,
+            shouldPlay: shouldPlayIncomingMessageHapticFromHistory(previous: existing, next: merged),
+            source: source
+        )
         updateSessionDetailState(sessionKey: delta.sessionKey, isLoading: false)
         let afterRows = sessionListState.rows.map(\.id)
         if beforeRows != afterRows {
@@ -715,9 +744,16 @@ final class WatchAppModel: ObservableObject {
         return nil
     }
 
+    // ─── Ariadne's Thread [AT-0127] ─────────────────────
+    // What: Reassign session detail snapshots and play a micro-haptic when a new bot reply appears on an open session.
+    // Why:  In-place dictionary mutation did not trigger @Published, so open session screens stayed stale until re-enter.
+    // Date: 2026-06-09
+    // Related: [AT-0116] WatchHomeView.GatewaySessionPage, [AT-0098] WatchAppModel.sessionDetailStates
+    // ─────────────────────────────────────────────────────
     private func updateSessionDetailState(sessionKey: String, isLoading: Bool) {
         let row = watchStore.sessionsById[sessionKey]
-        sessionDetailStates[sessionKey] = SessionDetailState(
+        let previous = sessionDetailStates[sessionKey]
+        let next = SessionDetailState(
             sessionKey: sessionKey,
             title: row?.title ?? "Session",
             updatedAt: row?.updatedAt,
@@ -725,7 +761,95 @@ final class WatchAppModel: ObservableObject {
             liveJobs: gatewayJobs[sessionKey] ?? [],
             isLoading: isLoading
         )
-        AppLog.info("Watch detailStateUpdated sessionKey=\(sessionKey) messages=\(sessionDetailStates[sessionKey]?.messages.count ?? 0) liveJobs=\(sessionDetailStates[sessionKey]?.liveJobs.count ?? 0) isLoading=\(isLoading)")
+        var states = sessionDetailStates
+        states[sessionKey] = next
+        sessionDetailStates = states
+        if shouldPlayIncomingMessageHaptic(previous: previous, next: next),
+           !isIncomingMessageMainScreenSession(sessionKey) {
+            playIncomingMessageHaptic(sessionKey: sessionKey)
+        }
+        AppLog.info("Watch detailStateUpdated sessionKey=\(sessionKey) messages=\(next.messages.count) liveJobs=\(next.liveJobs.count) isLoading=\(isLoading)")
+    }
+
+    private func shouldPlayIncomingMessageHaptic(previous: SessionDetailState?, next: SessionDetailState) -> Bool {
+        guard let previous, !next.isLoading else { return false }
+        let previousMessageIds = Set(previous.messages.map(\.id))
+        if next.messages.contains(where: { !$0.isUser && !previousMessageIds.contains($0.id) }) {
+            return true
+        }
+        let previousReplyJobIds: Set<UUID> = Set(previous.liveJobs.compactMap { (job: VoiceJob) -> UUID? in
+            guard let reply = job.resultText?.trimmingCharacters(in: .whitespacesAndNewlines), !reply.isEmpty else {
+                return nil
+            }
+            return job.id
+        })
+        return next.liveJobs.contains { job in
+            guard let reply = job.resultText?.trimmingCharacters(in: .whitespacesAndNewlines), !reply.isEmpty else {
+                return false
+            }
+            return !previousReplyJobIds.contains(job.id)
+        }
+    }
+
+    // ─── Ariadne's Thread [AT-0130] ─────────────────────
+    // What: Use the iPhone-synced hapticType (e.g. success) for incoming message feedback instead of hardcoded notification.
+    // Why:  Notification haptic was too quiet on device and ignored the user's Success setting that includes audible feedback.
+    // Date: 2026-06-10
+    // Related: [AT-0127] WatchAppModel.playIncomingMessageHaptic, [AT-0129] WatchAppModel.maybePlayIncomingMessageHapticForMainScreen
+    // ─────────────────────────────────────────────────────
+    private func playIncomingMessageHaptic(sessionKey: String) {
+        let wkType = Self.wkHaptic(for: hapticType) ?? .success
+        WKInterfaceDevice.current().play(wkType)
+        AppLog.info("Watch played incoming message haptic=\(hapticType.rawValue) wkType=\(wkType) sessionKey=\(sessionKey)")
+    }
+
+    private func isIncomingMessageMainScreenSession(_ sessionKey: String) -> Bool {
+        horizontalIndex == 2
+            && sessions.indices.contains(currentIndex)
+            && sessions[currentIndex].sessionKey == sessionKey
+    }
+
+    // ─── Ariadne's Thread [AT-0129] ─────────────────────
+    // What: Play notification haptic on the main live screen when a new bot reply arrives for the visible session.
+    // Why:  Gateway session detail already haptics on incoming messages; main WatchSessionPage needed the same behavior.
+    // Date: 2026-06-09
+    // Related: [AT-0127] WatchAppModel.playIncomingMessageHaptic, WatchHomeView.WatchSessionPage
+    // ─────────────────────────────────────────────────────
+    private func maybePlayIncomingMessageHapticForMainScreen(sessionKey: String, shouldPlay: Bool, source: String) {
+        guard shouldPlay else { return }
+        guard source != "jobsSnapshot" else { return }
+        guard horizontalIndex == 2 else { return }
+        guard sessions.indices.contains(currentIndex), sessions[currentIndex].sessionKey == sessionKey else { return }
+        playIncomingMessageHaptic(sessionKey: sessionKey)
+        AppLog.info("Watch played incoming message haptic on main screen sessionKey=\(sessionKey) source=\(source)")
+    }
+
+    private func shouldPlayIncomingMessageHapticForLiveJob(previous: VoiceJob?, incoming: VoiceJob) -> Bool {
+        guard let reply = incoming.resultText?.trimmingCharacters(in: .whitespacesAndNewlines), !reply.isEmpty else {
+            return false
+        }
+        guard let previous else { return true }
+        let previousReply = previous.resultText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return previousReply != reply
+    }
+
+    private func shouldPlayIncomingMessageHapticFromHistory(previous: [WatchHistoryMessage], next: [WatchHistoryMessage]) -> Bool {
+        let previousMessageIds = Set(previous.map(\.id))
+        return next.contains { !$0.isUser && !previousMessageIds.contains($0.id) }
+    }
+
+    private func refreshOpenSessionDetailIfNeeded(sessionKey: String) {
+        guard sessionDetailStates[sessionKey] != nil else { return }
+        updateSessionDetailState(
+            sessionKey: sessionKey,
+            isLoading: sessionDetailStates[sessionKey]?.isLoading ?? false
+        )
+    }
+
+    private func publishGatewayJobs(sessionKey: String, jobs: [VoiceJob]) {
+        var next = gatewayJobs
+        next[sessionKey] = jobs
+        gatewayJobs = next
     }
 
     func sessionDetailState(for sessionKey: String) -> SessionDetailState {
@@ -823,6 +947,92 @@ final class WatchAppModel: ObservableObject {
     private static func replaceCachedGatewaySessionsData(_ data: Data) {
         UserDefaults.standard.removeObject(forKey: PairingLocalCache.gatewaySessionsKey)
         UserDefaults.standard.set(data, forKey: PairingLocalCache.gatewaySessionsKey)
+    }
+
+    // ─── Ariadne's Thread [AT-0128] ─────────────────────
+    // What: Persist loaded session message history to Application Support instead of UserDefaults.
+    // Why:  Session index survives restarts, but message bodies were memory-only after AT-0125 stripped them from UserDefaults.
+    // Date: 2026-06-09
+    // Related: [AT-0125] WatchAppModel.saveCachedGatewaySessions, [AT-0096] WatchAppModel.applySessionMessagesDelta
+    // ─────────────────────────────────────────────────────
+    private static func sessionMessagesCacheURL() -> URL {
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return directory.appendingPathComponent(sessionMessagesFileName)
+    }
+
+    private static func loadCachedSessionMessages() -> [String: [WatchHistoryMessage]] {
+        let url = sessionMessagesCacheURL()
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            AppLog.info("Watch cached session messages file miss path=\(url.path)")
+            return [:]
+        }
+        do {
+            let data = try Data(contentsOf: url)
+            let decoded = try JSONDecoder().decode([String: [WatchHistoryMessage]].self, from: data)
+            var result: [String: [WatchHistoryMessage]] = [:]
+            for (sessionKey, messages) in decoded {
+                let normalized = normalizeMessages(messages)
+                if !normalized.isEmpty {
+                    result[sessionKey] = normalized
+                }
+            }
+            AppLog.info("Watch loaded cached session messages sessions=\(result.count) bytes=\(data.count) path=\(url.path)")
+            return result
+        } catch {
+            AppLog.error("Watch cached session messages decode failed path=\(url.path): \(error.localizedDescription)")
+            return [:]
+        }
+    }
+
+    private static func saveCachedSessionMessages(_ messages: [String: [WatchHistoryMessage]], source: String) {
+        let url = sessionMessagesCacheURL()
+        let directory = url.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let data = try JSONEncoder().encode(messages)
+            try data.write(to: url, options: .atomic)
+            AppLog.info("Watch saved cached session messages sessions=\(messages.count) bytes=\(data.count) source=\(source) path=\(url.path)")
+        } catch {
+            AppLog.error("Watch cached session messages save failed source=\(source) path=\(url.path): \(error.localizedDescription)")
+        }
+    }
+
+    private static func clearCachedSessionMessages() {
+        let url = sessionMessagesCacheURL()
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            AppLog.info("Watch cached session messages clear skipped file-miss path=\(url.path)")
+            return
+        }
+        do {
+            try FileManager.default.removeItem(at: url)
+            AppLog.info("Watch cleared cached session messages path=\(url.path)")
+        } catch {
+            AppLog.error("Watch cached session messages clear failed path=\(url.path): \(error.localizedDescription)")
+        }
+    }
+
+    private static func mergeSessionMessageCaches(
+        file: [String: [WatchHistoryMessage]],
+        legacy: [String: [WatchHistoryMessage]]
+    ) -> [String: [WatchHistoryMessage]] {
+        var result = file
+        for (sessionKey, messages) in legacy {
+            let existing = result[sessionKey] ?? []
+            var seen = Set(existing.map(\.id))
+            var merged = existing
+            for message in messages where !seen.contains(message.id) {
+                seen.insert(message.id)
+                merged.append(message)
+            }
+            if !merged.isEmpty {
+                result[sessionKey] = merged
+            }
+        }
+        return result
+    }
+
+    private func saveCachedSessionMessages(source: String) {
+        Self.saveCachedSessionMessages(watchStore.messagesBySessionKey, source: source)
     }
 
     // ─── Ariadne's Thread [AT-0078] ─────────────────────
@@ -1008,10 +1218,12 @@ final class WatchAppModel: ObservableObject {
             }
             guard added > 0 else { continue }
             gatewayMessagesBySessionKey[session.id] = merged
+            watchStore.messagesBySessionKey[session.id] = merged
             changedSessions += 1
             changedMessages += added
         }
         if changedMessages > 0 {
+            saveCachedSessionMessages(source: "mergeGatewayMessages")
             AppLog.info("Watch merged gateway message delta sessions=\(changedSessions) messages=\(changedMessages)")
         }
     }
@@ -1117,6 +1329,9 @@ final class WatchAppModel: ObservableObject {
         applyTtsLanguage(envelope.ttsLanguage)
         applyHapticType(envelope.hapticType)
         applyTtsRate(envelope.ttsRate)
+        applyLaunchGreetingPhrase(envelope.launchGreetingPhrase)
+        applyLaunchGreetingLanguage(envelope.launchGreetingLanguage)
+        applyLaunchGreetingVoiceIdentifier(envelope.launchGreetingVoiceIdentifier)
         WatchGatewayCredentialStore.save(
             gatewayURL: envelope.pairing?.gatewayURL,
             operatorToken: envelope.gatewayOperatorToken,
@@ -1134,6 +1349,7 @@ final class WatchAppModel: ObservableObject {
         watchStore = WatchStore()
         gatewaySessions = []
         gatewayMessagesBySessionKey = [:]
+        Self.clearCachedSessionMessages()
         UserDefaults.standard.removeObject(forKey: PairingLocalCache.gatewaySessionsKey)
         UserDefaults.standard.removeObject(forKey: PairingLocalCache.gatewayAgentsKey)
         UserDefaults.standard.removeObject(forKey: PairingLocalCache.selectedAgentIdKey)
@@ -1157,6 +1373,7 @@ final class WatchAppModel: ObservableObject {
         recordingJobId = nil
         statusHint = nil
         rebuildWatchSnapshots()
+        syncComplicationActiveJobState()
         AppLog.info("Watch cleared sessions/messages/agents/usage after pairing revoke")
     }
 
@@ -1412,6 +1629,93 @@ final class WatchAppModel: ObservableObject {
         guard let rate, rate > 0, rate != globalTtsRate else { return }
         globalTtsRate = rate
         AppLog.info("Watch TTS rate set to \(rate) by iPhone")
+    }
+
+    private func applyLaunchGreetingPhrase(_ phrase: String?) {
+        guard let phrase else { return }
+        guard phrase != launchGreetingPhrase else { return }
+        launchGreetingPhrase = phrase
+        UserDefaults.standard.set(phrase, forKey: OpenWatchVoiceSettings.launchGreetingPhraseDefaultsKey)
+        AppLog.info("Watch launch greeting phrase updated length=\(phrase.count)")
+    }
+
+    private func applyLaunchGreetingLanguage(_ language: String?) {
+        guard let language, !language.isEmpty, language != launchGreetingLanguage else { return }
+        launchGreetingLanguage = language
+        UserDefaults.standard.set(language, forKey: OpenWatchVoiceSettings.launchGreetingLanguageDefaultsKey)
+        AppLog.info("Watch launch greeting language updated language=\(language)")
+    }
+
+    private func applyLaunchGreetingVoiceIdentifier(_ voiceIdentifier: String?) {
+        guard let voiceIdentifier, voiceIdentifier != launchGreetingVoiceIdentifier else { return }
+        launchGreetingVoiceIdentifier = voiceIdentifier
+        UserDefaults.standard.set(voiceIdentifier, forKey: OpenWatchVoiceSettings.launchGreetingVoiceIdentifierDefaultsKey)
+        AppLog.info("Watch launch greeting voice updated voiceId=\(voiceIdentifier)")
+    }
+
+    // ─── Ariadne's Thread [AT-0134] ─────────────────────
+    // What: Haptic + spoken launch greeting when the Watch app becomes active.
+    // Why:  User wants OpenWatch to say an editable phrase (default "Hello Sir") on app open / Double Tap launch.
+    // Date: 2026-06-10
+    // Related: [AT-0133] AppModel.setLaunchGreetingPhrase, [AT-0131] OpenWatchLaunchIntent
+    // ─────────────────────────────────────────────────────
+    // ─── Ariadne's Thread [AT-0135] ─────────────────────
+    // What: Play iPhone-synced haptic on every app open (same debounce as launch greeting TTS).
+    // Why:  User wants tactile feedback when OpenWatch opens from Double Tap / icon / Smart Stack.
+    // Date: 2026-06-10
+    // Related: [AT-0134] WatchAppModel.deliverLaunchFeedbackIfNeeded, [AT-0008] AppModel.setHapticType
+    // ─────────────────────────────────────────────────────
+    // ─── Ariadne's Thread [AT-0137] ─────────────────────
+    // What: Reset launch feedback gate when the app leaves the foreground.
+    // Why:  Haptic + greeting must fire once per app open, not on every scenePhase .active while in use.
+    // Date: 2026-06-10
+    // Related: [AT-0135] WatchAppModel.deliverLaunchFeedbackIfNeeded
+    // ─────────────────────────────────────────────────────
+    func resetLaunchFeedbackSession() {
+        launchFeedbackDeliveredForForegroundSession = false
+        pendingLaunchGreetingTask?.cancel()
+        pendingLaunchGreetingTask = nil
+        AppLog.info("Watch launch feedback session reset (app backgrounded)")
+    }
+
+    func deliverLaunchFeedbackIfNeeded() {
+        guard !launchFeedbackDeliveredForForegroundSession else {
+            AppLog.info("Watch launch feedback skipped: already delivered this foreground session")
+            return
+        }
+        launchFeedbackDeliveredForForegroundSession = true
+
+        if let wkType = Self.wkHaptic(for: hapticType) {
+            WKInterfaceDevice.current().play(wkType)
+            AppLog.info("Watch played launch haptic=\(hapticType.rawValue) wkType=\(wkType)")
+        } else {
+            AppLog.info("Watch launch haptic skipped (off)")
+        }
+
+        let phrase = launchGreetingPhrase.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !phrase.isEmpty else {
+            AppLog.info("Watch launch greeting skipped: empty phrase")
+            return
+        }
+        let language = launchGreetingLanguage
+        let rate = globalTtsRate
+        let voiceIdentifier = launchGreetingVoiceIdentifier
+        AppLog.info("Watch launch greeting scheduled phraseLength=\(phrase.count) language=\(language) voiceId=\(voiceIdentifier) rate=\(rate)")
+        pendingLaunchGreetingTask?.cancel()
+        pendingLaunchGreetingTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else {
+                AppLog.info("Watch launch greeting cancelled before speak")
+                return
+            }
+            AppLog.info("Watch launch greeting speaking phraseLength=\(phrase.count) language=\(language) voiceId=\(voiceIdentifier) rate=\(rate)")
+            SpeechPlaybackService.shared.speak(
+                phrase,
+                language: language,
+                rateMultiplier: rate,
+                voiceIdentifier: voiceIdentifier.isEmpty ? nil : voiceIdentifier
+            )
+        }
     }
 
     private func applyHapticType(_ raw: String?) {
@@ -1795,20 +2099,73 @@ final class WatchAppModel: ObservableObject {
     private func markJobUpdate(_ jobId: UUID, source: String) {
         jobLastUpdateAt[jobId] = Date()
         AppLog.info("Watch job update timestamp jobId=\(jobId) source=\(source)")
+        syncComplicationActiveJobState()
     }
 
+    // ─── Ariadne's Thread [AT-0139] ─────────────────────
+    // What: Mirror executing-job state into App Group and reload the watch-face complication timeline.
+    // Why:  Complication must swap mic for a loader while sending/running jobs are in flight.
+    // Date: 2026-06-10
+    // Related: [AT-0132] OpenWatchComplication/OpenWatchComplication, shared→ComplicationActiveJobState
+    // ─────────────────────────────────────────────────────
+    private var hasExecutingJobs: Bool {
+        let isExecuting: (VoiceJob) -> Bool = { job in
+            !job.status.isTerminal && job.status != .idle && job.status != .listening
+        }
+        if sessions.flatMap(\.jobs).contains(where: isExecuting) { return true }
+        if gatewayJobs.values.flatMap({ $0 }).contains(where: isExecuting) { return true }
+        return false
+    }
+
+    private func syncComplicationActiveJobState() {
+        let active = hasExecutingJobs
+        ComplicationActiveJobState.setHasActiveJob(active)
+        WidgetCenter.shared.reloadTimelines(ofKind: ComplicationActiveJobState.widgetKind)
+        AppLog.info("Watch complication state synced hasActiveJob=\(active)")
+    }
+
+    // ─── Ariadne's Thread [AT-0141] ─────────────────────
+    // What: Discard in-progress Watch recording without sending audio to iPhone.
+    // Why:  Speak had only Stop & Send; users need Cancel that drops the recording and leaves no phantom job row.
+    // Date: 2026-06-10
+    // Related: [AT-0026] WatchAppModel.beginFileRecording, WatchAudioRecorder.cancel
+    // ─────────────────────────────────────────────────────
     func cancelRecording() {
         guard recorder.isRecording else { return }
+        let cancelledJobId = recordingJobId
         recorder.cancel()
-        if let jobId = recordingJobId {
-            updateDirectJob(jobId: jobId, status: .cancelled, statusDetail: nil, completedAt: Date())
+        if let jobId = cancelledJobId {
+            removeListeningJob(jobId: jobId)
+            pendingJobIds.remove(jobId)
+            markJobUpdate(jobId, source: "record-cancel")
+            AppLog.info("Watch removed listening job on cancel jobId=\(jobId)")
         }
         recordingSessionId = nil
         gatewayRecordingKey = nil
         recordingJobId = nil
         statusHint = nil
         objectWillChange.send()
-        AppLog.info("Watch cancelled recording")
+        AppLog.info("Watch cancelled recording without send jobId=\(cancelledJobId?.uuidString ?? "nil")")
+    }
+
+    private func removeListeningJob(jobId: UUID) {
+        if let gatewayKey = jobGatewayKey[jobId] {
+            var arr = gatewayJobs[gatewayKey] ?? []
+            arr.removeAll { $0.id == jobId }
+            if arr.isEmpty {
+                gatewayJobs.removeValue(forKey: gatewayKey)
+            } else {
+                publishGatewayJobs(sessionKey: gatewayKey, jobs: arr)
+            }
+            jobGatewayKey.removeValue(forKey: jobId)
+            AppLog.info("Watch removed gateway listening job jobId=\(jobId) sessionKey=\(gatewayKey)")
+            return
+        }
+        if let sessionId = jobSession[jobId], let si = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions[si].jobs.removeAll { $0.id == jobId }
+            jobSession.removeValue(forKey: jobId)
+            AppLog.info("Watch removed live listening job jobId=\(jobId) sessionIndex=\(si)")
+        }
     }
 
     // MARK: - Gateway session pages (horizontal)
@@ -1967,6 +2324,7 @@ final class WatchAppModel: ObservableObject {
         guard shouldApplyJobStatus(current: sessions[si].jobs[ji].status, incoming: status, jobId: jobId, source: "direct-local") else {
             return sessions[si].jobs[ji]
         }
+        let previousJob = sessions[si].jobs[ji]
         sessions[si].jobs[ji].status = status
         if let transcript { sessions[si].jobs[ji].transcript = transcript }
         if let resultText { sessions[si].jobs[ji].resultText = resultText }
@@ -1975,13 +2333,20 @@ final class WatchAppModel: ObservableObject {
         if let completedAt { sessions[si].jobs[ji].completedAt = completedAt }
         if status.isTerminal { pendingJobIds.remove(jobId) }
         markJobUpdate(jobId, source: "direct-local")
-        AppLog.info("Watch direct local job update jobId=\(jobId) status=\(status.rawValue) detail=\(statusDetail ?? "nil") transcriptLength=\(sessions[si].jobs[ji].transcript?.count ?? 0) replyLength=\(sessions[si].jobs[ji].resultText?.count ?? 0)")
-        return sessions[si].jobs[ji]
+        let updatedJob = sessions[si].jobs[ji]
+        maybePlayIncomingMessageHapticForMainScreen(
+            sessionKey: sessions[si].sessionKey,
+            shouldPlay: shouldPlayIncomingMessageHapticForLiveJob(previous: previousJob, incoming: updatedJob),
+            source: "direct-local"
+        )
+        AppLog.info("Watch direct local job update jobId=\(jobId) status=\(status.rawValue) detail=\(statusDetail ?? "nil") transcriptLength=\(updatedJob.transcript?.count ?? 0) replyLength=\(updatedJob.resultText?.count ?? 0)")
+        return updatedJob
     }
 
     /// Applies an iPhone job update to a gateway-session turn (mirrors the local upsert behavior, but on `gatewayJobs`).
-    private func upsertGateway(_ job: VoiceJob, key: String) {
+    private func upsertGateway(_ job: VoiceJob, key: String, source: String = "gateway-upsert") {
         var arr = gatewayJobs[key] ?? []
+        let previousJob = arr.first(where: { $0.id == job.id })
         if let ji = arr.firstIndex(where: { $0.id == job.id }) {
             guard shouldApplyJobStatus(current: arr[ji].status, incoming: job.status, jobId: job.id, source: "gateway-snapshot") else {
                 return
@@ -1990,10 +2355,16 @@ final class WatchAppModel: ObservableObject {
         } else {
             arr.insert(job, at: 0)
         }
-        gatewayJobs[key] = arr
+        publishGatewayJobs(sessionKey: key, jobs: arr)
         markJobUpdate(job.id, source: "gateway-upsert")
         AppLog.info("Watch gateway job update jobId=\(job.id) sessionKey=\(key) status=\(job.status.rawValue) detail=\(job.statusDetail ?? "nil") transcriptLength=\(job.transcript?.count ?? 0) replyLength=\(job.resultText?.count ?? 0) error=\(job.errorMessage ?? "nil")")
         if job.status.isTerminal { pendingJobIds.remove(job.id) }
+        maybePlayIncomingMessageHapticForMainScreen(
+            sessionKey: key,
+            shouldPlay: shouldPlayIncomingMessageHapticForLiveJob(previous: previousJob, incoming: job),
+            source: source
+        )
+        refreshOpenSessionDetailIfNeeded(sessionKey: key)
 
         switch job.status {
         case .done:
@@ -2010,9 +2381,10 @@ final class WatchAppModel: ObservableObject {
     // Date: 2026-06-07
     // Related: [AT-0048] shared→VoiceJob.gatewaySessionKey, [AT-0046] app→AppModel.resumePendingAudioJobs
     // ─────────────────────────────────────────────────────
-    private func upsert(_ job: VoiceJob) {
+    private func upsert(_ job: VoiceJob, source: String) {
         if let si = sessions.firstIndex(where: { $0.jobs.contains(where: { $0.id == job.id }) }) {
             jobSession[job.id] = sessions[si].id
+            let previousJob = sessions[si].jobs.first(where: { $0.id == job.id })
             if let ji = sessions[si].jobs.firstIndex(where: { $0.id == job.id }) {
                 guard shouldApplyJobStatus(current: sessions[si].jobs[ji].status, incoming: job.status, jobId: job.id, source: "live-session-snapshot") else {
                     return
@@ -2025,6 +2397,11 @@ final class WatchAppModel: ObservableObject {
                 pendingJobIds.remove(job.id)
             }
             markJobUpdate(job.id, source: "live-upsert")
+            maybePlayIncomingMessageHapticForMainScreen(
+                sessionKey: sessions[si].sessionKey,
+                shouldPlay: shouldPlayIncomingMessageHapticForLiveJob(previous: previousJob, incoming: job),
+                source: source
+            )
             AppLog.info("Watch upsert: updated existing live session jobId=\(job.id) status=\(job.status.rawValue) detail=\(job.statusDetail ?? "nil")")
             switch job.status {
             case .done:
@@ -2040,12 +2417,12 @@ final class WatchAppModel: ObservableObject {
         }
         // Turns started on a gateway-session page are tracked separately and never touch the local vertical sessions.
         if let key = jobGatewayKey[job.id] {
-            upsertGateway(job, key: key)
+            upsertGateway(job, key: key, source: source)
             return
         }
         if let key = job.gatewaySessionKey, !key.isEmpty {
             jobGatewayKey[job.id] = key
-            upsertGateway(job, key: key)
+            upsertGateway(job, key: key, source: source)
             AppLog.info("Watch upsert: attached iPhone job update to gateway session jobId=\(job.id) sessionKey=\(key)")
             return
         }
@@ -2068,6 +2445,7 @@ final class WatchAppModel: ObservableObject {
             AppLog.info("Watch upsert: job has no known session jobId=\(job.id); ignoring")
             return
         }
+        let previousJob = sessions[si].jobs.first(where: { $0.id == job.id })
         if let ji = sessions[si].jobs.firstIndex(where: { $0.id == job.id }) {
             guard shouldApplyJobStatus(current: sessions[si].jobs[ji].status, incoming: job.status, jobId: job.id, source: "local-snapshot") else {
                 return
@@ -2080,6 +2458,11 @@ final class WatchAppModel: ObservableObject {
             pendingJobIds.remove(job.id)
         }
         markJobUpdate(job.id, source: "local-upsert")
+        maybePlayIncomingMessageHapticForMainScreen(
+            sessionKey: sessions[si].sessionKey,
+            shouldPlay: shouldPlayIncomingMessageHapticForLiveJob(previous: previousJob, incoming: job),
+            source: source
+        )
 
         switch job.status {
         case .done:

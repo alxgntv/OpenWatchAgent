@@ -3,6 +3,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var model = WatchAppModel.shared
+    @Environment(\.scenePhase) private var scenePhase
     private let jobWatchdogTimer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -32,6 +33,15 @@ struct ContentView: View {
             model.horizontalIndex = 2
             WatchConnectivityWatchService.shared.logStep2IPhoneConnect(reason: "app-launched")
             AppLog.info("OpenWatch Watch app launched")
+            model.deliverLaunchFeedbackIfNeeded()
+        }
+        .onChange(of: scenePhase) { oldPhase, newPhase in
+            if newPhase == .background {
+                model.resetLaunchFeedbackSession()
+            } else if newPhase == .active, oldPhase == .background {
+                AppLog.info("OpenWatch Watch scene became active from background")
+                model.deliverLaunchFeedbackIfNeeded()
+            }
         }
         .onReceive(jobWatchdogTimer) { _ in
             model.tickJobStatusWatchdog()

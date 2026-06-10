@@ -72,6 +72,46 @@ struct HomeView: View {
                 Text("Language controls both speech recognition and spoken answers on Apple Watch.")
             }
 
+            Section {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Greeting phrase")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    TextField("Hello Sir", text: Binding(
+                        get: { model.launchGreetingPhrase },
+                        set: { model.setLaunchGreetingPhrase($0) }
+                    ), axis: .vertical)
+                    .textInputAutocapitalization(.sentences)
+                }
+
+                Picker(selection: Binding(
+                    get: { model.launchGreetingLanguage },
+                    set: { model.setLaunchGreetingLanguage($0) }
+                )) {
+                    ForEach(AppModel.availableLaunchGreetingLanguages, id: \.code) { lang in
+                        Text(lang.name).tag(lang.code)
+                    }
+                } label: {
+                    Label("Greeting language", systemImage: "globe")
+                }
+
+                Picker(selection: Binding(
+                    get: { model.launchGreetingVoiceIdentifier },
+                    set: { model.setLaunchGreetingVoiceIdentifier($0) }
+                )) {
+                    ForEach(model.launchGreetingVoiceOptions) { voice in
+                        Text(voice.name).tag(voice.id)
+                    }
+                } label: {
+                    Label("Greeting voice", systemImage: "person.wave.2")
+                }
+                .disabled(model.launchGreetingVoiceOptions.isEmpty)
+            } header: {
+                Text("Launch Greeting")
+            } footer: {
+                Text("Tap the phrase above to edit it. Your Apple Watch speaks it once when OpenWatch opens. Leave empty to stay silent.")
+            }
+
             if model.agentsLoading && model.gatewayAgents.isEmpty {
                 Section {
                     HStack { ProgressView(); Text("Loading agents…") }

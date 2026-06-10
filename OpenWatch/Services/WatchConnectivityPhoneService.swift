@@ -20,6 +20,9 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
     private var cachedTtsLanguageForWatch: String?
     private var cachedHapticTypeForWatch: String?
     private var cachedTtsRateForWatch: Double?
+    private var cachedLaunchGreetingPhraseForWatch: String?
+    private var cachedLaunchGreetingLanguageForWatch: String?
+    private var cachedLaunchGreetingVoiceIdentifierForWatch: String?
     private var cachedGatewayOperatorTokenForWatch: String?
     private var cachedGatewayOperatorScopesForWatch: [String]?
     private var deliveredGatewaySessionSnapshots: [String: WatchGatewaySession] = [:]
@@ -74,6 +77,9 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         ttsLanguage: String,
         hapticType: String,
         ttsRate: Double,
+        launchGreetingPhrase: String,
+        launchGreetingLanguage: String,
+        launchGreetingVoiceIdentifier: String,
         revokeGatewayPairing: Bool = false
     ) {
         let outbound = revokeGatewayPairing ? pairing : Self.pairingForWatchOutbound(pairing)
@@ -82,6 +88,9 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
         cachedTtsLanguageForWatch = ttsLanguage
         cachedHapticTypeForWatch = hapticType
         cachedTtsRateForWatch = ttsRate
+        cachedLaunchGreetingPhraseForWatch = launchGreetingPhrase
+        cachedLaunchGreetingLanguageForWatch = launchGreetingLanguage
+        cachedLaunchGreetingVoiceIdentifierForWatch = launchGreetingVoiceIdentifier
         cachedGatewayOperatorTokenForWatch = KeychainStore.loadOperatorToken()
         cachedGatewayOperatorScopesForWatch = KeychainStore.loadOperatorScopes()
         AppLog.info("Cached Watch pairing phase=\(outbound.phase.rawValue) haptic=\(hapticType) rate=\(ttsRate) revoke=\(revokeGatewayPairing) for context enrichment")
@@ -97,6 +106,9 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
             ttsLanguage: ttsLanguage,
             hapticType: hapticType,
             ttsRate: ttsRate,
+            launchGreetingPhrase: launchGreetingPhrase,
+            launchGreetingLanguage: launchGreetingLanguage,
+            launchGreetingVoiceIdentifier: launchGreetingVoiceIdentifier,
             revokeGatewayPairing: revokeGatewayPairing ? true : nil,
             gatewayOperatorToken: revokeGatewayPairing ? nil : cachedGatewayOperatorTokenForWatch,
             gatewayOperatorScopes: revokeGatewayPairing ? nil : cachedGatewayOperatorScopesForWatch
@@ -332,6 +344,9 @@ final class WatchConnectivityPhoneService: NSObject, ObservableObject {
             ttsLanguage: envelope.ttsLanguage ?? cachedTtsLanguageForWatch,
             hapticType: envelope.hapticType ?? cachedHapticTypeForWatch,
             ttsRate: envelope.ttsRate ?? cachedTtsRateForWatch,
+            launchGreetingPhrase: envelope.launchGreetingPhrase ?? cachedLaunchGreetingPhraseForWatch,
+            launchGreetingLanguage: envelope.launchGreetingLanguage ?? cachedLaunchGreetingLanguageForWatch,
+            launchGreetingVoiceIdentifier: envelope.launchGreetingVoiceIdentifier ?? cachedLaunchGreetingVoiceIdentifierForWatch,
             gatewaySessions: envelope.gatewaySessions,
             replaceGatewaySessions: envelope.replaceGatewaySessions,
             usage: envelope.usage,

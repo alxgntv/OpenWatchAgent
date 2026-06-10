@@ -5,9 +5,11 @@ import Foundation
 @MainActor
 final class WatchAudioRecorder: NSObject, ObservableObject {
     @Published private(set) var isRecording = false
+    @Published private(set) var meterLevel: Double = 0
 
     private var recorder: AVAudioRecorder?
     private var currentURL: URL?
+    private var meterTask: Task<Void, Never>?
 
     func ensurePermission() async -> Bool {
         let status = AVAudioApplication.shared.recordPermission
@@ -55,18 +57,22 @@ final class WatchAudioRecorder: NSObject, ObservableObject {
 
         let recorder = try AVAudioRecorder(url: url, settings: settings)
         recorder.delegate = self
+        recorder.isMeteringEnabled = true
         guard recorder.record() else {
             throw NSError(domain: "OpenWatch", code: 20, userInfo: [NSLocalizedDescriptionKey: "Could not start audio recording."])
         }
         self.recorder = recorder
         currentURL = url
         isRecording = true
+        meterLevel = 0
+        startMetering()
         FlowLog.progress(step: 3, side: .watch, flow: "audio-record", detail: "writing audio file url=\(url.lastPathComponent)")
         AppLog.info("Watch started file audio recording url=\(url.lastPathComponent)")
     }
 
     func stopRecording() -> URL? {
         guard isRecording, let recorder else { return nil }
+        stopMetering()
         recorder.stop()
         isRecording = false
         self.recorder = nil
@@ -77,6 +83,7 @@ final class WatchAudioRecorder: NSObject, ObservableObject {
     }
 
     func cancel() {
+        stopMetering()
         recorder?.stop()
         if let currentURL {
             try? FileManager.default.removeItem(at: currentURL)
@@ -86,6 +93,48 @@ final class WatchAudioRecorder: NSObject, ObservableObject {
         isRecording = false
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         AppLog.info("Watch cancelled file audio recording")
+    }
+
+    // ─── Ariadne's Thread [AT-0143] ─────────────────────
+    // What: Poll AVAudioRecorder input meters for the live waveform view.
+    // Why:  watchOS has no built-in recording waveform; native metering is the supported signal source.
+    // Date: 2026-06-10
+    // Related: [AT-0143] RecordingWaveformView
+    // ─────────────────────────────────────────────────────
+    private func startMetering() {
+        meterTask?.cancel()
+        meterTask = Task { @MainActor in
+            while !Task.isCancelled, isRecording {
+                updateMeterLevel()
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+        AppLog.info("Watch recording meter polling started")
+    }
+
+    private func stopMetering() {
+        meterTask?.cancel()
+        meterTask = nil
+        meterLevel = 0
+        AppLog.info("Watch recording meter polling stopped")
+    }
+
+    private func updateMeterLevel() {
+        guard let recorder, isRecording else {
+            meterLevel = 0
+            return
+        }
+        recorder.updateMeters()
+        let averagePower = recorder.averagePower(forChannel: 0)
+        let peakPower = recorder.peakPower(forChannel: 0)
+        let power = max(averagePower, peakPower)
+        let clamped = max(-45, min(0, power))
+        let normalized = Double(pow((clamped + 45) / 45, 1.35))
+        if normalized >= meterLevel {
+            meterLevel = meterLevel * 0.15 + normalized * 0.85
+        } else {
+            meterLevel = meterLevel * 0.72 + normalized * 0.28
+        }
     }
 
     private func logCurrentAudioRoute(session: AVAudioSession, context: String) {

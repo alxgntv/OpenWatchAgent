@@ -1,5 +1,13 @@
 import Foundation
 
+nonisolated public enum OpenWatchVoiceSettings {
+    public static let defaultLaunchGreetingPhrase = "Hello Sir"
+    public static let defaultLaunchGreetingLanguage = "en-US"
+    public static let launchGreetingPhraseDefaultsKey = "launchGreetingPhrase"
+    public static let launchGreetingLanguageDefaultsKey = "launchGreetingLanguage"
+    public static let launchGreetingVoiceIdentifierDefaultsKey = "launchGreetingVoiceIdentifier"
+}
+
 nonisolated public enum WatchMessageKind: String, Codable, Sendable {
     case pairingSnapshot
     case jobsSnapshot
@@ -242,6 +250,12 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
     public let hapticType: String?
     /// Watch speech rate multiplier for spoken replies. nil means "unchanged / unknown".
     public let ttsRate: Double?
+    /// Spoken phrase when the Watch app opens (e.g. "Hello Sir"). nil means "unchanged / unknown".
+    public let launchGreetingPhrase: String?
+    /// BCP-47 language for the launch greeting TTS. nil means "unchanged / unknown".
+    public let launchGreetingLanguage: String?
+    /// AVSpeechSynthesisVoice identifier for the launch greeting. nil/empty means language default on Watch.
+    public let launchGreetingVoiceIdentifier: String?
     /// Real gateway session index (with recent history) for the Watch's horizontal pages. nil means "unchanged / unknown".
     public let gatewaySessions: [WatchGatewaySession]?
     /// true/nil = replace Watch gateway sessions; false = merge only changed/missing sessions.
@@ -294,6 +308,9 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         ttsLanguage: String? = nil,
         hapticType: String? = nil,
         ttsRate: Double? = nil,
+        launchGreetingPhrase: String? = nil,
+        launchGreetingLanguage: String? = nil,
+        launchGreetingVoiceIdentifier: String? = nil,
         gatewaySessions: [WatchGatewaySession]? = nil,
         replaceGatewaySessions: Bool? = nil,
         usage: WatchUsage? = nil,
@@ -322,6 +339,9 @@ nonisolated public struct WatchEnvelope: Codable, Sendable {
         self.ttsLanguage = ttsLanguage
         self.hapticType = hapticType
         self.ttsRate = ttsRate
+        self.launchGreetingPhrase = launchGreetingPhrase
+        self.launchGreetingLanguage = launchGreetingLanguage
+        self.launchGreetingVoiceIdentifier = launchGreetingVoiceIdentifier
         self.gatewaySessions = gatewaySessions
         self.replaceGatewaySessions = replaceGatewaySessions
         self.usage = usage

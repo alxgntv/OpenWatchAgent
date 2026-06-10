@@ -16,6 +16,7 @@ private func watchCompactStamp(_ date: Date) -> String {
 struct WatchSessionPage: View {
     @ObservedObject var model: WatchAppModel
     @ObservedObject private var connectivity = WatchConnectivityWatchService.shared
+    @State private var selectedBotMessageId: String?
     let session: WatchSession
     let index: Int
 
@@ -34,11 +35,18 @@ struct WatchSessionPage: View {
     // Date: 2026-06-07
     // Related: [AT-0002] WatchAppModel horizontalIndex main screen
     // ─────────────────────────────────────────────────────
+    // ─── Ariadne's Thread [AT-0140] ─────────────────────
+    // What: Pin Speak/Voice controls above the message ScrollView on live session pages.
+    // Why:  Scrolling back up through an all-in-one ScrollView overscrolled into the vertical TabView and switched sessions, stopping TTS.
+    // Date: 2026-06-10
+    // Related: [AT-0002] ContentView.liveStack, WatchAppModel.currentIndex
+    // ─────────────────────────────────────────────────────
     var body: some View {
-        ScrollView {
+        VStack(spacing: 8) {
             VStack(spacing: 8) {
                 speakButton
                 muteButton
+                recordingWaveform
                 // Only pairing / permission / mic errors — send & record progress live inside the Speak button.
                 if index == model.currentIndex, session.activeJob == nil, !isRecordingHere,
                    let hint = model.statusHint, Self.isActionableStatusHint(hint) {
@@ -46,11 +54,15 @@ struct WatchSessionPage: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
+            }
+            .frame(maxWidth: .infinity)
+            .fixedSize(horizontal: false, vertical: true)
+            ScrollView {
                 history
             }
-            .padding(.horizontal, 4)
-            .frame(maxWidth: .infinity)
         }
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .toolbar(.hidden, for: .navigationBar)
         .onAppear {
             guard index == model.currentIndex, model.horizontalIndex == 2 else { return }
@@ -86,8 +98,13 @@ struct WatchSessionPage: View {
                 ForEach(session.jobs) { job in
                     VStack(alignment: .leading, spacing: 2) {
                         if let result = job.resultText {
-                            Text(result)
-                                .font(.footnote)
+                            BotMessageCard(
+                                id: job.id.uuidString,
+                                text: result,
+                                isSelected: selectedBotMessageId == job.id.uuidString,
+                                onSelect: { toggleSelectedBotMessage(job.id.uuidString) },
+                                onSpeak: { model.speakMessageText(result) }
+                            )
                         } else if let error = job.errorMessage {
                             Text(error)
                                 .font(.caption2)
@@ -105,6 +122,17 @@ struct WatchSessionPage: View {
         }
     }
 
+    private func toggleSelectedBotMessage(_ id: String) {
+        selectedBotMessageId = selectedBotMessageId == id ? nil : id
+        AppLog.info("Watch live bot message card selected id=\(id) selected=\(selectedBotMessageId == id)")
+    }
+
+    // ─── Ariadne's Thread [AT-0142] ─────────────────────
+    // What: Style Stop & Send as a green send action while recording on live sessions.
+    // Why:  Send is a positive completion action; red stop icon implied cancellation.
+    // Date: 2026-06-10
+    // Related: [AT-0141] WatchSessionPage.muteButton
+    // ─────────────────────────────────────────────────────
     private var speakButton: some View {
         Button {
             if let retryJob {
@@ -115,7 +143,7 @@ struct WatchSessionPage: View {
         } label: {
             VStack(spacing: 4) {
                 if isRecordingHere {
-                    Image(systemName: "stop.fill").font(.title2)
+                    Image(systemName: "paperplane.fill").font(.title2)
                     Text("Stop & Send").font(.caption2)
                 } else if retryJob != nil {
                     Image(systemName: "arrow.clockwise").font(.title2)
@@ -136,14 +164,30 @@ struct WatchSessionPage: View {
             }
         }
         .buttonStyle(.borderedProminent)
-        .tint(isRecordingHere ? .red : (isWaitingForIPhoneInternet ? .gray : .blue))
+        .frame(maxWidth: .infinity)
+        .tint(isRecordingHere ? .green : (isWaitingForIPhoneInternet ? .gray : .blue))
         .disabled((session.activeJob != nil && !isRecordingHere) || isWaitingForIPhoneInternet)
     }
 
-    /// Per-session voice mute — hidden when iPhone has disabled "Speak replies on Watch".
+    // ─── Ariadne's Thread [AT-0141] ─────────────────────
+    // What: Swap Voice On/Off for Cancel on the live session page while recording.
+    // Why:  Voice mute is irrelevant during capture; Cancel should occupy the same secondary button slot.
+    // Date: 2026-06-10
+    // Related: [AT-0141] WatchAppModel.cancelRecording
+    // ─────────────────────────────────────────────────────
     @ViewBuilder
     private var muteButton: some View {
-        if model.globalTtsEnabled {
+        if isRecordingHere {
+            Button {
+                model.cancelRecording()
+            } label: {
+                Label("Cancel", systemImage: "xmark")
+                    .font(.caption2)
+            }
+            .buttonStyle(.bordered)
+            .frame(maxWidth: .infinity)
+            .tint(.gray)
+        } else if model.globalTtsEnabled {
             Button {
                 model.toggleMute(sessionId: session.id)
             } label: {
@@ -154,7 +198,15 @@ struct WatchSessionPage: View {
                 .font(.caption2)
             }
             .buttonStyle(.bordered)
+            .frame(maxWidth: .infinity)
             .tint(session.muted ? .gray : .blue)
+        }
+    }
+
+    @ViewBuilder
+    private var recordingWaveform: some View {
+        if isRecordingHere {
+            RecordingWaveformView(level: model.recordingMeterLevel, isActive: true)
         }
     }
 }
@@ -188,16 +240,27 @@ struct GatewaySessionPage: View {
         !connectivity.canSendVoice && !isRecordingHere && activeJob == nil && retryJob == nil
     }
 
+    // ─── Ariadne's Thread [AT-0140] ─────────────────────
+    // What: Pin Speak/Voice controls above the message ScrollView on gateway session pages.
+    // Why:  Same overscroll/session-switch bug as live sessions when scrolling back to Speak during TTS.
+    // Date: 2026-06-10
+    // Related: [AT-0140] WatchSessionPage.body
+    // ─────────────────────────────────────────────────────
     var body: some View {
-        ScrollView {
+        VStack(spacing: 8) {
             VStack(spacing: 8) {
                 speakButton
                 muteButton
+                recordingWaveform
+            }
+            .frame(maxWidth: .infinity)
+            .fixedSize(horizontal: false, vertical: true)
+            ScrollView {
                 history
             }
-            .padding(.horizontal, 4)
-            .frame(maxWidth: .infinity)
         }
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .navigationTitle(titleText)
         .refreshable {
             await model.refreshSessionMessages(sessionKey: sessionKey)
@@ -207,10 +270,20 @@ struct GatewaySessionPage: View {
         }
     }
 
-    /// Per-session voice mute for this gateway page — hidden when iPhone has disabled global TTS.
+    /// Per-session voice mute for this gateway page — swaps to Cancel while recording.
     @ViewBuilder
     private var muteButton: some View {
-        if model.globalTtsEnabled {
+        if isRecordingHere {
+            Button {
+                model.cancelRecording()
+            } label: {
+                Label("Cancel", systemImage: "xmark")
+                    .font(.caption2)
+            }
+            .buttonStyle(.bordered)
+            .frame(maxWidth: .infinity)
+            .tint(.gray)
+        } else if model.globalTtsEnabled {
             Button {
                 model.toggleGatewayMute(sessionKey: sessionKey)
             } label: {
@@ -221,6 +294,7 @@ struct GatewaySessionPage: View {
                 .font(.caption2)
             }
             .buttonStyle(.bordered)
+            .frame(maxWidth: .infinity)
             .tint(model.isGatewayMuted(sessionKey) ? .gray : .blue)
         }
     }
@@ -244,7 +318,7 @@ struct GatewaySessionPage: View {
         } label: {
             VStack(spacing: 4) {
                 if isRecordingHere {
-                    Image(systemName: "stop.fill").font(.title2)
+                    Image(systemName: "paperplane.fill").font(.title2)
                     Text("Stop & Send").font(.caption2)
                 } else if retryJob != nil {
                     Image(systemName: "arrow.clockwise").font(.title2)
@@ -264,8 +338,16 @@ struct GatewaySessionPage: View {
             }
         }
         .buttonStyle(.borderedProminent)
-        .tint(isRecordingHere ? .red : (isWaitingForIPhoneInternet ? .gray : .blue))
+        .frame(maxWidth: .infinity)
+        .tint(isRecordingHere ? .green : (isWaitingForIPhoneInternet ? .gray : .blue))
         .disabled((activeJob != nil && !isRecordingHere) || isWaitingForIPhoneInternet)
+    }
+
+    @ViewBuilder
+    private var recordingWaveform: some View {
+        if isRecordingHere {
+            RecordingWaveformView(level: model.recordingMeterLevel, isActive: true)
+        }
     }
 
     @ViewBuilder
@@ -312,13 +394,20 @@ struct GatewaySessionPage: View {
                 }
                 // Recent server history (oldest-first slice) reversed so the newest message is on top.
                 ForEach(Array(messages.reversed())) { message in
-                    BotMessageCard(
-                        id: message.id,
-                        text: message.text,
-                        isSelected: selectedBotMessageId == message.id,
-                        onSelect: { toggleSelectedBotMessage(message.id) },
-                        onSpeak: { model.speakMessageText(message.text) }
-                    )
+                    if message.isUser {
+                        Text(message.text)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        BotMessageCard(
+                            id: message.id,
+                            text: message.text,
+                            isSelected: selectedBotMessageId == message.id,
+                            onSelect: { toggleSelectedBotMessage(message.id) },
+                            onSpeak: { model.speakMessageText(message.text) }
+                        )
+                    }
                 }
             }
         }
@@ -358,6 +447,10 @@ struct BotMessageCard: View {
                 .font(.footnote)
                 .foregroundStyle(.primary)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    onSelect()
+                }
         }
         .padding(.vertical, 8)
         .padding(.horizontal, 10)
@@ -366,10 +459,6 @@ struct BotMessageCard: View {
         .overlay {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(isSelected ? Color.blue.opacity(0.7) : Color.clear, lineWidth: 1)
-        }
-        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .onTapGesture {
-            onSelect()
         }
     }
 }
