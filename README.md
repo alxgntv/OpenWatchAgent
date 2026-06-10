@@ -32,7 +32,13 @@ Raise your wrist -> speak -> send -> get shit done. Working with AirPods & Apple
 
 - [x] Tap **Speak** to record, tap **Stop & Send** to send a voice command to your agent
 - [x] Hear agent replies on the watch (TTS), with **Voice On/Off**
+- [x] Tap a message, then tap **Speak** to replay that reply only
+- [x] Hear a launch greeting when OpenWatch opens (know the agent started - great with headphones)
+- [x] Speech is free - powered by Apple platform voices
 - [x] Switch between your OpenClaw agents
+- [x] Load the full list of platform agents and subagents
+- [x] Inspect reply and message history for every agent and subagent
+- [x] Open a subagent session and keep talking in that chat
 - [x] Open past gateway sessions and keep talking in the same session
 - [x] See usage stats: agents, sessions, messages, tokens
 
@@ -42,6 +48,14 @@ Raise your wrist -> speak -> send -> get shit done. Working with AirPods & Apple
 - [x] Stay connected in the background while the watch sends voice jobs
 - [x] Pick your main agent and browse agent sessions
 - [x] Configure language, speech rate, haptics, and launch greeting for the watch
+- [x] Set **Haptic Feedback** for Watch button taps
+- [x] Launch greeting setting - know OpenWatch started (especially with headphones)
+- [x] Set **Speech Rate** for Watch speech playback
+- [x] Configure your **greeting phrase**
+- [x] Pick an English **Greeting voice** from many Apple voices
+- [x] Load the full list of platform agents and subagents from your gateway
+- [x] Inspect reply and message history for every agent and subagent
+- [x] Open a subagent session and continue that chat
 
 ## Supported Platforms
 
