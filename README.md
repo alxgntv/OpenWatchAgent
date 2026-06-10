@@ -26,6 +26,23 @@ Most AI-agent workflows still assume that you are sitting at a computer or holdi
 
 Raise your wrist -> speak -> send -> get shit done. Working with AirPods & Apple Watch
 
+## What it does now
+
+**Apple Watch**
+
+- [x] Tap **Speak** to record, tap **Stop & Send** to send a voice command to your agent
+- [x] Hear agent replies on the watch (TTS), with **Voice On/Off**
+- [x] Switch between your OpenClaw agents
+- [x] Open past gateway sessions and keep talking in the same session
+- [x] See usage stats: agents, sessions, messages, tokens
+
+**iPhone**
+
+- [x] Pair with your OpenClaw Gateway via setup code
+- [x] Stay connected in the background while the watch sends voice jobs
+- [x] Pick your main agent and browse agent sessions
+- [x] Configure language, speech rate, haptics, and launch greeting for the watch
+
 ## Supported Platforms
 
 - [x] Apple Watch (watchOS 10+)
