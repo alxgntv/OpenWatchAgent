@@ -1,12 +1,12 @@
+<p align="center">
+  <img src="docs/images/open-watch-logo.png" width="260" alt="Open Watch logo">
+</p>
+
 # Open Watch Platform
 
-Open Watch Platform is an open-source watch-first interface for your personal AI agents. It lets you talk to an agent from your wrist, send a voice command, receive a response, and hear it in your headphones without opening a computer or holding a phone.
+Open Watch Platform is an open-source watch-first interface for your personal AI agents. It lets you talk to an agent from your wrist, send a voice command, receive a response, and hear it in your headphones without opening a computer or holding a phone. If you want your AI assistant to feel always available, mobile, and close to you instead of trapped inside a desktop or phone chat window, this is it.
 
-The goal is simple: anyone with a watch that has internet access should be able to reach their own AI agents anywhere. The agent can be OpenClaw, Nanoclaw, Hermes, or any other personal agent stack. The watch is just the natural access point.
-
-If you want your AI assistant to feel always available, mobile, and close to you instead of trapped inside a desktop or phone chat window, this is it.
-
-Current implementation: Apple Watch + iPhone companion for voice commands to an **OpenClaw** agent.
+Anyone with a watch that has internet can access their own AI agents.
 
 Open Watch Platform is designed so the community can extend it to more watches, more platforms, and more agent backends.
 
@@ -30,11 +30,9 @@ Speak to your selected agent, send the recording, switch agents, review sessions
 
 OpenWatch uses native OpenClaw device pairing. The iPhone app connects to your OpenClaw Gateway, registers this phone as a device, and waits until the Gateway owner approves it.
 
-OpenClaw docs:
+How to Pair docs:
 
 - [Gateway pairing](https://docs.openclaw.ai/gateway/pairing)
-- [`openclaw qr`](https://docs.openclaw.ai/cli/qr)
-- [`openclaw devices`](https://docs.openclaw.ai/cli/devices)
 - [Gateway protocol](https://docs.openclaw.ai/gateway/protocol)
 
 On the machine where your OpenClaw Gateway is running:
@@ -87,34 +85,20 @@ Open Watch Platform exists to make access to personal AI agents more natural, mo
 
 The original idea came from a simple moment: riding a bike to training while an OpenClaw agent was working on a project. The agent kept sending updates, but interacting with it through a phone chat while cycling was unsafe and inconvenient. The watch was already on the wrist. The missing piece was obvious: tap, speak, send, listen.
 
-## Supported Agents
+## Supported Platforms
 
-Open Watch Platform is intended to work with any personal AI-agent backend.
+Current implementation:
 
-Current focus:
+- **Apple Watch:** watchOS 10+.
+- **iPhone:** iOS 18+.
+- **OpenClaw Gateway / Agent:**
 
-- OpenClaw
+Agent backends:
 
-Planned by design:
-
-- Nanoclaw
-- Hermes
-- Any gateway or agent API the community wants to connect
-
-## Status
-
-- **iPhone:** setup code pairing, approval screen, home + job list, speech on phone.
-- **Watch:** tap Listen, tap Send, job list/detail, TTS on done.
-- **Bridge:** WatchConnectivity, so watch commands can reach the iPhone companion.
-- **Jobs:** placeholder response until OpenClaw agent RPC is wired (`GatewayJobClient`).
-
-## Requirements
-
-- Apple Watch with watchOS 10+.
-- iPhone with iOS 18+.
-- Xcode 16+.
-- A self-hosted OpenClaw Gateway for the current implementation.
-- Pairing through a setup code from `openclaw qr --setup-code-only`, followed by `openclaw devices approve`.
+- [*] OpenClaw.
+- [ ] Nanoclaw
+- [ ] Hermes
+- [ ] Any gateway or agent API the community wants to connect
 
 ## Run on a real iPhone
 
