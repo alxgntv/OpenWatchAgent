@@ -35,14 +35,8 @@ struct WatchSessionPage: View {
     // Date: 2026-06-07
     // Related: [AT-0002] WatchAppModel horizontalIndex main screen
     // ─────────────────────────────────────────────────────
-    // ─── Ariadne's Thread [AT-0140] ─────────────────────
-    // What: Pin Speak/Voice controls above the message ScrollView on live session pages.
-    // Why:  Scrolling back up through an all-in-one ScrollView overscrolled into the vertical TabView and switched sessions, stopping TTS.
-    // Date: 2026-06-10
-    // Related: [AT-0002] ContentView.liveStack, WatchAppModel.currentIndex
-    // ─────────────────────────────────────────────────────
     var body: some View {
-        VStack(spacing: 8) {
+        ScrollView {
             VStack(spacing: 8) {
                 speakButton
                 muteButton
@@ -54,15 +48,11 @@ struct WatchSessionPage: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
-            }
-            .frame(maxWidth: .infinity)
-            .fixedSize(horizontal: false, vertical: true)
-            ScrollView {
                 history
             }
+            .padding(.horizontal, 4)
+            .frame(maxWidth: .infinity)
         }
-        .padding(.horizontal, 4)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .toolbar(.hidden, for: .navigationBar)
         .onAppear {
             guard index == model.currentIndex, model.horizontalIndex == 2 else { return }
@@ -240,27 +230,17 @@ struct GatewaySessionPage: View {
         !connectivity.canSendVoice && !isRecordingHere && activeJob == nil && retryJob == nil
     }
 
-    // ─── Ariadne's Thread [AT-0140] ─────────────────────
-    // What: Pin Speak/Voice controls above the message ScrollView on gateway session pages.
-    // Why:  Same overscroll/session-switch bug as live sessions when scrolling back to Speak during TTS.
-    // Date: 2026-06-10
-    // Related: [AT-0140] WatchSessionPage.body
-    // ─────────────────────────────────────────────────────
     var body: some View {
-        VStack(spacing: 8) {
+        ScrollView {
             VStack(spacing: 8) {
                 speakButton
                 muteButton
                 recordingWaveform
-            }
-            .frame(maxWidth: .infinity)
-            .fixedSize(horizontal: false, vertical: true)
-            ScrollView {
                 history
             }
+            .padding(.horizontal, 4)
+            .frame(maxWidth: .infinity)
         }
-        .padding(.horizontal, 4)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .navigationTitle(titleText)
         .refreshable {
             await model.refreshSessionMessages(sessionKey: sessionKey)
