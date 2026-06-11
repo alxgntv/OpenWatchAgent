@@ -132,6 +132,7 @@ final class WatchAppModel: ObservableObject {
     @Published private(set) var launchGreetingVoiceIdentifier: String = UserDefaults.standard.string(forKey: OpenWatchVoiceSettings.launchGreetingVoiceIdentifierDefaultsKey) ?? ""
     /// Haptic feedback played when Watch recording starts/stops, mirrored from the iPhone app.
     @Published var hapticType: WatchHapticType = .start
+    @Published private(set) var manualSpeakingMessageId: String?
     /// Real gateway session index mirrored from the iPhone — shown in the Sessions list/navigation.
     @Published var gatewaySessions: [WatchGatewaySession] = []
     @Published var gatewaySessionsLoading = false
@@ -246,13 +247,26 @@ final class WatchAppModel: ObservableObject {
         restorePairingFromLocalCache()
         rebuildWatchSnapshots()
         recorderMeterCancellable = recorder.$meterLevel
+            .combineLatest(recorder.$isRecording)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
+            .sink { [weak self] _, _ in
                 self?.objectWillChange.send()
+                self?.syncComplicationActiveJobState()
             }
+        SpeechPlaybackService.shared.onPlaybackIdle = { [weak self] in
+            self?.manualSpeakingMessageId = nil
+            AppLog.info("Watch manual TTS button state cleared")
+        }
+    }
+
+    /// Reload watch-face complication after install or when returning to foreground.
+    func refreshComplicationPresentation() {
+        syncComplicationActiveJobState()
     }
 
     var recordingMeterLevel: Double { recorder.meterLevel }
+    var recordingStartedAt: Date? { recorder.recordingStartedAt }
+    var watchAudioRecorder: WatchAudioRecorder { recorder }
 
     // ─── Ariadne's Thread [AT-0099] ─────────────────────
     // What: Route Watch UI and WCSession changes through one MainActor event reducer.
@@ -890,7 +904,7 @@ final class WatchAppModel: ObservableObject {
     private func agentRowsForDisplay() -> [WatchAgentRow] {
         let rows = watchStore.agentOrder.compactMap { watchStore.agentsById[$0] }
         guard !rows.isEmpty else {
-            return [WatchGatewayAgent(id: "main", name: "Main Actor", emoji: "🎯", subtitle: "Default agent", modelLabel: nil, isDefault: true)]
+            return [WatchGatewayAgent(id: "main", name: "Main Actor", emoji: nil, subtitle: "Default agent", modelLabel: nil, isDefault: true)]
         }
         return rows
     }
@@ -1475,7 +1489,7 @@ final class WatchAppModel: ObservableObject {
             return [WatchGatewayAgent(
                 id: "main",
                 name: "Main Actor",
-                emoji: "🎯",
+                emoji: nil,
                 subtitle: "Default agent",
                 modelLabel: nil,
                 isDefault: true
@@ -1491,7 +1505,7 @@ final class WatchAppModel: ObservableObject {
                 return WatchGatewayAgent(
                     id: agent.id,
                     name: "Main Actor",
-                    emoji: agent.emoji ?? "🎯",
+                    emoji: agent.emoji,
                     subtitle: agent.subtitle,
                     modelLabel: agent.modelLabel,
                     isDefault: agent.isDefault
@@ -1523,6 +1537,19 @@ final class WatchAppModel: ObservableObject {
     /// Agent row for `selectedAgentId` (same name/emoji as on the Agents page).
     var selectedAgentDisplay: WatchGatewayAgent? {
         sortedAgentsForDisplay.first { $0.id == mainAgentId }
+    }
+
+    // ─── Ariadne's Thread [AT-0161] ─────────────────────
+    // What: Main Actor logo placeholder only when no custom emoji (legacy 🎯 counts as unset).
+    // Why:  Custom emoji stays in text UI; mascot PNG is for Agents list + watch-face complication.
+    // Date: 2026-06-11
+    // Related: [AT-0161] AgentLeadingIconView
+    // ─────────────────────────────────────────────────────
+    /// Main Actor uses the red agent logo when emoji is missing or still the legacy 🎯 default.
+    static func shouldShowMainAgentLogo(agentId: String, emoji: String?) -> Bool {
+        guard agentId == "main" else { return false }
+        guard let emoji = emoji?.trimmingCharacters(in: .whitespacesAndNewlines), !emoji.isEmpty else { return true }
+        return emoji == "🎯"
     }
 
     /// Emoji for the active agent (same as Agents page card).
@@ -2194,7 +2221,14 @@ final class WatchAppModel: ObservableObject {
     // Date: 2026-06-10
     // Related: [AT-0132] OpenWatchComplication/OpenWatchComplication, shared→ComplicationActiveJobState
     // ─────────────────────────────────────────────────────
+    // ─── Ariadne's Thread [AT-0160] ─────────────────────
+    // What: Complication loader while recording or any non-idle in-flight job is active on Watch.
+    // Why:  Watch-face slot must show ProgressView during background work, not only after send.
+    // Date: 2026-06-11
+    // Related: [AT-0139] ComplicationActiveJobState, OpenWatchComplicationView.statusGlyph
+    // ─────────────────────────────────────────────────────
     private var hasExecutingJobs: Bool {
+        if recorder.isRecording { return true }
         let isExecuting: (VoiceJob) -> Bool = { job in
             !job.status.isTerminal && job.status != .idle && job.status != .listening
         }
@@ -2634,11 +2668,20 @@ final class WatchAppModel: ObservableObject {
     // Date: 2026-06-09
     // Related: [AT-0062] WatchAppModel.speakOnce, [AT-0120] WatchHomeView.BotMessageCard
     // ─────────────────────────────────────────────────────
-    func speakMessageText(_ text: String) {
+    func speakMessageText(_ text: String, messageId: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        manualSpeakingMessageId = messageId
+        WKInterfaceDevice.current().play(.click)
         SpeechPlaybackService.shared.speak(trimmed, language: globalTtsLanguage, rateMultiplier: globalTtsRate)
-        AppLog.info("Watch TTS manual message playback length=\(trimmed.count)")
+        AppLog.info("Watch TTS manual message playback id=\(messageId) length=\(trimmed.count)")
+    }
+
+    func stopMessageSpeech(messageId: String) {
+        WKInterfaceDevice.current().play(.click)
+        SpeechPlaybackService.shared.stop()
+        manualSpeakingMessageId = nil
+        AppLog.info("Watch TTS manual message stop tapped id=\(messageId)")
     }
 
     /// Speaks the reply exactly once per job, letting it read to the end without restarting.

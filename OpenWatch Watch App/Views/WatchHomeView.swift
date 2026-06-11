@@ -92,8 +92,10 @@ struct WatchSessionPage: View {
                                 id: job.id.uuidString,
                                 text: result,
                                 isSelected: selectedBotMessageId == job.id.uuidString,
+                                isSpeaking: model.manualSpeakingMessageId == job.id.uuidString,
                                 onSelect: { toggleSelectedBotMessage(job.id.uuidString) },
-                                onSpeak: { model.speakMessageText(result) }
+                                onSpeak: { model.speakMessageText(result, messageId: job.id.uuidString) },
+                                onStop: { model.stopMessageSpeech(messageId: job.id.uuidString) }
                             )
                         } else if let error = job.errorMessage {
                             Text(error)
@@ -196,7 +198,7 @@ struct WatchSessionPage: View {
     @ViewBuilder
     private var recordingWaveform: some View {
         if isRecordingHere {
-            RecordingWaveformView(level: model.recordingMeterLevel, isActive: true)
+            RecordingWaveformView(recorder: model.watchAudioRecorder, isActive: true)
         }
     }
 }
@@ -326,7 +328,7 @@ struct GatewaySessionPage: View {
     @ViewBuilder
     private var recordingWaveform: some View {
         if isRecordingHere {
-            RecordingWaveformView(level: model.recordingMeterLevel, isActive: true)
+            RecordingWaveformView(recorder: model.watchAudioRecorder, isActive: true)
         }
     }
 
@@ -360,8 +362,10 @@ struct GatewaySessionPage: View {
                                 id: job.id.uuidString,
                                 text: result,
                                 isSelected: selectedBotMessageId == job.id.uuidString,
+                                isSpeaking: model.manualSpeakingMessageId == job.id.uuidString,
                                 onSelect: { toggleSelectedBotMessage(job.id.uuidString) },
-                                onSpeak: { model.speakMessageText(result) }
+                                onSpeak: { model.speakMessageText(result, messageId: job.id.uuidString) },
+                                onStop: { model.stopMessageSpeech(messageId: job.id.uuidString) }
                             )
                         } else if let error = job.errorMessage {
                             Text(error).font(.caption2).foregroundStyle(.red)
@@ -384,8 +388,10 @@ struct GatewaySessionPage: View {
                             id: message.id,
                             text: message.text,
                             isSelected: selectedBotMessageId == message.id,
+                            isSpeaking: model.manualSpeakingMessageId == message.id,
                             onSelect: { toggleSelectedBotMessage(message.id) },
-                            onSpeak: { model.speakMessageText(message.text) }
+                            onSpeak: { model.speakMessageText(message.text, messageId: message.id) },
+                            onStop: { model.stopMessageSpeech(messageId: message.id) }
                         )
                     }
                 }
@@ -409,37 +415,40 @@ struct BotMessageCard: View {
     let id: String
     let text: String
     let isSelected: Bool
+    let isSpeaking: Bool
     let onSelect: () -> Void
     let onSpeak: () -> Void
+    let onStop: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 1) {
             if isSelected {
                 Button {
-                    onSpeak()
+                    isSpeaking ? onStop() : onSpeak()
                 } label: {
-                    Label("Speak", systemImage: "speaker.wave.2.fill")
+                    Label(isSpeaking ? "Stop" : "Speak", systemImage: isSpeaking ? "stop.fill" : "speaker.wave.2.fill")
                         .font(.caption2)
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
+                .frame(maxWidth: .infinity)
+                .tint(isSpeaking ? .gray : .blue)
+                .padding(.top, 8)
             }
             Text(text)
                 .font(.footnote)
                 .foregroundStyle(.primary)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
+                .multilineTextAlignment(.leading)
+                .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .onTapGesture {
                     onSelect()
                 }
+                .padding(.vertical, 12)
+                .padding(.horizontal, 14)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
-        .padding(.vertical, 8)
-        .padding(.horizontal, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(isSelected ? Color.blue.opacity(0.7) : Color.clear, lineWidth: 1)
-        }
     }
 }
 
@@ -603,13 +612,7 @@ struct WatchAgentListRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            if let emoji = agent.emoji, !emoji.isEmpty {
-                Text(emoji)
-                    .font(.body)
-            } else {
-                Image(systemName: "person.circle.fill")
-                    .foregroundStyle(.secondary)
-            }
+            AgentLeadingIconView(agentId: agent.id, emoji: agent.emoji, size: 18)
             VStack(alignment: .leading, spacing: 2) {
                 Text(displayName)
                     .lineLimit(1)
@@ -630,6 +633,34 @@ struct WatchAgentListRow: View {
                 Image(systemName: "checkmark")
                     .font(.caption.weight(.semibold))
             }
+        }
+    }
+}
+
+// ─── Ariadne's Thread [AT-0161] ─────────────────────
+// What: AgentLogo placeholder in Agents list only when Main Actor has no custom emoji.
+// Why:  Inline image on the main session screen broke layout; list row is the correct place for the mascot.
+// Date: 2026-06-11
+// Related: [AT-0159] WatchAppModel.shouldShowMainAgentLogo, [AT-0158] ComplicationAgent
+// ─────────────────────────────────────────────────────
+struct AgentLeadingIconView: View {
+    let agentId: String
+    let emoji: String?
+    var size: CGFloat = 18
+
+    var body: some View {
+        if WatchAppModel.shouldShowMainAgentLogo(agentId: agentId, emoji: emoji) {
+            Image("AgentLogo")
+                .resizable()
+                .scaledToFit()
+                .frame(width: size, height: size)
+        } else if let trimmedEmoji = emoji?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmedEmoji.isEmpty {
+            Text(trimmedEmoji)
+                .font(.system(size: size * 0.95))
+        } else {
+            Image(systemName: "person.circle.fill")
+                .font(.system(size: size))
+                .foregroundStyle(.secondary)
         }
     }
 }

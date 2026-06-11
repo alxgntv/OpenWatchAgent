@@ -34,8 +34,12 @@ struct ContentView: View {
             WatchConnectivityWatchService.shared.logStep2IPhoneConnect(reason: "app-launched")
             AppLog.info("OpenWatch Watch app launched")
             model.deliverLaunchFeedbackIfNeeded()
+            model.refreshComplicationPresentation()
         }
         .onChange(of: scenePhase) { oldPhase, newPhase in
+            if newPhase == .active {
+                model.refreshComplicationPresentation()
+            }
             if newPhase == .background {
                 model.resetLaunchFeedbackSession()
             } else if newPhase == .active, oldPhase == .background {

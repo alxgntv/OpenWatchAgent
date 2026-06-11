@@ -4,6 +4,7 @@ import AVFoundation
 final class SpeechPlaybackService: NSObject {
     static let shared = SpeechPlaybackService()
     private let synthesizer = AVSpeechSynthesizer()
+    var onPlaybackIdle: (() -> Void)?
 
     private override init() {
         super.init()
@@ -93,6 +94,7 @@ extension SpeechPlaybackService: AVSpeechSynthesizerDelegate {
             // Release the audio session only when nothing else is queued, so multi-part replies are not cut off.
             if !synthesizer.isSpeaking {
                 try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+                onPlaybackIdle?()
             }
         }
     }
@@ -100,6 +102,7 @@ extension SpeechPlaybackService: AVSpeechSynthesizerDelegate {
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance, error: Error?) {
         Task { @MainActor in
             AppLog.error("Watch TTS cancelled error=\(error?.localizedDescription ?? "nil")")
+            self.onPlaybackIdle?()
         }
     }
 }

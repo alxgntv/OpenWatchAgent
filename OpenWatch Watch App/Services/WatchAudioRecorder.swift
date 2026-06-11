@@ -6,6 +6,7 @@ import Foundation
 final class WatchAudioRecorder: NSObject, ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var meterLevel: Double = 0
+    @Published private(set) var recordingStartedAt: Date?
 
     private var recorder: AVAudioRecorder?
     private var currentURL: URL?
@@ -65,6 +66,7 @@ final class WatchAudioRecorder: NSObject, ObservableObject {
         currentURL = url
         isRecording = true
         meterLevel = 0
+        recordingStartedAt = Date()
         startMetering()
         FlowLog.progress(step: 3, side: .watch, flow: "audio-record", detail: "writing audio file url=\(url.lastPathComponent)")
         AppLog.info("Watch started file audio recording url=\(url.lastPathComponent)")
@@ -91,6 +93,7 @@ final class WatchAudioRecorder: NSObject, ObservableObject {
         recorder = nil
         currentURL = nil
         isRecording = false
+        recordingStartedAt = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         AppLog.info("Watch cancelled file audio recording")
     }
@@ -116,9 +119,16 @@ final class WatchAudioRecorder: NSObject, ObservableObject {
         meterTask?.cancel()
         meterTask = nil
         meterLevel = 0
+        recordingStartedAt = nil
         AppLog.info("Watch recording meter polling stopped")
     }
 
+    // ─── Ariadne's Thread [AT-0156] ─────────────────────
+    // What: Track recording start time for live elapsed display (currentTime stays 0 on watchOS).
+    // Why:  Timer showed 0:00 because AVAudioRecorder.currentTime does not advance while recording on Watch.
+    // Date: 2026-06-11
+    // Related: [AT-0155] RecordingWaveformView, [AT-0143] WatchAudioRecorder.startMetering
+    // ─────────────────────────────────────────────────────
     private func updateMeterLevel() {
         guard let recorder, isRecording else {
             meterLevel = 0
