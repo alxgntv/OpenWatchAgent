@@ -17,9 +17,9 @@ This is fully open-source
 </p>
 
 <p>
+  <img src="docs/images/watch-transcribing.png" width="220" alt="Transcribing on Apple Watch">
   <img src="docs/images/watch-session-speak.png" width="220" alt="Replay message on Apple Watch">
   <img src="docs/images/watch-session-stop.png" width="220" alt="Stop replay on Apple Watch">
-  <img src="docs/images/watch-transcribing.png" width="220" alt="Transcribing on Apple Watch">
   <img src="docs/images/watch-agents.png" width="220" alt="Agents on Apple Watch">
   <img src="docs/images/watch-sessions.png" width="220" alt="Sessions on Apple Watch">
 </p>
