@@ -904,7 +904,7 @@ final class WatchAppModel: ObservableObject {
     private func agentRowsForDisplay() -> [WatchAgentRow] {
         let rows = watchStore.agentOrder.compactMap { watchStore.agentsById[$0] }
         guard !rows.isEmpty else {
-            return [WatchGatewayAgent(id: "main", name: "Main Actor", emoji: nil, subtitle: "Default agent", modelLabel: nil, isDefault: true)]
+            return [WatchGatewayAgent(id: "main", name: "Main Actor", emoji: "🦞", subtitle: "Default agent", modelLabel: nil, isDefault: true)]
         }
         return rows
     }
@@ -1489,7 +1489,7 @@ final class WatchAppModel: ObservableObject {
             return [WatchGatewayAgent(
                 id: "main",
                 name: "Main Actor",
-                emoji: nil,
+                emoji: "🦞",
                 subtitle: "Default agent",
                 modelLabel: nil,
                 isDefault: true
@@ -1539,25 +1539,12 @@ final class WatchAppModel: ObservableObject {
         sortedAgentsForDisplay.first { $0.id == mainAgentId }
     }
 
-    // ─── Ariadne's Thread [AT-0161] ─────────────────────
-    // What: Main Actor logo placeholder only when no custom emoji (legacy 🎯 counts as unset).
-    // Why:  Custom emoji stays in text UI; mascot PNG is for Agents list + watch-face complication.
-    // Date: 2026-06-11
-    // Related: [AT-0161] AgentLeadingIconView
-    // ─────────────────────────────────────────────────────
-    /// Main Actor uses the red agent logo when emoji is missing or still the legacy 🎯 default.
-    static func shouldShowMainAgentLogo(agentId: String, emoji: String?) -> Bool {
-        guard agentId == "main" else { return false }
-        guard let emoji = emoji?.trimmingCharacters(in: .whitespacesAndNewlines), !emoji.isEmpty else { return true }
-        return emoji == "🎯"
-    }
-
     /// Emoji for the active agent (same as Agents page card).
     func selectedAgentEmojiSymbol() -> String {
         if let agent = selectedAgentDisplay {
             return agentEmoji(for: agent)
         }
-        return mainAgentId == "main" ? "🎯" : "🤖"
+        return mainAgentId == "main" ? "🦞" : "🤖"
     }
 
     /// Display name for the active agent (Main Actor for `main`).
@@ -1576,7 +1563,7 @@ final class WatchAppModel: ObservableObject {
         if let emoji = agent.emoji?.trimmingCharacters(in: .whitespacesAndNewlines), !emoji.isEmpty {
             return emoji
         }
-        return agent.id == "main" ? "🎯" : "🤖"
+        return agent.id == "main" ? "🦞" : "🤖"
     }
 
     private func newSessionKey(for agentId: String? = nil) -> String {

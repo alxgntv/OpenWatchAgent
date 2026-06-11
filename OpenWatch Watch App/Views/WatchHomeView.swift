@@ -495,7 +495,7 @@ struct GatewaySessionsListPage: View {
             .padding(.horizontal, 4)
             .padding(.top, 4)
         }
-        .navigationTitle("Sessions")
+        .navigationTitle("💬 Sessions")
         .refreshable {
             await model.refreshSessionsForCurrentAgent()
         }
@@ -597,7 +597,7 @@ struct AgentsPage: View {
             }
             .disabled(model.agentsRefreshing)
         }
-        .navigationTitle("Agents")
+        .navigationTitle("🦞 Agents")
     }
 }
 
@@ -612,7 +612,6 @@ struct WatchAgentListRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            AgentLeadingIconView(agentId: agent.id, emoji: agent.emoji, size: 18)
             VStack(alignment: .leading, spacing: 2) {
                 Text(displayName)
                     .lineLimit(1)
@@ -633,34 +632,6 @@ struct WatchAgentListRow: View {
                 Image(systemName: "checkmark")
                     .font(.caption.weight(.semibold))
             }
-        }
-    }
-}
-
-// ─── Ariadne's Thread [AT-0161] ─────────────────────
-// What: AgentLogo placeholder in Agents list only when Main Actor has no custom emoji.
-// Why:  Inline image on the main session screen broke layout; list row is the correct place for the mascot.
-// Date: 2026-06-11
-// Related: [AT-0159] WatchAppModel.shouldShowMainAgentLogo, [AT-0158] ComplicationAgent
-// ─────────────────────────────────────────────────────
-struct AgentLeadingIconView: View {
-    let agentId: String
-    let emoji: String?
-    var size: CGFloat = 18
-
-    var body: some View {
-        if WatchAppModel.shouldShowMainAgentLogo(agentId: agentId, emoji: emoji) {
-            Image("AgentLogo")
-                .resizable()
-                .scaledToFit()
-                .frame(width: size, height: size)
-        } else if let trimmedEmoji = emoji?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmedEmoji.isEmpty {
-            Text(trimmedEmoji)
-                .font(.system(size: size * 0.95))
-        } else {
-            Image(systemName: "person.circle.fill")
-                .font(.system(size: size))
-                .foregroundStyle(.secondary)
         }
     }
 }
