@@ -879,18 +879,15 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Connects to any OpenClaw gateway: paste a full `openclaw qr` setup code, or enter gateway address + bootstrap token.
-    func submitPairing(gatewayURL: String, setupCode: String) {
+    /// Connects to an OpenClaw gateway using a setup code from `openclaw qr` or Telegram `/pair`.
+    func submitPairing(setupCode: String) {
         Task {
             pairing.phase = .connecting
             pairing.message = "Connecting…"
             errorBanner = nil
             syncWatch()
             do {
-                let payload = try SetupCodeDecoder.resolvePairingInput(
-                    gatewayURLInput: gatewayURL,
-                    setupCodeInput: setupCode
-                )
+                let payload = try SetupCodeDecoder.resolvePairingInput(setupCode)
                 AppLog.info(
                     "submitPairing connecting host=\(payload.gatewayURL.host ?? "unknown") port=\(payload.gatewayURL.port ?? 0)"
                 )

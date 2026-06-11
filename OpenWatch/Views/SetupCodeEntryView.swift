@@ -2,14 +2,8 @@ import SwiftUI
 
 struct SetupCodeEntryView: View {
     @ObservedObject var model: AppModel
-    @State private var gatewayURL = ""
     @State private var setupCode = ""
-    @FocusState private var focusedField: Field?
-
-    private enum Field: Hashable {
-        case gateway
-        case setupCode
-    }
+    @FocusState private var setupCodeFocused: Bool
 
     var body: some View {
         ScrollView {
@@ -17,34 +11,20 @@ struct SetupCodeEntryView: View {
                 Text("Connect OpenClaw")
                     .font(.largeTitle.bold())
 
-                Text("Each gateway lives on its own server. Enter that server's address and a fresh setup code from `openclaw qr --setup-code-only` on that machine.")
+                Text("Paste a setup code from `openclaw qr --setup-code-only` on your gateway server, or from `/pair` in Telegram.")
                     .font(.body)
                     .foregroundStyle(.secondary)
 
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Gateway address")
-                        .font(.subheadline.weight(.semibold))
-                    TextField("wss://your-server:18789", text: $gatewayURL)
-                        .textFieldStyle(.roundedBorder)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                        .focused($focusedField, equals: .gateway)
-                    Text("Examples: wss://myhost.example.com:18789 · 192.168.1.10:18789 · tailnet-host:18789")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                VStack(alignment: .leading, spacing: 8) {
                     Text("Setup code")
                         .font(.subheadline.weight(.semibold))
-                    TextField("Paste full setup code or bootstrap token", text: $setupCode, axis: .vertical)
+                    TextField("Paste setup code", text: $setupCode, axis: .vertical)
                         .textFieldStyle(.roundedBorder)
                         .lineLimit(3 ... 8)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
-                        .focused($focusedField, equals: .setupCode)
-                    Text("Full code from openclaw qr includes the URL — you can leave Gateway address empty. Or paste only the bootstrap token and fill Gateway address above.")
+                        .focused($setupCodeFocused)
+                    Text("The setup code includes your gateway address and pairing token.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -56,11 +36,9 @@ struct SetupCodeEntryView: View {
                 }
 
                 Button {
-                    AppLog.info(
-                        "SetupCodeEntry Connect tapped gatewayFieldEmpty=\(gatewayURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)"
-                    )
-                    focusedField = nil
-                    model.submitPairing(gatewayURL: gatewayURL, setupCode: setupCode)
+                    AppLog.info("SetupCodeEntry Connect tapped setupCodeLength=\(setupCode.trimmingCharacters(in: .whitespacesAndNewlines).count)")
+                    setupCodeFocused = false
+                    model.submitPairing(setupCode: setupCode)
                 } label: {
                     HStack {
                         if model.pairing.phase == .connecting {
@@ -81,34 +59,19 @@ struct SetupCodeEntryView: View {
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
                 Button("Done") {
-                    AppLog.info("SetupCodeEntry keyboard dismissed field=\(String(describing: focusedField))")
-                    focusedField = nil
+                    AppLog.info("SetupCodeEntry keyboard dismissed")
+                    setupCodeFocused = false
                 }
             }
         }
         .onAppear {
-            if gatewayURL.isEmpty, let last = SetupCodeDecoder.loadLastGatewayURL() {
-                gatewayURL = last
-                AppLog.info("SetupCodeEntryView prefilled last gateway host from defaults")
-            }
-            focusedField = gatewayURL.isEmpty ? .gateway : .setupCode
+            setupCodeFocused = true
             AppLog.info("SetupCodeEntryView appeared")
         }
     }
 
     private var canConnect: Bool {
-        let code = setupCode.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !code.isEmpty, model.pairing.phase != .connecting else { return false }
-        let url = gatewayURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !url.isEmpty { return true }
-        return looksLikeFullSetupCode(code)
-    }
-
-    /// Heuristic: full openclaw setup codes are base64-ish and longer than a bare token.
-    private func looksLikeFullSetupCode(_ raw: String) -> Bool {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count >= 40 else { return false }
-        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-")
-        return trimmed.unicodeScalars.allSatisfy { allowed.contains($0) }
+        !setupCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && model.pairing.phase != .connecting
     }
 }
