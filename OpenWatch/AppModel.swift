@@ -337,7 +337,7 @@ final class AppModel: ObservableObject {
     private static let fallbackMainActor = GatewayAgentRow(
         id: "main",
         name: "Main Actor",
-        emoji: "🎯",
+        emoji: "🦞",
         subtitle: "Default agent",
         modelLabel: nil,
         isDefault: true
