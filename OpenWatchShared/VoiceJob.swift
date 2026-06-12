@@ -27,6 +27,13 @@ nonisolated public struct VoiceJob: Identifiable, Codable, Sendable, Equatable {
     public var elapsedSinceWorking: Double?
     public var wsCloseCode: String?
     public var backendErrorCode: String?
+    // ─── Ariadne's Thread [AT-0168] ─────────────────────
+    // What: Persist the Watch-recorded audio file name for local chat playback.
+    // Why:  Voice-only turns have no transcript on Watch; users must replay what they sent.
+    // Date: 2026-06-12
+    // Related: [AT-0169] WatchVoiceMessageStore, [AT-0170] WatchVoiceMessagePlayerView
+    // ─────────────────────────────────────────────────────
+    public var localAudioFileName: String?
     public let agentId: String
     public let createdAt: Date
     public var completedAt: Date?
@@ -46,6 +53,7 @@ nonisolated public struct VoiceJob: Identifiable, Codable, Sendable, Equatable {
         elapsedSinceWorking: Double? = nil,
         wsCloseCode: String? = nil,
         backendErrorCode: String? = nil,
+        localAudioFileName: String? = nil,
         agentId: String = "main",
         createdAt: Date = Date(),
         completedAt: Date? = nil
@@ -64,6 +72,7 @@ nonisolated public struct VoiceJob: Identifiable, Codable, Sendable, Equatable {
         self.elapsedSinceWorking = elapsedSinceWorking
         self.wsCloseCode = wsCloseCode
         self.backendErrorCode = backendErrorCode
+        self.localAudioFileName = localAudioFileName
         self.agentId = agentId
         self.createdAt = createdAt
         self.completedAt = completedAt

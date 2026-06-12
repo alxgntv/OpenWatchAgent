@@ -2003,13 +2003,24 @@ final class WatchAppModel: ObservableObject {
             AppLog.error("Watch file finishRecording: job id missing")
             return nil
         }
-        guard let fileURL = recorder.stopRecording() else {
+        guard let tempURL = recorder.stopRecording() else {
             FlowLog.started(step: 4, side: .watch, flow: "audio-save", detail: "jobId=\(jobId)")
             FlowLog.result(step: 4, side: .watch, flow: "audio-save", success: false, detail: "recording file missing jobId=\(jobId)")
             FlowLog.finished(step: 4, side: .watch, flow: "audio-save")
             updateDirectJob(jobId: jobId, status: .failed, errorMessage: "Recording file is missing.", statusDetail: nil, completedAt: Date())
             AppLog.error("Watch file finishRecording: recorder returned nil URL jobId=\(jobId)")
             return nil
+        }
+        guard let localAudioFileName = WatchVoiceMessageStore.persistRecording(from: tempURL, jobId: jobId) else {
+            updateDirectJob(jobId: jobId, status: .failed, errorMessage: "Could not save voice message.", statusDetail: nil, completedAt: Date())
+            AppLog.error("Watch file finishRecording: voice message persist failed jobId=\(jobId) temp=\(tempURL.path)")
+            return nil
+        }
+        attachLocalAudioFileName(to: jobId, fileName: localAudioFileName)
+        let fileURL = WatchVoiceMessageStore.url(forFileName: localAudioFileName)
+        if tempURL != fileURL {
+            try? FileManager.default.removeItem(at: tempURL)
+            AppLog.info("Watch removed recorder temp file jobId=\(jobId) temp=\(tempURL.lastPathComponent)")
         }
         let fileBytes = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.intValue ?? -1
         FlowLog.started(step: 4, side: .watch, flow: "audio-save", detail: "jobId=\(jobId)")
@@ -2033,7 +2044,6 @@ final class WatchAppModel: ObservableObject {
             sessionKey: savedAudio.sessionKey
         )
         if queuedForIPhone {
-            try? FileManager.default.removeItem(at: savedAudio.fileURL)
             AppLog.info("Watch iPhone relay audio send requested jobId=\(savedAudio.jobId) sessionKey=\(savedAudio.sessionKey) file=\(savedAudio.fileURL.lastPathComponent) bytes=\(savedAudio.bytes)")
         } else if WatchNetworkPathMonitor.shared.internetAvailable {
             Task { await sendSavedAudioFileDirectToGateway(savedAudio) }
@@ -2046,7 +2056,6 @@ final class WatchAppModel: ObservableObject {
                 statusDetail: nil,
                 completedAt: Date()
             )
-            try? FileManager.default.removeItem(at: savedAudio.fileURL)
             AppLog.error("Watch audio send failed: relay queue unavailable and direct internet unavailable jobId=\(savedAudio.jobId)")
         }
         recordingJobId = nil
@@ -2091,7 +2100,40 @@ final class WatchAppModel: ObservableObject {
             FlowLog.finished(step: 6, side: .watch, flow: "server-response")
             AppLog.error("Watch direct WSS audio failed jobId=\(savedAudio.jobId): \(error.localizedDescription)")
         }
-        try? FileManager.default.removeItem(at: savedAudio.fileURL)
+    }
+
+    // ─── Ariadne's Thread [AT-0168] ─────────────────────
+    // What: Attach persisted local audio file name to the in-memory voice job row.
+    // Why:  Chat history must show a replayable user voice bubble after Stop & Send.
+    // Date: 2026-06-12
+    // Related: [AT-0169] WatchVoiceMessageStore, [AT-0170] WatchVoiceMessagePlayerView
+    // ─────────────────────────────────────────────────────
+    private func attachLocalAudioFileName(to jobId: UUID, fileName: String) {
+        if let key = jobGatewayKey[jobId], var arr = gatewayJobs[key], let index = arr.firstIndex(where: { $0.id == jobId }) {
+            arr[index].localAudioFileName = fileName
+            gatewayJobs[key] = arr
+            markJobUpdate(jobId, source: "local-audio-gateway")
+            AppLog.info("Watch attached local audio to gateway job jobId=\(jobId) file=\(fileName)")
+            return
+        }
+        if let sessionId = jobSession[jobId],
+           let si = sessions.firstIndex(where: { $0.id == sessionId }),
+           let ji = sessions[si].jobs.firstIndex(where: { $0.id == jobId }) {
+            sessions[si].jobs[ji].localAudioFileName = fileName
+            markJobUpdate(jobId, source: "local-audio-live")
+            AppLog.info("Watch attached local audio to live job jobId=\(jobId) file=\(fileName) sessionKey=\(sessions[si].sessionKey)")
+            return
+        }
+        AppLog.error("Watch attach local audio missed jobId=\(jobId) file=\(fileName)")
+    }
+
+    private func preservingLocalAudio(from existing: VoiceJob?, into incoming: VoiceJob) -> VoiceJob {
+        var merged = incoming
+        if merged.localAudioFileName == nil, let fileName = existing?.localAudioFileName {
+            merged.localAudioFileName = fileName
+            AppLog.info("Watch preserved local audio on job merge jobId=\(incoming.id) file=\(fileName)")
+        }
+        return merged
     }
 
     func activeJobsForSync() -> [VoiceJob] {
@@ -2458,7 +2500,7 @@ final class WatchAppModel: ObservableObject {
             guard shouldApplyJobStatus(current: arr[ji].status, incoming: job.status, jobId: job.id, source: "gateway-snapshot") else {
                 return
             }
-            arr[ji] = job
+            arr[ji] = preservingLocalAudio(from: arr[ji], into: job)
         } else {
             arr.insert(job, at: 0)
         }
@@ -2496,7 +2538,7 @@ final class WatchAppModel: ObservableObject {
                 guard shouldApplyJobStatus(current: sessions[si].jobs[ji].status, incoming: job.status, jobId: job.id, source: "live-session-snapshot") else {
                     return
                 }
-                sessions[si].jobs[ji] = job
+                sessions[si].jobs[ji] = preservingLocalAudio(from: sessions[si].jobs[ji], into: job)
             } else {
                 sessions[si].jobs.insert(job, at: 0)
             }
@@ -2557,7 +2599,7 @@ final class WatchAppModel: ObservableObject {
             guard shouldApplyJobStatus(current: sessions[si].jobs[ji].status, incoming: job.status, jobId: job.id, source: "local-snapshot") else {
                 return
             }
-            sessions[si].jobs[ji] = job
+            sessions[si].jobs[ji] = preservingLocalAudio(from: sessions[si].jobs[ji], into: job)
         } else {
             sessions[si].jobs.insert(job, at: 0)
         }

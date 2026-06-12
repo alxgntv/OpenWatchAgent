@@ -102,11 +102,7 @@ struct WatchSessionPage: View {
                                 .font(.caption2)
                                 .foregroundStyle(.red)
                         }
-                        if let transcript = job.transcript {
-                            Text(transcript)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
+                        UserVoiceMessageView(job: job)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -370,9 +366,7 @@ struct GatewaySessionPage: View {
                         } else if let error = job.errorMessage {
                             Text(error).font(.caption2).foregroundStyle(.red)
                         }
-                        if let transcript = job.transcript {
-                            Text(transcript).font(.caption2).foregroundStyle(.secondary)
-                        }
+                        UserVoiceMessageView(job: job)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -402,6 +396,42 @@ struct GatewaySessionPage: View {
     private func toggleSelectedBotMessage(_ id: String) {
         selectedBotMessageId = selectedBotMessageId == id ? nil : id
         AppLog.info("Watch bot message card selected id=\(id) selected=\(selectedBotMessageId == id)")
+    }
+}
+
+// ─── Ariadne's Thread [AT-0170] ─────────────────────
+// What: Render the user's voice turn with local playback and optional transcript text.
+// Why:  Voice-only sends had no visible user bubble in Watch chat history.
+// Date: 2026-06-12
+// Related: [AT-0168] VoiceJob.localAudioFileName, WatchVoiceMessagePlayerView
+// ─────────────────────────────────────────────────────
+struct UserVoiceMessageView: View {
+    let job: VoiceJob
+
+    private var hasLocalAudio: Bool {
+        guard let fileName = job.localAudioFileName, !fileName.isEmpty else { return false }
+        return FileManager.default.fileExists(atPath: WatchVoiceMessageStore.url(forFileName: fileName).path)
+    }
+
+    private var hasTranscript: Bool {
+        guard let transcript = job.transcript?.trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
+        return !transcript.isEmpty
+    }
+
+    var body: some View {
+        if hasLocalAudio || hasTranscript {
+            VStack(alignment: .leading, spacing: 4) {
+                if hasLocalAudio, let fileName = job.localAudioFileName {
+                    WatchVoiceMessagePlayerView(fileURL: WatchVoiceMessageStore.url(forFileName: fileName))
+                }
+                if hasTranscript, let transcript = job.transcript {
+                    Text(transcript)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }
 
