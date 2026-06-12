@@ -142,6 +142,8 @@ final class AppModel: ObservableObject {
     private var watchEnrichedSessionCache: [String: WatchGatewaySession] = [:]
     private var pendingAudioJobs: [PendingAudioJob] = []
     private var pendingResumeTask: Task<Void, Never>?
+    private var pendingProgressTask: Task<Void, Never>?
+    private var pendingProgressLastStepByJobId: [UUID: String] = [:]
     private var didRequestGatewayAgentsThisLaunch = false
     private let pendingAudioJobsKey = "openwatch.pendingAudioJobs.v1"
     private let watchMessageTextLimit = 500
@@ -187,6 +189,9 @@ final class AppModel: ObservableObject {
             launchGreetingVoiceIdentifier: launchGreetingVoiceIdentifier
         )
         _ = AppModel.availableVoiceLanguages
+        if isPaired, !pendingAudioJobs.isEmpty {
+            refreshPendingProgressMonitor()
+        }
     }
 
     private static func loadPendingAudioJobs(key: String) -> [PendingAudioJob] {
@@ -1330,6 +1335,49 @@ final class AppModel: ObservableObject {
         }
         savePendingAudioJobs()
         AppLog.info("Pending audio job stored jobId=\(pending.watchJobId) sessionKey=\(pending.sessionKey) chatSendId=\(pending.chatSendId) baseline=\(pending.historyBaselineAssistantCount)")
+        refreshPendingProgressMonitor()
+    }
+
+    // ─── Ariadne's Thread [AT-0171] ─────────────────────
+    // What: Stream gateway session progress to Watch Speak button while async audio jobs are pending.
+    // Why:  Pending jobs no longer hold one WSS for the full run; progress must be relayed separately.
+    // Date: 2026-06-12
+    // Related: [AT-0046] AppModel.resumePendingAudioJobs, GatewayJobClient.monitorSessionProgress
+    // ─────────────────────────────────────────────────────
+    private func refreshPendingProgressMonitor() {
+        pendingProgressTask?.cancel()
+        pendingProgressTask = nil
+        guard isPaired, !pendingAudioJobs.isEmpty else {
+            pendingProgressLastStepByJobId.removeAll()
+            AppLog.info("Pending progress monitor stopped: paired=\(isPaired) pendingCount=\(pendingAudioJobs.count)")
+            return
+        }
+        let sessionKeys = Set(pendingAudioJobs.map(\.sessionKey))
+        let pendingSnapshot = pendingAudioJobs
+        pendingProgressTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.jobClient.monitorSessionProgress(sessionKeys: sessionKeys) { sessionKey, step in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        for pending in pendingSnapshot where pending.sessionKey == sessionKey || sessionKey.isEmpty {
+                            guard let index = self.jobs.firstIndex(where: { $0.id == pending.watchJobId }) else { continue }
+                            guard self.jobs[index].status == .running || self.jobs[index].status == .sending else { continue }
+                            if self.pendingProgressLastStepByJobId[pending.watchJobId] == step { continue }
+                            self.pendingProgressLastStepByJobId[pending.watchJobId] = step
+                            self.jobs[index].statusDetail = step
+                            AppLog.info("Pending progress jobId=\(pending.watchJobId) step=\(step)")
+                            self.syncWatch(job: self.jobs[index])
+                        }
+                    }
+                }
+            } catch {
+                if !Task.isCancelled {
+                    AppLog.error("Pending progress monitor failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        AppLog.info("Pending progress monitor started sessionKeys=\(sessionKeys.joined(separator: ",")) count=\(pendingSnapshot.count)")
     }
 
     func triggerPendingAudioResume(reason: String) {
@@ -1396,7 +1444,9 @@ final class AppModel: ObservableObject {
         if let index = jobs.firstIndex(where: { $0.id == pending.watchJobId }) {
             guard jobs[index].status == .sending || jobs[index].status == .running else { return }
             jobs[index].status = .running
-            jobs[index].statusDetail = "Processing…"
+            if jobs[index].statusDetail == nil {
+                jobs[index].statusDetail = "Processing…"
+            }
             syncWatch(job: jobs[index])
             return
         }
@@ -1440,7 +1490,9 @@ final class AppModel: ObservableObject {
         }
         if activeJobId == pending.watchJobId { activeJobId = nil }
         pendingAudioJobs.removeAll { $0.watchJobId == pending.watchJobId }
+        pendingProgressLastStepByJobId.removeValue(forKey: pending.watchJobId)
         savePendingAudioJobs()
+        refreshPendingProgressMonitor()
         syncWatch(job: updated)
         FlowLog.started(step: 6, side: .iphone, flow: "server-response", detail: "jobId=\(pending.watchJobId) source=history")
         FlowLog.function(step: 6, side: .iphone, flow: "server-response", name: "AppModel.resumePendingAudioJobs")

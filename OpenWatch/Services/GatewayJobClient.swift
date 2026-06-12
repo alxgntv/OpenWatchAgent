@@ -286,6 +286,53 @@ actor GatewayJobClient {
         )
     }
 
+    // ─── Ariadne's Thread [AT-0171] ─────────────────────
+    // What: Keep a live WSS open for pending async jobs and stream gateway progress steps.
+    // Why:  After chat.send accept the relay socket closes; Watch still needs live reasoning on the Speak button.
+    // Date: 2026-06-12
+    // Related: [AT-0046] AppModel.resumePendingAudioJobs, shared→GatewayRunProgress
+    // ─────────────────────────────────────────────────────
+    func monitorSessionProgress(
+        sessionKeys: Set<String>,
+        onProgress: @escaping @Sendable (String, String) -> Void
+    ) async throws {
+        let task = try await openOperatorSocket()
+        defer {
+            task.cancel(with: .goingAway, reason: nil)
+        }
+        for sessionKey in sessionKeys {
+            try await sendSessionMessagesSubscribe(on: task, sessionKey: sessionKey)
+            AppLog.info("Pending progress monitor subscribed sessionKey=\(sessionKey)")
+        }
+        while !Task.isCancelled {
+            let json: [String: Any]
+            do {
+                json = try await receiveJSON(on: task, timeoutSeconds: stallTimeoutSeconds)
+            } catch {
+                if Task.isCancelled { return }
+                if (error as? GatewayJobError)?.isTimedOut == true {
+                    continue
+                }
+                throw error
+            }
+            guard (json["type"] as? String) == "event", let event = json["event"] as? String else { continue }
+            let payload = json["payload"] as? [String: Any] ?? [:]
+            let sessionKey = GatewayRunProgress.eventSessionKey(payload) ?? ""
+            guard sessionKey.isEmpty || sessionKeys.contains(sessionKey) else { continue }
+            if event == "chat",
+               let chatSessionKey = payload["sessionKey"] as? String,
+               sessionKeys.contains(chatSessionKey),
+               (payload["state"] as? String) == "delta" {
+                onProgress(chatSessionKey, "Responding…")
+                continue
+            }
+            if event == "session.operation" || event == "session.tool" || event == "session.message" || event == "agent",
+               let step = GatewayRunProgress.progressStep(event: event, payload: payload) {
+                onProgress(sessionKey, step)
+            }
+        }
+    }
+
     func latestAssistantReplyAfterBaseline(sessionKey: String, baselineAssistantCount: Int) async throws -> String? {
         let messages = try await fetchHistory(sessionKey: sessionKey)
         let assistantMessages = messages.filter { !$0.isUser }
@@ -967,10 +1014,9 @@ actor GatewayJobClient {
                 continue
             }
 
-            // Live chain of what OpenClaw is doing for this session (operations, tools, transcript steps).
             if event == "session.operation" || event == "session.tool" || event == "session.message" || event == "agent" {
                 if eventSessionKey(payload) == nil || eventSessionKey(payload) == sessionKey,
-                   let step = progressString(event: event, payload: payload) {
+                   let step = GatewayRunProgress.progressStep(event: event, payload: payload) {
                     emit(step)
                 }
                 continue
@@ -1081,35 +1127,6 @@ actor GatewayJobClient {
         let type = (data["type"] as? String) ?? (data["kind"] as? String)
         let phase = (data["phase"] as? String) ?? (data["status"] as? String)
         return type == "agentMessage" && phase == "completed"
-    }
-
-    /// Builds a short, human-readable status line from a streamed session/agent event.
-    private func progressString(event: String, payload: [String: Any]) -> String? {
-        func firstString(_ keys: [String]) -> String? {
-            for key in keys {
-                if let value = payload[key] as? String, !value.isEmpty { return value }
-            }
-            return nil
-        }
-
-        switch event {
-        case "session.tool":
-            let name = firstString(["tool", "name", "toolName", "title", "label"]) ?? "tool"
-            let status = firstString(["status", "state", "phase"])
-            return status != nil ? "Tool: \(name) (\(status!))" : "Tool: \(name)"
-        case "session.operation":
-            let label = firstString(["label", "title", "kind", "operation", "name", "type"]) ?? "operation"
-            let status = firstString(["status", "state", "phase"])
-            return status != nil ? "\(label) (\(status!))" : label
-        case "agent":
-            if let status = firstString(["status", "state", "phase"]) { return "Agent: \(status)" }
-            return "Working…"
-        case "session.message":
-            if let role = firstString(["role"]), role != "assistant" { return nil }
-            return nil
-        default:
-            return nil
-        }
     }
 
     private func extractAssistantText(from payload: [String: Any]) -> String? {

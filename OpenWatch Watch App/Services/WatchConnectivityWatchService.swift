@@ -955,7 +955,7 @@ actor WatchGatewayDirectClient {
 
             if event == "session.operation" || event == "session.tool" || event == "session.message" || event == "agent" {
                 if eventSessionKey(payload) == nil || eventSessionKey(payload) == sessionKey,
-                   let step = progressString(event: event, payload: payload) {
+                   let step = GatewayRunProgress.progressStep(event: event, payload: payload) {
                     emit(step)
                 }
                 continue
@@ -1115,30 +1115,6 @@ actor WatchGatewayDirectClient {
         let type = (data["type"] as? String) ?? (data["kind"] as? String)
         let phase = (data["phase"] as? String) ?? (data["status"] as? String)
         return type == "agentMessage" && phase == "completed"
-    }
-
-    private func progressString(event: String, payload: [String: Any]) -> String? {
-        func firstString(_ keys: [String]) -> String? {
-            for key in keys {
-                if let value = payload[key] as? String, !value.isEmpty { return value }
-            }
-            return nil
-        }
-        switch event {
-        case "session.tool":
-            let name = firstString(["tool", "name", "toolName", "title", "label"]) ?? "tool"
-            let status = firstString(["status", "state", "phase"])
-            return status != nil ? "Tool: \(name) (\(status!))" : "Tool: \(name)"
-        case "session.operation":
-            let label = firstString(["label", "title", "kind", "operation", "name", "type"]) ?? "operation"
-            let status = firstString(["status", "state", "phase"])
-            return status != nil ? "\(label) (\(status!))" : label
-        case "agent":
-            if let status = firstString(["status", "state", "phase"]) { return "Agent: \(status)" }
-            return "Working…"
-        default:
-            return nil
-        }
     }
 
     // ─── Ariadne's Thread [AT-0118] ─────────────────────

@@ -139,7 +139,7 @@ struct WatchSessionPage: View {
                 } else if let job = session.activeJob {
                     // Already sent to work in this session: spinner replaces the mic and the live status is the label.
                     ProgressView()
-                    Text(job.statusDetail ?? "Working…")
+                    Text(GatewayRunProgress.speakButtonLabel(statusDetail: job.statusDetail, status: job.status))
                         .font(.caption2)
                         .multilineTextAlignment(.center)
                 } else if isWaitingForIPhoneInternet {
@@ -303,7 +303,7 @@ struct GatewaySessionPage: View {
                     Text("Retry").font(.caption2)
                 } else if let job = activeJob {
                     ProgressView()
-                    Text(job.statusDetail ?? "Working…")
+                    Text(GatewayRunProgress.speakButtonLabel(statusDetail: job.statusDetail, status: job.status))
                         .font(.caption2)
                         .multilineTextAlignment(.center)
                 } else if isWaitingForIPhoneInternet {
